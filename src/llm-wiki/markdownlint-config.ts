@@ -1,0 +1,6 @@
+export const markdownlintConfig = {
+  default: true,
+  MD013: false,
+  MD033: false,
+  MD041: false,
+};

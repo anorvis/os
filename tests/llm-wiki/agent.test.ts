@@ -1,0 +1,161 @@
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { lintLlmWiki, runWikiAgent } from "../../src/llm-wiki";
+import { resolveWikiAgentCommand } from "../../src/llm-wiki/agent";
+
+function tmpRoot() {
+  return mkdtempSync(join(tmpdir(), "anorvis-agent-"));
+}
+
+describe("resolveWikiAgentCommand", () => {
+  test("honors explicit command environment variables before host CLI discovery", () => {
+    const cases = [
+      {
+        env: { ANORVIS_AGENT_COMMAND: "omp", ANORVIS_OMP_COMMAND: "custom-omp", ANORVIS_PI_COMMAND: "custom-pi" },
+        expected: { command: "omp", label: "omp Wiki Agent" },
+      },
+      {
+        env: { ANORVIS_OMP_COMMAND: "custom-omp", ANORVIS_PI_COMMAND: "custom-pi" },
+        expected: { command: "custom-omp", label: "custom-omp Wiki Agent" },
+      },
+      {
+        env: { ANORVIS_PI_COMMAND: "custom-pi" },
+        expected: { command: "custom-pi", label: "custom-pi Wiki Agent" },
+      },
+    ];
+
+    for (const { env, expected } of cases) {
+      expect(resolveWikiAgentCommand(env, () => true)).toEqual(expected);
+    }
+  });
+
+  test("falls back through host CLIs while preserving Pi compatibility", () => {
+    const cases: Array<{
+      available: Record<string, true>;
+      expected: { command: string; label: string };
+    }> = [
+      {
+        available: { pi: true, omp: true },
+        expected: { command: "pi", label: "Pi Wiki Agent" },
+      },
+      {
+        available: { omp: true },
+        expected: { command: "omp", label: "OMP Wiki Agent" },
+      },
+      {
+        available: {},
+        expected: { command: "pi", label: "Pi Wiki Agent" },
+      },
+    ];
+
+    for (const { available, expected } of cases) {
+      expect(resolveWikiAgentCommand({}, (command) => available[command] === true)).toEqual(expected);
+    }
+  });
+});
+
+describe("runWikiAgent", () => {
+  test("delegates normal wiki tasks to the Pi Wiki Agent runner", async () => {
+    const rootDir = tmpRoot();
+    let called = false;
+    const result = await runWikiAgent({ task: "Remember that Anorvis uses llm-wiki." }, {
+      rootDir,
+      now: new Date("2026-07-03T00:00:00.000Z"),
+      wikiAgent: ({ task, rootDir: agentRoot }) => {
+        called = true;
+        expect(task).toBe("Remember that Anorvis uses llm-wiki.");
+        expect(agentRoot).toBe(rootDir);
+        const page = "wiki/queries/2026-07-03-anorvis-uses-llm-wiki.md";
+        mkdirSync(join(rootDir, "wiki", "queries"), { recursive: true });
+        writeFileSync(join(rootDir, page), "---\ntype: query\ntitle: Anorvis uses llm-wiki\ncreated: 2026-07-03\nupdated: 2026-07-03\nstatus: seed\ntags: []\nrelated: []\nsources: []\n---\n\n# Anorvis uses llm-wiki\n");
+        return Promise.resolve({
+          task,
+          answer: "Recorded by Pi Wiki Agent.",
+          confidence: "high",
+          sources: [{ path: page, title: "Anorvis uses llm-wiki" }],
+          changed: [{ path: page, action: "created", why: "Pi Wiki Agent wrote it." }],
+          readNext: [{ path: page, reason: "Review result." }],
+          contradictions: [],
+          gaps: [],
+          warnings: [],
+        });
+      },
+    });
+
+    expect(called).toBe(true);
+    expect(result.answer).toContain("Pi Wiki Agent");
+    expect(result.changed.some((c) => c.path.startsWith("wiki/queries/"))).toBe(true);
+    expect(readFileSync(join(rootDir, "log.md"), "utf8")).toContain("Wiki Agent handled");
+    expect((await lintLlmWiki({ rootDir })).ok).toBe(true);
+  });
+
+  test("scopes vault tasks to an added vault", async () => {
+    const rootDir = tmpRoot();
+    const vaultDir = tmpRoot();
+    mkdirSync(join(rootDir, ".index"), { recursive: true });
+    writeFileSync(join(rootDir, ".index", "vaults.json"), JSON.stringify({ vaults: [{ name: "Work", path: vaultDir }] }));
+
+    let cwd = "";
+    const result = await runWikiAgent({ task: "What is in this vault?", vault: "Work" }, {
+      rootDir,
+      now: new Date("2026-07-03T00:01:00.000Z"),
+      wikiAgent: ({ vault }) => {
+        cwd = vault?.path ?? "";
+        return Promise.resolve({
+          task: "What is in this vault?",
+          answer: "Inspected selected vault only.",
+          confidence: "high",
+          sources: [{ path: "Note.md", title: "Note" }],
+          changed: [],
+          readNext: [],
+          contradictions: [],
+          gaps: [],
+          warnings: [],
+        });
+      },
+    });
+
+    expect(cwd).toBe(realpathSync(vaultDir));
+    expect(result.answer).toContain("selected vault");
+  });
+
+  test("recall tasks are answered by the Pi Wiki Agent runner without deterministic search", async () => {
+    const rootDir = tmpRoot();
+    const recalled = await runWikiAgent({ task: "What sea otter fact did we record?" }, {
+      rootDir,
+      now: new Date("2026-07-03T00:01:00.000Z"),
+      wikiAgent: ({ task }) => Promise.resolve({
+        task,
+        answer: "Sea otters hold hands while resting so they do not drift apart.",
+        confidence: "high",
+        sources: [{ path: "wiki/queries/sea-otters.md", title: "Sea otters" }],
+        changed: [],
+        readNext: [{ path: "wiki/queries/sea-otters.md", reason: "Pi Wiki Agent inspected it." }],
+        contradictions: [],
+        gaps: [],
+        warnings: [],
+      }),
+    });
+
+    expect(recalled.answer).toContain("Sea otters hold hands");
+    expect(recalled.readNext[0]?.reason).toBe("Pi Wiki Agent inspected it.");
+    expect(recalled.changed).toHaveLength(0);
+  });
+
+  test("migrates legacy memory through anorvis_wiki dry-run and approved run", async () => {
+    const rootDir = tmpRoot();
+    const legacyRoot = tmpRoot();
+    mkdirSync(join(legacyRoot, "preference"), { recursive: true });
+    writeFileSync(join(legacyRoot, "preference", "index.md"), "# Preferences\n\nUse direct names.\n");
+
+    const dry = await runWikiAgent({ task: "migrate old memory", dryRun: true }, { rootDir, legacyRoot, now: new Date("2026-07-03T00:00:00.000Z") });
+    expect(dry.changed).toHaveLength(0);
+
+    const migrated = await runWikiAgent({ task: "migrate old memory" }, { rootDir, legacyRoot, now: new Date("2026-07-03T00:00:00.000Z") });
+    expect(migrated.changed.some((c) => c.path === "wiki/sources/legacy-memory-migration.md")).toBe(true);
+    expect(readdirSync(join(rootDir, "raw", "notes")).length).toBeGreaterThan(0);
+    expect(readFileSync(join(legacyRoot, "preference", "index.md"), "utf8")).toContain("Use direct names");
+  });
+});

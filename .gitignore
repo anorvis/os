@@ -1,0 +1,4 @@
+:memory:
+:memory:-shm
+:memory:-wal
+node_modules/
