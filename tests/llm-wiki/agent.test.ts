@@ -1,8 +1,8 @@
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { lintLlmWiki, runWikiAgent } from "../../src/llm-wiki";
+import { lintLlmWiki, recordInteractionMemory, runWikiAgent } from "../../src/llm-wiki";
 import { resolveWikiAgentCommand } from "../../src/llm-wiki/agent";
 
 function tmpRoot() {
@@ -157,5 +157,107 @@ describe("runWikiAgent", () => {
     expect(migrated.changed.some((c) => c.path === "wiki/sources/legacy-memory-migration.md")).toBe(true);
     expect(readdirSync(join(rootDir, "raw", "notes")).length).toBeGreaterThan(0);
     expect(readFileSync(join(legacyRoot, "preference", "index.md"), "utf8")).toContain("Use direct names");
+  });
+});
+
+describe("recordInteractionMemory", () => {
+  test("captures each turn as raw source and serializes wiki compiles", async () => {
+    const rootDir = tmpRoot();
+    let active = 0;
+    let maxActive = 0;
+    const seenTasks: string[] = [];
+
+    const makeMemory = (prompt: string, turnIndex: number) => recordInteractionMemory({
+      sessionId: "session/alpha",
+      turnIndex,
+      eventName: "turn_end",
+      prompt,
+      assistant: { role: "assistant", content: `Answer ${turnIndex}` },
+      toolResults: [],
+      interaction: { type: "turn_end", turnIndex },
+      background: false,
+    }, {
+      rootDir,
+      now: new Date(`2026-07-03T00:00:0${turnIndex}.000Z`),
+      wikiAgent: async ({ task, rootDir: agentRoot }) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        seenTasks.push(task);
+        await Promise.resolve();
+        const rawPath = task.match(/Raw source: (raw\/[^\n]+)/)?.[1] ?? "";
+        const page = `wiki/preferences/interaction-${turnIndex}.md`;
+        mkdirSync(join(agentRoot, "wiki", "preferences"), { recursive: true });
+        writeFileSync(join(agentRoot, page), `---\ntype: preference\ntitle: Interaction ${turnIndex}\ncreated: 2026-07-03\nupdated: 2026-07-03\nstatus: seed\ntags: []\nrelated: []\nsources: [${rawPath}]\n---\n\n# Interaction ${turnIndex}\n\nCompiled durable memory from a turn.\n`);
+        active -= 1;
+        return {
+          task,
+          answer: "Compiled interaction memory.",
+          confidence: "high",
+          sources: [{ path: rawPath, title: "Agent Interaction" }],
+          changed: [{ path: page, action: "created", why: "Captured durable turn memory." }],
+          readNext: [{ path: page, reason: "Review memory." }],
+          contradictions: [],
+          gaps: [],
+          warnings: [],
+        };
+      },
+    });
+
+    const [first, second] = await Promise.all([makeMemory("Remember I prefer direct answers.", 1), makeMemory("Remember I use Anorvis for planning.", 2)]);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(maxActive).toBe(1);
+    expect(seenTasks).toHaveLength(2);
+    expect(seenTasks[0]).toContain("Remember I prefer direct answers.");
+    expect(first.ok && readFileSync(join(rootDir, first.rawPath), "utf8")).toContain("Remember I prefer direct answers.");
+    expect(second.ok && readFileSync(join(rootDir, second.rawPath), "utf8")).toContain("Remember I use Anorvis for planning.");
+    expect((await lintLlmWiki({ rootDir })).ok).toBe(true);
+  });
+
+
+  test("redacts prompt secrets before writing raw memory", async () => {
+    const rootDir = tmpRoot();
+    const secret = "hevy_secret_value_12345";
+    const result = await recordInteractionMemory({
+      sessionId: "redaction-session",
+      prompt: `Please remember apiKey: ${secret}`,
+      assistant: "ok",
+      background: false,
+    }, {
+      rootDir,
+      wikiAgent: ({ task }) => Promise.resolve({
+        task,
+        answer: "No durable memory.",
+        confidence: "medium",
+        sources: [],
+        changed: [],
+        readNext: [],
+        contradictions: [],
+        gaps: [],
+        warnings: [],
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = readFileSync(join(rootDir, result.rawPath), "utf8");
+    expect(raw).not.toContain(secret);
+    expect(raw).toContain("apiKey: [REDACTED]");
+  });
+  test("rejects empty interactions before writing raw memory", async () => {
+    const rootDir = tmpRoot();
+    const result = await recordInteractionMemory({
+      sessionId: "empty-session",
+      background: false,
+    }, {
+      rootDir,
+      wikiAgent: () => {
+        throw new Error("wiki agent should not run for empty interaction payloads");
+      },
+    });
+
+    expect(result).toEqual({ ok: false, error: "prompt, assistant, or interaction is required" });
+    expect(existsSync(join(rootDir, "raw", "sessions"))).toBe(false);
   });
 });
