@@ -21,6 +21,10 @@ export function getLlmWikiRoot(): string {
   return join(getHomeDir(), ".anorvis", "llm-wiki");
 }
 
+export function getDataRoot(): string {
+  return join(getHomeDir(), ".anorvis", "data");
+}
+
 export function getLogsRoot(): string {
   return join(getHomeDir(), ".anorvis", "logs");
 }
@@ -31,6 +35,7 @@ export function getTmpRoot(): string {
 
 export const ANORVIS_STORAGE_POLICIES = {
   os: "runtime",
+  data: "structured",
   memory: "legacy",
   "llm-wiki": "memory",
   logs: "log",

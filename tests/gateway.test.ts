@@ -1,31 +1,50 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../src/gateway/app";
+import { resetDatabaseForTests } from "../src/data/db/database";
+
+type CreateAppOptions = Parameters<typeof createApp>[0];
+type GatewayFixture = {
+  app: ReturnType<typeof createApp>;
+  home: string;
+};
 
 function tmpHome() {
   return mkdtempSync(join(tmpdir(), "anorvis-gateway-"));
 }
 
+async function withIsolatedGateway(run: (fixture: GatewayFixture) => Promise<void>, options?: CreateAppOptions): Promise<void> {
+  const environment = captureEnvironment("HOME", "ANORVIS_DB_PATH", "ANORVIS_OS_API_TOKEN");
+  const home = tmpHome();
+  process.env.HOME = home;
+  process.env.ANORVIS_DB_PATH = join(home, ".anorvis", "data", "test.sqlite");
+  delete process.env.ANORVIS_OS_API_TOKEN;
+  resetDatabaseForTests();
+
+  try {
+    await run({ app: createApp(options), home });
+  } finally {
+    resetDatabaseForTests();
+    restoreEnvironment(environment);
+  }
+}
+
+function captureEnvironment(...keys: string[]): Map<string, string | undefined> {
+  return new Map(keys.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnvironment(environment: Map<string, string | undefined>): void {
+  for (const [key, value] of environment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
 describe("minimal Anorvis OS gateway", () => {
   test("serves health and wiki task route", async () => {
-    const oldHome = process.env.HOME;
-    process.env.HOME = tmpHome();
-    try {
-      const app = createApp({
-        wikiAgent: ({ task }) => Promise.resolve({
-          task,
-          answer: "Recorded task through injected Pi Wiki Agent.",
-          confidence: "high",
-          sources: [],
-          changed: [{ path: "wiki/queries/gateway-test.md", action: "created", why: "test" }],
-          readNext: [],
-          contradictions: [],
-          gaps: [],
-          warnings: [],
-        }),
-      });
+    await withIsolatedGateway(async ({ app }) => {
       const health = await app.request("/health");
       expect(health.status).toBe(200);
       expect(await health.json()).toEqual({ ok: true });
@@ -39,8 +58,162 @@ describe("minimal Anorvis OS gateway", () => {
       const body = await wiki.json() as { answer?: string; changed?: Array<{ path: string }> };
       expect(body.answer).toContain("Recorded task");
       expect(body.changed?.some((item) => item.path.startsWith("wiki/queries/"))).toBe(true);
-    } finally {
-      process.env.HOME = oldHome;
-    }
+    }, {
+      wikiAgent: ({ task }) => Promise.resolve({
+        task,
+        answer: "Recorded task through injected Pi Wiki Agent.",
+        confidence: "high",
+        sources: [],
+        changed: [{ path: "wiki/queries/gateway-test.md", action: "created", why: "test" }],
+        readNext: [],
+        contradictions: [],
+        gaps: [],
+        warnings: [],
+      }),
+    });
+  });
+
+  test("records interaction turns through memory route", async () => {
+    await withIsolatedGateway(async ({ app, home }) => {
+      const response = await app.request("/v1/llm-wiki/interaction", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "gateway-session",
+          turnIndex: 7,
+          prompt: "Remember that gateway interactions should become memory.",
+          assistant: { role: "assistant", content: "I will remember." },
+          background: false,
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      const body = await response.json() as { ok?: boolean; rawPath?: string; queued?: boolean; wiki?: { answer?: string } };
+      expect(body.ok).toBe(true);
+      expect(body.queued).toBe(false);
+      expect(body.wiki?.answer).toContain("Compiled gateway");
+      expect(body.rawPath && readFileSync(join(home, ".anorvis", "llm-wiki", body.rawPath), "utf8")).toContain("gateway interactions should become memory");
+    }, {
+      wikiAgent: ({ task, rootDir }) => {
+        const rawPath = task.match(/Raw source: (raw\/[^\n]+)/)?.[1] ?? "";
+        const page = "wiki/preferences/gateway-memory.md";
+        mkdirSync(join(rootDir, "wiki", "preferences"), { recursive: true });
+        writeFileSync(join(rootDir, page), `---\ntype: preference\ntitle: Gateway memory\ncreated: 2026-07-03\nupdated: 2026-07-03\nstatus: seed\ntags: []\nrelated: []\nsources: [${rawPath}]\n---\n\n# Gateway memory\n\nThe gateway can persist interaction memory.\n`);
+        return Promise.resolve({
+          task,
+          answer: "Compiled gateway interaction memory.",
+          confidence: "high",
+          sources: [{ path: rawPath, title: "Agent Interaction" }],
+          changed: [{ path: page, action: "created", why: "test" }],
+          readNext: [],
+          contradictions: [],
+          gaps: [],
+          warnings: [],
+        });
+      },
+    });
+  });
+
+  test("rejects malformed or empty interaction memory payloads", async () => {
+    let wikiAgentCalls = 0;
+    await withIsolatedGateway(async ({ app }) => {
+      const malformed = await app.request("/v1/llm-wiki/interaction", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{not-json",
+      });
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toEqual({ error: "invalid JSON body" });
+
+      const empty = await app.request("/v1/llm-wiki/interaction", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: "empty-session", background: false }),
+      });
+      expect(empty.status).toBe(400);
+      expect(await empty.json()).toEqual({ error: "prompt, assistant, or interaction is required" });
+      expect(wikiAgentCalls).toBe(0);
+    }, {
+      wikiAgent: () => {
+        wikiAgentCalls += 1;
+        throw new Error("wiki agent should not run for invalid interaction payloads");
+      },
+    });
+  });
+
+  test("advertises PUT and rejects unknown task-session moves", async () => {
+    await withIsolatedGateway(async ({ app }) => {
+      const preflight = await app.request("/v1/health/meals/example", { method: "OPTIONS" });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-methods")).toContain("PUT");
+
+      const missingSession = await app.request("/v1/tasks/sessions/not-a-session", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ start: "2026-07-06T16:00:00.000Z", end: "2026-07-06T17:00:00.000Z" }),
+      });
+      expect(missingSession.status).toBe(404);
+      expect(await missingSession.json()).toEqual({ error: "task session not found" });
+
+      const tasksResponse = await app.request("/v1/tasks");
+      const tasksBody = await tasksResponse.json() as { tasks: unknown[] };
+      expect(tasksBody.tasks).toHaveLength(0);
+    });
+  });
+
+  test("persists calendar events through sqlite gateway routes", async () => {
+    await withIsolatedGateway(async ({ app }) => {
+      const createdResponse = await app.request("/v1/calendar/events", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          summary: "Work shift",
+          startDateTime: "2026-07-06T16:00:00.000Z",
+          endDateTime: "2026-07-06T22:00:00.000Z",
+          tag: "work",
+        }),
+      });
+
+      expect(createdResponse.status).toBe(201);
+      const created = await createdResponse.json() as { id: string; summary: string; startAt: string; endAt: string; tag?: string; source?: string };
+      expect(created.summary).toBe("Work shift");
+      expect(created.startAt).toBe("2026-07-06T16:00:00.000Z");
+      expect(created.tag).toBe("work");
+      expect(created.source).toBe("local");
+
+      const listResponse = await app.request("/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z");
+      expect(listResponse.status).toBe(200);
+      const listed = await listResponse.json() as { events: Array<{ id: string; summary: string; source?: string }> };
+      expect(listed.events.some((event) => event.id === created.id)).toBe(true);
+      expect(listed.events.find((event) => event.id === created.id)?.source).toBe("local");
+
+      const invalidPatchResponse = await app.request(`/v1/calendar/events/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ startAt: "2026-07-06T23:00:00.000Z" }),
+      });
+      expect(invalidPatchResponse.status).toBe(400);
+      const afterInvalidResponse = await app.request("/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z");
+      const afterInvalid = await afterInvalidResponse.json() as { events: Array<{ id: string; startAt: string; endAt: string }> };
+      const unchanged = afterInvalid.events.find((event) => event.id === created.id);
+      expect(unchanged?.startAt).toBe("2026-07-06T16:00:00.000Z");
+      expect(unchanged?.endAt).toBe("2026-07-06T22:00:00.000Z");
+
+      const patchResponse = await app.request(`/v1/calendar/events/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ summary: "Updated work shift", location: "store" }),
+      });
+      expect(patchResponse.status).toBe(200);
+      const patched = await patchResponse.json() as { summary: string; location?: string };
+      expect(patched.summary).toBe("Updated work shift");
+      expect(patched.location).toBe("store");
+
+      const deleteResponse = await app.request(`/v1/calendar/events/${encodeURIComponent(created.id)}`, { method: "DELETE" });
+      expect(deleteResponse.status).toBe(200);
+      const emptyResponse = await app.request("/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z");
+      const empty = await emptyResponse.json() as { events: unknown[] };
+      expect(empty.events).toHaveLength(0);
+    });
   });
 });

@@ -1,7 +1,17 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getHomeDir } from "../paths";
-import { initLlmWiki, lintLlmWiki, runWikiAgent, wikiResultAsJson } from "../llm-wiki";
+import { runWikiAgent } from "../llm-wiki";
+import { corsHeaders, json, type RouteHandler } from "./http";
+import { calendarRoutes } from "./routes/calendar";
+import { eventRoutes } from "./routes/events";
+import { financeRoutes } from "./routes/finance";
+import { healthRoutes } from "./routes/health";
+import { integrationRoutes } from "./routes/integrations";
+import { lifeRoutes } from "./routes/life";
+import { llmWikiRoutes } from "./routes/llm-wiki";
+import { overviewRoutes } from "./routes/overview";
+import { taskRoutes } from "./routes/tasks";
 
 type CreateServerOptions = {
   port?: number;
@@ -18,28 +28,35 @@ type App = {
 };
 
 export function createApp(options: CreateAppOptions = {}): App {
+  const handlers: RouteHandler[] = [
+    llmWikiRoutes(options),
+    eventRoutes(),
+    overviewRoutes(),
+    integrationRoutes(),
+    healthRoutes(),
+    financeRoutes(),
+    taskRoutes(),
+    calendarRoutes(),
+    lifeRoutes(),
+  ];
+
   const fetch = async (request: Request): Promise<Response> => {
     try {
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
       const url = new URL(request.url);
       if (request.method === "GET" && url.pathname === "/health") return json({ ok: true });
 
       const unauthorized = authorize(request);
       if (unauthorized) return unauthorized;
 
-      if (request.method === "POST" && url.pathname === "/v1/llm-wiki/init") return json(initLlmWiki());
-      if (request.method === "POST" && url.pathname === "/v1/llm-wiki/wiki") {
-        const body = await request.text().then((text) => JSON.parse(text) as unknown).catch(() => ({}));
-        const input = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
-        const task = typeof input.task === "string" && input.task.trim() ? input.task : "Orient the Anorvis LLM Wiki.";
-        const vault = typeof input.vault === "string" && input.vault.trim() ? input.vault : undefined;
-        const result = await runWikiAgent({ task, allowWeb: input.allowWeb === true, dryRun: input.dryRun === true, vault }, { wikiAgent: options.wikiAgent });
-        return json(wikiResultAsJson(result));
+      for (const handler of handlers) {
+        const response = await handler(request, url);
+        if (response) return response;
       }
-      if (request.method === "GET" && url.pathname === "/v1/llm-wiki/lint") return json(await lintLlmWiki());
 
-      return new Response("Not found", { status: 404 });
+      return new Response("Not found", { status: 404, headers: corsHeaders() });
     } catch (error) {
-      return new Response(error instanceof Error ? error.message : String(error), { status: 500 });
+      return new Response(error instanceof Error ? error.message : String(error), { status: 500, headers: corsHeaders() });
     }
   };
 
@@ -64,11 +81,7 @@ function authorize(request: Request): Response | undefined {
   const expected = process.env.ANORVIS_OS_API_TOKEN || readToken();
   if (!expected) return undefined;
   const actual = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  return actual === expected ? undefined : new Response("Unauthorized", { status: 401 });
-}
-
-function json(value: unknown): Response {
-  return new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
+  return actual === expected ? undefined : new Response("Unauthorized", { status: 401, headers: corsHeaders() });
 }
 
 function readToken(): string {
