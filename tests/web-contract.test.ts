@@ -3,8 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp } from "../src/gateway/app";
-import { resetDatabaseForTests } from "../src/data/db/database";
+import { createApp } from "../src/platform/gateway/app";
+import { resetDatabaseForTests } from "../src/core/db/database";
 
 type GatewayApp = {
   request(input: string | Request, init?: RequestInit): Promise<Response>;
@@ -70,7 +70,7 @@ describe("web API contracts", () => {
         body: JSON.stringify({
           title: "Prepare launch plan",
           notes: "Draft rollout risks",
-          date: dueDate,
+          dueAt,
           priority: "urgent",
           durationMinutes: 90,
           links: ["obsidian://launch", "https://example.test/rollout"],
@@ -102,7 +102,7 @@ describe("web API contracts", () => {
       const sessionResponse = await app.request(`/v1/tasks/sessions/${encodeURIComponent(createdTask.id)}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ start: sessionStart, end: sessionEnd }),
+        body: JSON.stringify({ startAt: sessionStart, endAt: sessionEnd }),
       });
       expect(sessionResponse.status).toBe(200);
       const session = await sessionResponse.json() as { id: string; taskId: string; startAt: string; endAt: string; status: string };
@@ -120,31 +120,106 @@ describe("web API contracts", () => {
       const planResponse = await app.request("/v1/tasks/plan");
       expect(planResponse.status).toBe(200);
       const plan = await planResponse.json() as {
-        tasks: Array<{ id: string; title: string; status: string; date: string; priority?: string; durationMinutes?: number; multiSession: boolean; links: unknown[] }>;
-        sessions: Array<{ id: string; taskId: string; completed: boolean; start: string; end: string; conflictState: string }>;
+        tasks: Array<{ id: string; title: string; status: string; dueAt: string; priority?: string; durationMinutes?: number; multiSession: boolean; links: unknown[] }>;
+        sessions: Array<{ id: string; taskId: string; status: string; startAt: string; endAt: string }>;
         prepPackages: unknown[];
       };
       expect(plan.tasks).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: createdTask.id, title: "Prepare launch plan", status: "open", date: dueAt, priority: "urgent", durationMinutes: 90, multiSession: true, links: ["obsidian://launch", "https://example.test/rollout"] }),
+        expect.objectContaining({ id: createdTask.id, title: "Prepare launch plan", status: "open", dueAt, priority: "urgent", durationMinutes: 90, multiSession: true, links: ["obsidian://launch", "https://example.test/rollout"] }),
       ]));
       expect(plan.sessions).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: createdTask.id, taskId: createdTask.id, completed: false, start: sessionStart, end: sessionEnd, conflictState: "none" }),
+        expect.objectContaining({ id: createdTask.id, taskId: createdTask.id, status: "planned", startAt: sessionStart, endAt: sessionEnd }),
       ]));
       expect(plan.prepPackages).toEqual([]);
 
       const snapshotResponse = await app.request("/v1/life/snapshot");
       expect(snapshotResponse.status).toBe(200);
       const snapshot = await snapshotResponse.json() as {
-        queue: Array<{ id: string; title: string; scheduledStart: string; scheduledEnd: string; label: string; conflictState: string }>;
-        weekCalendarEvents: Array<{ id: string; summary: string; taskId?: string; source?: string; type: string; date: string; conflictState?: string }>;
+        queue: Array<{ id: string; title: string; scheduledStart: string; scheduledEnd: string; label: string }>;
+        weekCalendarEvents: Array<{ id: string; summary: string; taskId?: string; source?: string; type: string; date: string }>;
       };
       expect(snapshot.queue).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: createdTask.id, title: "Prepare launch plan", scheduledStart: sessionStart, scheduledEnd: sessionEnd, label: "scheduled", conflictState: "none" }),
+        expect.objectContaining({ id: createdTask.id, title: "Prepare launch plan", scheduledStart: sessionStart, scheduledEnd: sessionEnd, label: "scheduled" }),
       ]));
       expect(snapshot.weekCalendarEvents).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: createdTask.id, taskId: createdTask.id, summary: "Prepare launch plan", source: "task", type: "plannedTask", conflictState: "none" }),
+        expect.objectContaining({ id: createdTask.id, taskId: createdTask.id, summary: "Prepare launch plan", source: "task", type: "plannedTask" }),
         expect.objectContaining({ id: calendarEvent.id, summary: "Local planning block", source: "local", type: "default", date: calendarDate }),
       ]));
+    });
+  });
+
+  test("task patches preserve archived status and reject invalid links without corrupting stored links", async () => {
+    await withIsolatedGateway(async (app) => {
+      const links = ["obsidian://archive-review", "https://example.test/archive-review"];
+      const createdResponse = await app.request("/v1/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title: "Archive schema boundary",
+          links,
+        }),
+      });
+      expect(createdResponse.status).toBe(201);
+      const created = await createdResponse.json() as { id: string };
+
+      const archivedResponse = await app.request(`/v1/tasks/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "archived" }),
+      });
+      expect(archivedResponse.status).toBe(200);
+      const archived = await archivedResponse.json() as { status: string };
+      expect(archived.status).toBe("archived");
+
+      const invalidLinksPatch = await app.request(`/v1/tasks/${encodeURIComponent(created.id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ links: ["obsidian://archive-review", 42] }),
+      });
+      expect(invalidLinksPatch.status).toBe(400);
+      expect(await invalidLinksPatch.json()).toEqual({ error: "invalid task patch" });
+
+      const listedResponse = await app.request("/v1/tasks");
+      expect(listedResponse.status).toBe(200);
+      const listed = await listedResponse.json() as { tasks: Array<{ id: string; status: string; links: string[] }> };
+      expect(listed.tasks).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: created.id, status: "archived", links }),
+      ]));
+    });
+  });
+
+  test("rejects malformed task session bodies with the public startAt/endAt validation error", async () => {
+    await withIsolatedGateway(async (app) => {
+      const createdResponse = await app.request("/v1/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Session schema boundary" }),
+      });
+      expect(createdResponse.status).toBe(201);
+      const created = await createdResponse.json() as { id: string };
+
+      const malformedBodies = [
+        { name: "missing endAt", body: { startAt: "2026-07-06T16:00:00.000Z" } },
+        { name: "non-string startAt", body: { startAt: 123, endAt: "2026-07-06T17:00:00.000Z" } },
+      ];
+      for (const { name, body } of malformedBodies) {
+        const response = await app.request(`/v1/tasks/sessions/${encodeURIComponent(created.id)}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const responseBody = await response.json() as { error: string };
+        expect({ name, status: response.status, body: responseBody }).toEqual({
+          name,
+          status: 400,
+          body: { error: "startAt and endAt are required" },
+        });
+      }
+
+      const planResponse = await app.request("/v1/tasks/plan");
+      expect(planResponse.status).toBe(200);
+      const plan = await planResponse.json() as { sessions: Array<{ taskId: string }> };
+      expect(plan.sessions.some((session) => session.taskId === created.id)).toBe(false);
     });
   });
 
@@ -265,7 +340,7 @@ describe("web API contracts", () => {
       const taskResponse = await app.request("/v1/tasks", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: "Review overview contracts", dueAt: currentWeekDate(3, 16).toISOString(), priority: "high", source: "overview-test" }),
+        body: JSON.stringify({ title: "Review overview contracts", dueAt: currentWeekDate(10, 16).toISOString(), priority: "high", source: "overview-test" }),
       });
       expect(taskResponse.status).toBe(201);
 
