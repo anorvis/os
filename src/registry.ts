@@ -7,6 +7,7 @@ import { createLlmWikiService } from "./capability/wiki/service";
 import type { ServiceFactory } from "./core/service/service";
 import { createEventsService } from "./platform/events/service";
 import { createOsService } from "./platform/status/service";
+import { createToolkitService } from "./platform/toolkit/service";
 import { createWebFinanceService } from "./product/web/finance/service";
 import { createWebHealthService } from "./product/web/health/service";
 import { createLifeService } from "./product/web/life/service";
@@ -15,6 +16,7 @@ import { createOverviewService } from "./product/web/overview/service";
 export const serviceFactories: ServiceFactory[] = [
   createLlmWikiService,
   createEventsService,
+  createToolkitService,
   createOverviewService,
   createIntegrationsService,
   createHealthService,
