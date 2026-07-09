@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { Schema } from "effect";
+import { decodeUnknownResult } from "../core/effect/schema";
 import { extractWikiLinks, firstParagraph, listMarkdownFiles, parseFrontmatter, readMarkdown, titleFromMarkdown } from "./utils";
 
 export type ManifestPage = {
@@ -16,6 +18,8 @@ export type LlmWikiManifest = {
   updatedAt: string;
   pages: ManifestPage[];
 };
+
+const ManifestJsonSchema = Schema.parseJson(Schema.Unknown);
 
 export function rebuildManifest(rootDir: string, now: Date = new Date()): LlmWikiManifest {
   const pages = listMarkdownFiles(rootDir, "wiki").map((path) => {
@@ -41,5 +45,6 @@ export function rebuildManifest(rootDir: string, now: Date = new Date()): LlmWik
 export function readManifest(rootDir: string): LlmWikiManifest {
   const path = join(rootDir, ".index", "manifest.json");
   if (!existsSync(path)) return rebuildManifest(rootDir);
-  return JSON.parse(readFileSync(path, "utf8")) as LlmWikiManifest;
+  const decoded = decodeUnknownResult(ManifestJsonSchema, readFileSync(path, "utf8"));
+  return decoded.ok ? (decoded.value as LlmWikiManifest) : rebuildManifest(rootDir);
 }

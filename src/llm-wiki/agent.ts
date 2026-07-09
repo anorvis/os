@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { Schema } from "effect";
+import { decodeUnknownResult } from "../core/effect/schema";
 import { getHomeDir } from "../paths";
 import { initLlmWiki } from "./init";
 import { rebuildManifest } from "./manifest";
@@ -27,6 +29,21 @@ export type AnorvisWikiResult = {
   gaps: string[];
   warnings: string[];
 };
+
+const AgentJsonTextSchema = Schema.parseJson(Schema.Unknown);
+const VaultRegistryTextSchema = Schema.parseJson(
+  Schema.Struct({
+    vaults: Schema.optional(
+      Schema.Array(
+        Schema.Struct({
+          name: Schema.String,
+          path: Schema.String,
+          addedAt: Schema.optional(Schema.String),
+        }),
+      ),
+    ),
+  }),
+);
 
 type VaultRef = { name: string; path: string };
 type WikiAgentRun = { task: string; rootDir: string; now: Date; allowWeb?: boolean; dryRun?: boolean; vault?: VaultRef };
@@ -113,8 +130,8 @@ Rules:
 
 function resolveVault(rootDir: string, query: string): VaultRef {
   const vaultsPath = join(rootDir, ".index", "vaults.json");
-  const json = JSON.parse(readFileSync(vaultsPath, "utf8")) as { vaults?: VaultRef[] };
-  const vaults = Array.isArray(json.vaults) ? json.vaults : [];
+  const decoded = decodeUnknownResult(VaultRegistryTextSchema, readFileSync(vaultsPath, "utf8"));
+  const vaults = decoded.ok ? decoded.value.vaults ?? [] : [];
   const normalizedQuery = query.toLowerCase();
   const queryPath = safeRealpath(query);
   const vault = vaults.find((item) => item.name.toLowerCase() === normalizedQuery || item.path === query || (queryPath && safeRealpath(item.path) === queryPath));
@@ -171,11 +188,13 @@ function runCommand(command: string, args: string[], cwd: string, timeoutMs: num
 }
 
 function parseAgentJson(stdout: string): unknown {
-  try { return JSON.parse(stdout); } catch { /* output may include incidental text */ }
+  const decoded = decodeUnknownResult(AgentJsonTextSchema, stdout);
+  if (decoded.ok) return decoded.value;
   const start = stdout.indexOf("{");
   const end = stdout.lastIndexOf("}");
   if (start < 0 || end <= start) return undefined;
-  try { return JSON.parse(stdout.slice(start, end + 1)); } catch { return undefined; }
+  const sliced = decodeUnknownResult(AgentJsonTextSchema, stdout.slice(start, end + 1));
+  return sliced.ok ? sliced.value : undefined;
 }
 
 function normalizeResult(task: string, value: unknown, warnings: string[]): AnorvisWikiResult {
