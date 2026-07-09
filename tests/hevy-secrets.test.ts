@@ -3,8 +3,8 @@ import { Buffer } from "node:buffer";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getDatabase, resetDatabaseForTests } from "../src/data/db/database";
-import { createApp } from "../src/gateway/app";
+import { getDatabase, resetDatabaseForTests } from "../src/core/db/database";
+import { createApp } from "../src/platform/gateway/app";
 
 type GatewayApp = {
   request(input: string | Request, init?: RequestInit): Promise<Response>;
@@ -21,7 +21,7 @@ type HevySettingsResponse = {
 type HevyConnectionRow = {
   status: string;
   settings_json: string | null;
-  secret_ref: string | null;
+  secret_refs_json: string | null;
 };
 
 async function withIsolatedGateway(run: (app: GatewayApp) => Promise<void>): Promise<void> {
@@ -55,10 +55,15 @@ async function withIsolatedGateway(run: (app: GatewayApp) => Promise<void>): Pro
 
 function hevyConnection(): HevyConnectionRow | null {
   return getDatabase().query<HevyConnectionRow, []>(`
-    SELECT status, settings_json, secret_ref
-    FROM integration_connections
-    WHERE integration_id = 'hevy'
+    SELECT status, settings_json, secret_refs_json
+    FROM provider_connections
+    WHERE provider_id = 'hevy'
   `).get() ?? null;
+}
+
+function hevySecretRef(row: HevyConnectionRow | null): string | undefined {
+  const refs = JSON.parse(row?.secret_refs_json ?? "{}") as { token?: string };
+  return refs.token;
 }
 
 function localSecretRecordExists(secretRef: string): boolean {
@@ -134,7 +139,7 @@ describe("Hevy secret gateway contracts", () => {
 
       const row = hevyConnection();
       expect(row?.status).toBe("connected");
-      const secretRef = row?.secret_ref;
+      const secretRef = hevySecretRef(row);
       if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
       expect(secretRef).not.toContain(apiKey);
       expect(secretRef).not.toContain(base64ApiKey);
@@ -156,7 +161,7 @@ describe("Hevy secret gateway contracts", () => {
         body: JSON.stringify({ apiKey }),
       });
       expect(saveResponse.status).toBe(200);
-      const secretRef = hevyConnection()?.secret_ref;
+      const secretRef = hevySecretRef(hevyConnection());
       if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
       expect(localSecretRecordExists(secretRef)).toBe(true);
 
@@ -173,8 +178,8 @@ describe("Hevy secret gateway contracts", () => {
 
       const disconnected = hevyConnection();
       expect(disconnected?.status).toBe("available");
-      expect(disconnected?.settings_json).toBeNull();
-      expect(disconnected?.secret_ref).toBeNull();
+      expect(disconnected?.settings_json).toBe("{}");
+      expect(disconnected?.secret_refs_json).toBe("{}");
       expect(localSecretRecordExists(secretRef)).toBe(false);
 
       const syncResponse = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
@@ -197,7 +202,7 @@ describe("Hevy secret gateway contracts", () => {
         body: JSON.stringify({ apiKey: "hevy_stale_token" }),
       });
       expect(saveResponse.status).toBe(200);
-      const secretRef = hevyConnection()?.secret_ref;
+      const secretRef = hevySecretRef(hevyConnection());
       if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
       const id = secretRef.startsWith("secret:") ? secretRef.slice("secret:".length) : secretRef;
       getDatabase().query("DELETE FROM secret_records WHERE id = ?1").run(id);
