@@ -1,4 +1,5 @@
 import { listCalendarEvents, type CalendarEvent as StoredCalendarEvent } from "../../../capability/calendar/data";
+import { listWorkoutsInRange, type Workout } from "../../../capability/health/data";
 import { readSnapshot } from "../../../core/snapshots/snapshots";
 import { listTasks, listTaskSessions, type Task, type TaskSession } from "../../../capability/task/data";
 
@@ -68,11 +69,12 @@ function buildLifeSnapshot(now: Date): LifeSnapshot {
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekEnd.getDate() + 7);
   const range = { timeMin: weekStart.toISOString(), timeMax: weekEnd.toISOString() };
+  const workoutEvents = listWorkoutsInRange(range).map(workoutToUiEvent);
   const storedEvents = listCalendarEvents(range).map(storedEventToUiEvent);
   const tasks = listTasks().filter((task) => task.status !== "completed" && task.status !== "archived");
   const sessions = listTaskSessions(range);
   const taskEvents = taskCalendarEvents(tasks, sessions, weekStart, weekEnd);
-  const events = [...storedEvents, ...taskEvents].sort((a, b) => a.date.localeCompare(b.date) || a.startMinute - b.startMinute);
+  const events = [...storedEvents, ...workoutEvents, ...taskEvents].sort((a, b) => a.date.localeCompare(b.date) || a.startMinute - b.startMinute);
   const todayKey = dateKey(now);
   const todayCalendarEvents = events.filter((event) => event.date === todayKey);
   const currentMinute = now.getHours() * 60 + now.getMinutes();
@@ -123,6 +125,25 @@ function storedEventToUiEvent(event: StoredCalendarEvent): UiCalendarEvent {
     source: event.source,
     calendarId: event.calendarId,
     readOnly: event.readOnly,
+  };
+}
+
+function workoutToUiEvent(workout: Workout): UiCalendarEvent {
+  const start = new Date(workout.startedAt);
+  const end = new Date(start.getTime() + Math.max(workout.durationSeconds, 1) * 1000);
+  const startMinute = start.getHours() * 60 + start.getMinutes();
+  return {
+    id: `workout:${workout.id}`,
+    summary: workout.title,
+    startMinute,
+    endMinute: Math.max(startMinute + 1, end.getHours() * 60 + end.getMinutes()),
+    type: "default",
+    dayIndex: start.getDay(),
+    date: dateKey(start),
+    tag: workout.source === "hevy" ? "hevy" : "health",
+    source: workout.source === "hevy" ? "hevy" : "health",
+    calendarId: workout.source === "hevy" ? "hevy" : "health",
+    readOnly: true,
   };
 }
 

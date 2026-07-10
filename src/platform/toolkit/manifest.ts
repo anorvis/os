@@ -1,4 +1,5 @@
 import { calendarToolkitTools } from "../../capability/calendar/toolkit";
+import { financeToolkitTools } from "../../capability/finance/toolkit";
 import { taskToolkitTools } from "../../capability/task/toolkit";
 import { lifeToolkitTools } from "../../product/web/life/toolkit";
 import type { ToolkitTool } from "./schema";
@@ -6,6 +7,7 @@ import type { ToolkitTool } from "./schema";
 const tools = [
   ...taskToolkitTools,
   ...calendarToolkitTools,
+  ...financeToolkitTools,
   ...lifeToolkitTools,
 ] satisfies ToolkitTool[];
 

@@ -3,7 +3,11 @@ import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetDatabaseForTests } from "../src/core/db/database";
-import { createApp, type App, type CreateAppOptions } from "../src/platform/gateway/app";
+import {
+  createApp,
+  type App,
+  type CreateAppOptions,
+} from "../src/platform/gateway/app";
 import type { AnorvisWikiResult } from "../src/llm-wiki";
 
 type EndpointFixture = {
@@ -97,6 +101,42 @@ function expectObject(value: unknown): Record<string, unknown> {
 function expectString(value: unknown): string {
   expect(typeof value).toBe("string");
   return value as string;
+}
+
+const HEVY_WORKOUTS_URL = "https://api.hevyapp.com/v1/workouts";
+const HEVY_BODY_MEASUREMENTS_URL =
+  "https://api.hevyapp.com/v1/body_measurements";
+
+// Mirrors os/tests/web-contract.test.ts and hevy-secrets.test.ts: swap globalThis.fetch so the
+// Hevy sync contract runs deterministically offline (empty workouts and body measurements)
+// instead of reaching the live api.hevyapp.com and failing on the fake token.
+function withFakeHevyFetch(): { restore: () => void } {
+  const original = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request): Promise<Response> => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    let payload: unknown;
+    if (url.startsWith(HEVY_WORKOUTS_URL)) {
+      payload = { workouts: [], page_count: 1 };
+    } else if (url.startsWith(HEVY_BODY_MEASUREMENTS_URL)) {
+      payload = { body_measurements: [], page_count: 1 };
+    } else {
+      return Promise.reject(
+        new Error(`unexpected network fetch in test: ${url}`),
+      );
+    }
+    return Promise.resolve(
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  }) as typeof fetch;
+  return { restore: () => void (globalThis.fetch = original) };
 }
 
 describe("Anorvis OS endpoint coverage", () => {
@@ -461,13 +501,19 @@ describe("Anorvis OS endpoint coverage", () => {
       expect(
         await expectJson(app, "/v1/finance/portfolio", undefined, 200),
       ).toEqual(expect.objectContaining({ portfolio: null, history: [] }));
+      const account = (await expectJson(
+        app,
+        "/v1/finance/accounts",
+        jsonRequest({ name: "Checking", type: "checking", currency: "USD" }),
+        201,
+      )) as { account: { id: string } };
       expect(
         await expectJson(
           app,
           "/v1/finance/imports/csv",
           jsonRequest({
             source: "manual",
-            accountName: "Checking",
+            accountId: account.account.id,
             balance: 1250,
             transactions: [
               {
@@ -540,16 +586,21 @@ describe("Anorvis OS endpoint coverage", () => {
           200,
         ),
       ).toEqual(expect.objectContaining({ ok: true, status: "connected" }));
-      expect(
-        await expectJson(
-          app,
-          "/v1/integrations/hevy/sync",
-          { method: "POST" },
-          200,
-        ),
-      ).toEqual(
-        expect.objectContaining({ fetched: 0, created: 0, updated: 0 }),
-      );
+      const hevyFetch = withFakeHevyFetch();
+      try {
+        expect(
+          await expectJson(
+            app,
+            "/v1/integrations/hevy/sync",
+            { method: "POST" },
+            200,
+          ),
+        ).toEqual(
+          expect.objectContaining({ fetched: 0, created: 0, updated: 0 }),
+        );
+      } finally {
+        hevyFetch.restore();
+      }
       expect(
         await expectJson(
           app,
@@ -707,6 +758,4 @@ describe("Anorvis OS endpoint coverage", () => {
       ).toEqual({ error: "not_found" });
     });
   });
-
-
 });

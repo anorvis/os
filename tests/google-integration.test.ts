@@ -15,6 +15,7 @@ const CLIENT_SECRET = "GOCSPX-super-secret-client-value";
 const ACCESS_TOKEN = "ya29.mock-access-token-abcdef";
 const REFRESH_TOKEN = "1//mock-refresh-token-xyz";
 
+const API_TOKEN = "test-api-token-1234567890";
 type GoogleSettingsResponse = {
   connected: boolean;
   hasClientConfig: boolean;
@@ -302,6 +303,51 @@ describe("Google integration gateway contracts", () => {
       const viewText = JSON.stringify(settings);
       expect(viewText).not.toContain(ACCESS_TOKEN);
       expect(viewText).not.toContain(REFRESH_TOKEN);
+    });
+  });
+
+  test("callback accepts Google redirect without gateway bearer token", async () => {
+    await withIsolatedGateway(async (app) => {
+      process.env.ANORVIS_OS_API_TOKEN = API_TOKEN;
+      const authHeaders = {
+        authorization: `Bearer ${API_TOKEN}`,
+        "content-type": "application/json",
+      };
+
+      const saved = await app.request("/v1/integrations/google/settings", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET }),
+      });
+      expect(saved.status).toBe(200);
+
+      const started = await app.request("/v1/integrations/google/auth/start", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({}),
+      });
+      expect(started.status).toBe(200);
+      const { state } = (await started.json()) as AuthStartResponse;
+
+      const protectedStatus = await app.request("/v1/integrations/google/status");
+      expect(protectedStatus.status).toBe(401);
+
+      const fake = withFakeGoogleFetch({ token: () => ({ payload: OK_TOKEN }) });
+      try {
+        const callback = await app.request(
+          `/v1/integrations/google/auth/callback?code=auth-code-abc&state=${encodeURIComponent(state)}`,
+        );
+        expect(callback.status).toBe(302);
+        expect(callback.headers.get("location")).toBe("http://localhost:3000/life");
+      } finally {
+        fake.restore();
+      }
+
+      const connected = await app.request("/v1/integrations/google/status", {
+        headers: { authorization: `Bearer ${API_TOKEN}` },
+      });
+      expect(connected.status).toBe(200);
+      expect(((await connected.json()) as GoogleSettingsResponse).connected).toBe(true);
     });
   });
 

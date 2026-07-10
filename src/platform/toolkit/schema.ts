@@ -1,8 +1,16 @@
 import { JSONSchema, type Schema } from "effect";
 
 export type ToolkitMethod = "GET" | "POST" | "PATCH" | "DELETE";
-export type ToolkitOperation = "read" | "create" | "update" | "complete" | "delete" | "start" | "stop";
-export type ToolkitResource = "task" | "calendar_event" | "task_session" | "life_snapshot";
+export type ToolkitOperation =
+  "read" | "create" | "update" | "complete" | "delete" | "start" | "stop";
+export type ToolkitResource =
+  | "task"
+  | "calendar_event"
+  | "task_session"
+  | "life_snapshot"
+  | "finance_dashboard"
+  | "finance_account"
+  | "finance_import";
 
 export type ToolkitTool = {
   id: string;

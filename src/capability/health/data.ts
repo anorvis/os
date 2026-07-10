@@ -64,16 +64,40 @@ export type Workout = {
   }>;
 };
 
+export type BodyMeasurement = {
+  id: string;
+  source: string;
+  weightKg: number | null;
+  leanMassKg: number | null;
+  bodyFatPercent: number | null;
+  heightCm: number | null;
+  neckCm: number | null;
+  shoulderCm: number | null;
+  chestCm: number | null;
+  leftBicepCm: number | null;
+  rightBicepCm: number | null;
+  leftForearmCm: number | null;
+  rightForearmCm: number | null;
+  abdomenCm: number | null;
+  waistCm: number | null;
+  hipsCm: number | null;
+  leftThighCm: number | null;
+  rightThighCm: number | null;
+  leftCalfCm: number | null;
+  rightCalfCm: number | null;
+  recordedAt: string;
+};
+
+export type BodyMeasurementInput = Omit<BodyMeasurement, "id" | "heightCm"> & {
+  sourceId: string;
+};
+
 export type HealthDashboard = {
   macroProfile: MacroProfile | null;
   todayMeals: Meal[];
   recentMeals: Meal[];
   recentWorkouts: Workout[];
-  latestCheckin: {
-    weightKg: number;
-    adherencePercent: number;
-    checkedInAt: string;
-  } | null;
+  measurementHistory: BodyMeasurement[];
 };
 
 export type MealInput = {
@@ -142,6 +166,29 @@ type MacroProfileRow = {
   created_at: string;
   updated_at: string;
 };
+type BodyMeasurementRow = {
+  id: string;
+  source: string;
+  recorded_at: string;
+  weight_kg: number | null;
+  lean_mass_kg: number | null;
+  fat_percent: number | null;
+  neck_cm: number | null;
+  shoulder_cm: number | null;
+  chest_cm: number | null;
+  left_bicep_cm: number | null;
+  right_bicep_cm: number | null;
+  left_forearm_cm: number | null;
+  right_forearm_cm: number | null;
+  abdomen_cm: number | null;
+  waist_cm: number | null;
+  hips_cm: number | null;
+  left_thigh_cm: number | null;
+  right_thigh_cm: number | null;
+  left_calf_cm: number | null;
+  right_calf_cm: number | null;
+};
+
 
 type WorkoutRow = {
   id: string;
@@ -195,7 +242,7 @@ function buildHealthDashboard(now: Date): HealthDashboard {
     SELECT id, name, meal_type, logged_at, calories, protein_grams, carbs_grams, fat_grams, source, notes
     FROM meals
     ORDER BY logged_at DESC
-    LIMIT 20
+    LIMIT 100
   `)
     .all()
     .map(rowToMeal);
@@ -204,7 +251,176 @@ function buildHealthDashboard(now: Date): HealthDashboard {
     todayMeals,
     recentMeals,
     recentWorkouts: listRecentWorkouts(),
-    latestCheckin: null,
+    measurementHistory: listMeasurementHistory(),
+  };
+}
+
+export function listMeasurementHistory(): HealthDashboard["measurementHistory"] {
+  const profileMeasurements = getDatabase()
+    .query<
+      {
+        id: string;
+        weight_kg: number | null;
+        body_fat_percent: number | null;
+        height_cm: number | null;
+        updated_at: string;
+      },
+      []
+    >(`
+      SELECT id, weight_kg, body_fat_percent, height_cm, updated_at
+      FROM macro_profiles
+    `)
+    .all()
+    .map((row): BodyMeasurement => ({
+      id: row.id,
+      source: "manual",
+      weightKg: row.weight_kg,
+      leanMassKg: null,
+      bodyFatPercent: row.body_fat_percent,
+      heightCm: row.height_cm,
+      neckCm: null,
+      shoulderCm: null,
+      chestCm: null,
+      leftBicepCm: null,
+      rightBicepCm: null,
+      leftForearmCm: null,
+      rightForearmCm: null,
+      abdomenCm: null,
+      waistCm: null,
+      hipsCm: null,
+      leftThighCm: null,
+      rightThighCm: null,
+      leftCalfCm: null,
+      rightCalfCm: null,
+      recordedAt: row.updated_at,
+    }));
+  const syncedMeasurements = getDatabase()
+    .query<BodyMeasurementRow, []>(`
+      SELECT id, source, recorded_at, weight_kg, lean_mass_kg, fat_percent,
+        neck_cm, shoulder_cm, chest_cm, left_bicep_cm, right_bicep_cm,
+        left_forearm_cm, right_forearm_cm, abdomen_cm, waist_cm, hips_cm,
+        left_thigh_cm, right_thigh_cm, left_calf_cm, right_calf_cm
+      FROM body_measurements
+    `)
+    .all()
+    .map(rowToBodyMeasurement);
+  return [...profileMeasurements, ...syncedMeasurements].sort((left, right) =>
+    left.recordedAt.localeCompare(right.recordedAt),
+  );
+}
+
+export function bodyMeasurementExists(id: string): boolean {
+  return Boolean(
+    getDatabase()
+      .query<{ id: string }, [string]>(
+        "SELECT id FROM body_measurements WHERE id = ?1",
+      )
+      .get(id),
+  );
+}
+
+export function upsertBodyMeasurement(
+  id: string,
+  input: BodyMeasurementInput,
+  now = new Date(),
+): BodyMeasurement {
+  const timestamp = now.toISOString();
+  getDatabase()
+    .query(`
+      INSERT INTO body_measurements (
+        id, source, source_id, recorded_at, weight_kg, lean_mass_kg, fat_percent,
+        neck_cm, shoulder_cm, chest_cm, left_bicep_cm, right_bicep_cm,
+        left_forearm_cm, right_forearm_cm, abdomen_cm, waist_cm, hips_cm,
+        left_thigh_cm, right_thigh_cm, left_calf_cm, right_calf_cm,
+        created_at, updated_at
+      ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        source = excluded.source,
+        source_id = excluded.source_id,
+        recorded_at = excluded.recorded_at,
+        weight_kg = excluded.weight_kg,
+        lean_mass_kg = excluded.lean_mass_kg,
+        fat_percent = excluded.fat_percent,
+        neck_cm = excluded.neck_cm,
+        shoulder_cm = excluded.shoulder_cm,
+        chest_cm = excluded.chest_cm,
+        left_bicep_cm = excluded.left_bicep_cm,
+        right_bicep_cm = excluded.right_bicep_cm,
+        left_forearm_cm = excluded.left_forearm_cm,
+        right_forearm_cm = excluded.right_forearm_cm,
+        abdomen_cm = excluded.abdomen_cm,
+        waist_cm = excluded.waist_cm,
+        hips_cm = excluded.hips_cm,
+        left_thigh_cm = excluded.left_thigh_cm,
+        right_thigh_cm = excluded.right_thigh_cm,
+        left_calf_cm = excluded.left_calf_cm,
+        right_calf_cm = excluded.right_calf_cm,
+        updated_at = excluded.updated_at
+    `)
+    .run(
+      id,
+      input.source,
+      input.sourceId,
+      input.recordedAt,
+      input.weightKg,
+      input.leanMassKg,
+      input.bodyFatPercent,
+      input.neckCm,
+      input.shoulderCm,
+      input.chestCm,
+      input.leftBicepCm,
+      input.rightBicepCm,
+      input.leftForearmCm,
+      input.rightForearmCm,
+      input.abdomenCm,
+      input.waistCm,
+      input.hipsCm,
+      input.leftThighCm,
+      input.rightThighCm,
+      input.leftCalfCm,
+      input.rightCalfCm,
+      timestamp,
+    );
+  const row = getDatabase()
+    .query<BodyMeasurementRow, [string]>(`
+      SELECT id, source, recorded_at, weight_kg, lean_mass_kg, fat_percent,
+        neck_cm, shoulder_cm, chest_cm, left_bicep_cm, right_bicep_cm,
+        left_forearm_cm, right_forearm_cm, abdomen_cm, waist_cm, hips_cm,
+        left_thigh_cm, right_thigh_cm, left_calf_cm, right_calf_cm
+      FROM body_measurements
+      WHERE id = ?1
+    `)
+    .get(id);
+  if (!row) throw new Error("Saved body measurement could not be read.");
+  return rowToBodyMeasurement(row);
+}
+
+function rowToBodyMeasurement(row: BodyMeasurementRow): BodyMeasurement {
+  return {
+    id: row.id,
+    source: row.source,
+    weightKg: row.weight_kg,
+    leanMassKg: row.lean_mass_kg,
+    bodyFatPercent: row.fat_percent,
+    heightCm: null,
+    neckCm: row.neck_cm,
+    shoulderCm: row.shoulder_cm,
+    chestCm: row.chest_cm,
+    leftBicepCm: row.left_bicep_cm,
+    rightBicepCm: row.right_bicep_cm,
+    leftForearmCm: row.left_forearm_cm,
+    rightForearmCm: row.right_forearm_cm,
+    abdomenCm: row.abdomen_cm,
+    waistCm: row.waist_cm,
+    hipsCm: row.hips_cm,
+    leftThighCm: row.left_thigh_cm,
+    rightThighCm: row.right_thigh_cm,
+    leftCalfCm: row.left_calf_cm,
+    rightCalfCm: row.right_calf_cm,
+    recordedAt: row.recorded_at,
   };
 }
 
@@ -422,6 +638,14 @@ export function createWorkout(input: WorkoutInput, now = new Date()): Workout {
   return saveWorkout(randomUUID(), input, now);
 }
 
+export function upsertWorkout(
+  id: string,
+  input: WorkoutInput,
+  now = new Date(),
+): Workout {
+  return saveWorkout(id, input, now);
+}
+
 export function updateWorkout(
   id: string,
   input: WorkoutInput,
@@ -429,6 +653,10 @@ export function updateWorkout(
 ): Workout | null {
   if (!getWorkout(id)) return null;
   return saveWorkout(id, input, now);
+}
+
+export function workoutExists(id: string): boolean {
+  return Boolean(getWorkout(id));
 }
 
 export function parseWorkoutInput(value: unknown): WorkoutInput | null {
@@ -568,9 +796,33 @@ function listRecentWorkouts(): Workout[] {
     SELECT id, title, started_at, duration_seconds, notes, source
     FROM workouts
     ORDER BY started_at DESC
-    LIMIT 10
+    LIMIT 100
   `)
     .all();
+  return workouts.map((workout) => ({
+    id: workout.id,
+    title: workout.title,
+    startedAt: workout.started_at,
+    durationSeconds: workout.duration_seconds,
+    notes: workout.notes,
+    source: workout.source,
+    exercises: listWorkoutExercises(workout.id),
+  }));
+}
+
+export function listWorkoutsInRange(input: {
+  timeMin?: string | null;
+  timeMax?: string | null;
+}): Workout[] {
+  const workouts = getDatabase()
+    .query<WorkoutRow, [string | null, string | null]>(`
+    SELECT id, title, started_at, duration_seconds, notes, source
+    FROM workouts
+    WHERE (?1 IS NULL OR datetime(started_at, '+' || duration_seconds || ' seconds') >= datetime(?1))
+      AND (?2 IS NULL OR datetime(started_at) <= datetime(?2))
+    ORDER BY started_at ASC
+  `)
+    .all(input.timeMin ?? null, input.timeMax ?? null);
   return workouts.map((workout) => ({
     id: workout.id,
     title: workout.title,
@@ -651,11 +903,11 @@ function rowToMeal(row: MealRow): Meal {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return decodeUnknownResult(HealthJsonObjectSchema, value).ok;
 }
 
-function stringField(
+export function stringField(
   value: Record<string, unknown>,
   key: string,
 ): string | undefined {
@@ -663,7 +915,7 @@ function stringField(
   return typeof field === "string" ? field : undefined;
 }
 
-function nullableStringField(
+export function nullableStringField(
   value: Record<string, unknown>,
   key: string,
 ): string | null {
@@ -672,7 +924,7 @@ function nullableStringField(
   return typeof field === "string" && field.trim() ? field : null;
 }
 
-function numberField(
+export function numberField(
   value: Record<string, unknown>,
   key: string,
 ): number | undefined {
@@ -682,16 +934,16 @@ function numberField(
     : undefined;
 }
 
-function stringValue(value: unknown): string | undefined {
+export function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function nullableStringValue(value: unknown): string | null {
+export function nullableStringValue(value: unknown): string | null {
   if (value === null) return null;
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-function numberValue(value: unknown): number | undefined {
+export function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value)
     ? value
     : undefined;

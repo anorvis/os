@@ -1,5 +1,6 @@
 import { createCalendarService } from "./capability/calendar/service";
 import { createFinanceService } from "./capability/finance/service";
+import { createLifeTagsService } from "./capability/life-tags/service";
 import { createHealthService } from "./capability/health/service";
 import { createIntegrationsService } from "./capability/integration/service";
 import { createTasksService } from "./capability/task/service";
@@ -25,6 +26,7 @@ export const serviceFactories: ServiceFactory[] = [
   createWebFinanceService,
   createTasksService,
   createCalendarService,
+  createLifeTagsService,
   createLifeService,
   createOsService,
 ];

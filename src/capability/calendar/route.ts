@@ -1,7 +1,8 @@
 import { emitInvalidation } from "../../core/events/events";
 import { json, parseJsonRequest, validDateParam } from "../../core/http/http";
 import type { RouteRegistrar } from "../../core/service/service";
-import { createCalendarEvent, deleteCalendarEvent, listCalendarEvents, parseCalendarEventInput, parseCalendarEventPatch, updateCalendarEvent } from "./data";
+import { createCalendarEvent, deleteCalendarEvent, listCalendarEvents, parseCalendarEventInput, parseCalendarEventPatch, updateCalendarEvent, type CalendarEvent } from "./data";
+import { listWorkoutsInRange, type Workout } from "../health/data";
 import { listGoogleCalendarEvents } from "../integration/google";
 
 export function calendarRoutes(): RouteRegistrar {
@@ -24,7 +25,11 @@ export function calendarRoutes(): RouteRegistrar {
             })
               .then((payload) => payload.events.flatMap(googleEventToCalendarEvent))
               .catch(() => []);
-      const items = [...events, ...googleEvents].sort((a, b) => a.startAt.localeCompare(b.startAt));
+      const hevyEvents =
+        params.includeProviders === false
+          ? []
+          : listWorkoutsInRange(params).map(workoutToCalendarEvent);
+      const items = [...events, ...googleEvents, ...hevyEvents].sort((a, b) => a.startAt.localeCompare(b.startAt));
       return json({ events: items, items });
     });
 
@@ -66,6 +71,28 @@ export function calendarRoutes(): RouteRegistrar {
   };
 }
 
+function workoutToCalendarEvent(workout: Workout): CalendarEvent {
+  const start = new Date(workout.startedAt);
+  const end = new Date(start.getTime() + Math.max(workout.durationSeconds, 1) * 1000);
+  return {
+    id: `workout:${workout.id}`,
+    summary: workout.title,
+    startAt: start.toISOString(),
+    endAt: end.toISOString(),
+    location: undefined,
+    description: workout.notes ?? undefined,
+    tag: workout.source === "hevy" ? "hevy" : "health",
+    source: workout.source === "hevy" ? "hevy" : "health",
+    readOnly: true,
+    providerEventId: workout.id,
+    calendarId: workout.source === "hevy" ? "hevy" : "health",
+    allDay: false,
+    timezone: null,
+    createdAt: workout.startedAt,
+    updatedAt: workout.startedAt,
+  };
+}
+
 type GoogleCalendarApiEvent = {
   id?: string;
   calendarId?: string;
@@ -87,8 +114,8 @@ function googleEventToCalendarEvent(event: GoogleCalendarApiEvent) {
   return [{
     id: `google:${event.calendarId ?? "primary"}:${event.id ?? start.toISOString()}`,
     summary: event.summary || "untitled event",
-    startAt: start.toISOString(),
-    endAt: end > start ? end.toISOString() : new Date(start.getTime() + 30 * 60_000).toISOString(),
+    startAt: allDay ? startRaw : start.toISOString(),
+    endAt: allDay ? endRaw : end > start ? end.toISOString() : new Date(start.getTime() + 30 * 60_000).toISOString(),
     tag: "google calendar",
     source: "google-calendar",
     readOnly: true,
