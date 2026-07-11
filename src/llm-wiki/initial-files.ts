@@ -27,9 +27,25 @@ Created: ${today}
 3. Prefer updating existing pages over duplicating concepts.
 4. Use Obsidian \`[[wikilinks]]\` for relationships.
 5. Preserve provenance: link claims back to raw sources or prior wiki pages.
-6. Mark uncertainty, contradictions, stale claims, and gaps explicitly.
+6. Mark uncertainty, contradictions, stale claims, and gaps explicitly. Prefix claims not directly stated in a source with \`[inferred]\` so later verification can separate source from synthesis.
 7. Never store secrets, tokens, cookies, passwords, or raw private transcripts as wiki synthesis.
 8. Raw sources may contain private material; compiled wiki pages should contain only useful synthesized knowledge with provenance.
+
+## Page types and routing
+
+Choose the page type by scope, not by topic:
+
+- \`wiki/projects/\` — state, plans, and detail scoped to one ongoing effort.
+- \`wiki/preferences/\` — durable user preferences and agent-tailoring guidance.
+- \`wiki/decisions/\` — decisions that are reusable beyond one project or that changed direction; link back to the originating project page.
+- \`wiki/workflows/\` — repeatable procedures the user follows more than once.
+- \`wiki/entities/\` — people, places, tools, courses, and organizations referenced from two or more pages; hub pages that link the pages mentioning them.
+- \`wiki/concepts/\` — general knowledge synthesized across sources.
+- \`wiki/comparisons/\` — evaluated alternatives and their tradeoffs.
+- \`wiki/sources/\` — durable external references (web lookups, documents) worth citing again.
+- \`wiki/queries/\` — recorded question/answer tasks.
+
+Project-scoped facts stay inline in the project page. Create a typed page once a fact is referenced from two or more pages or outlives its originating project — then link it with \`[[wikilinks]]\` instead of duplicating the content.
 
 ## Page conventions
 

@@ -136,7 +136,11 @@ async function compileInteractionMemory(input: InteractionMemoryInput, rawPath: 
     `Raw source: ${rawPath}`,
     input.prompt ? `User prompt: ${redact(truncate(input.prompt, 1_000))}` : undefined,
     "Read the raw source, then update existing wiki pages before creating new ones.",
-    "Extract only durable preferences, project facts, decisions, workflows, recurring goals, and user-tailoring guidance.",
+    "Extract every durable fact worth remembering: preferences, project facts, decisions, workflows, goals, biographical details, dates, events, relationships, skills, opinions, plans, and user-tailoring guidance.",
+    "Prefer many small dated claims over one summary sentence; a fact too minor for its own bullet is still worth a clause.",
+    "Distinguish evidence levels: write directly stated facts plainly; prefix speculative or derived claims with `[inferred]`. Keep a provenance link either way so later verification can separate source from synthesis.",
+    "File facts involving multiple people on every involved person's page, not only the speaker's.",
+    "Route by scope per AGENTS.md: project-scoped detail stays in the project page; reusable cross-project decisions, repeatable workflows, and recurring entities get their own typed page under wiki/decisions/, wiki/workflows/, or wiki/entities/, wikilinked from related pages.",
     "Do not preserve secrets, credentials, one-off transcript detail, or private raw transcript in compiled wiki pages.",
     "If there is no durable memory, leave compiled pages unchanged and report unchanged.",
   ].filter(Boolean).join("\n");
