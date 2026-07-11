@@ -24,7 +24,9 @@ type HevyConnectionRow = {
   secret_refs_json: string | null;
 };
 
-async function withIsolatedGateway(run: (app: GatewayApp) => Promise<void>): Promise<void> {
+async function withIsolatedGateway(
+  run: (app: GatewayApp) => Promise<void>,
+): Promise<void> {
   const oldHome = process.env.HOME;
   const oldToken = process.env.ANORVIS_OS_API_TOKEN;
   const oldDbPath = process.env.ANORVIS_DB_PATH;
@@ -46,19 +48,27 @@ async function withIsolatedGateway(run: (app: GatewayApp) => Promise<void>): Pro
     else process.env.ANORVIS_OS_API_TOKEN = oldToken;
     if (oldDbPath === undefined) delete process.env.ANORVIS_DB_PATH;
     else process.env.ANORVIS_DB_PATH = oldDbPath;
-    if (oldSecretProvider === undefined) delete process.env.ANORVIS_SECRET_PROVIDER;
+    if (oldSecretProvider === undefined)
+      delete process.env.ANORVIS_SECRET_PROVIDER;
     else process.env.ANORVIS_SECRET_PROVIDER = oldSecretProvider;
-    if (oldSecretKeyPath === undefined) delete process.env.ANORVIS_SECRET_KEY_PATH;
+    if (oldSecretKeyPath === undefined)
+      delete process.env.ANORVIS_SECRET_KEY_PATH;
     else process.env.ANORVIS_SECRET_KEY_PATH = oldSecretKeyPath;
   }
 }
 
 function hevyConnection(): HevyConnectionRow | null {
-  return getDatabase().query<HevyConnectionRow, []>(`
+  return (
+    getDatabase()
+      .query<HevyConnectionRow, []>(
+        `
     SELECT status, settings_json, secret_refs_json
     FROM provider_connections
     WHERE provider_id = 'hevy'
-  `).get() ?? null;
+  `,
+      )
+      .get() ?? null
+  );
 }
 
 function hevySecretRef(row: HevyConnectionRow | null): string | undefined {
@@ -67,8 +77,16 @@ function hevySecretRef(row: HevyConnectionRow | null): string | undefined {
 }
 
 function localSecretRecordExists(secretRef: string): boolean {
-  const id = secretRef.startsWith("secret:") ? secretRef.slice("secret:".length) : secretRef;
-  return getDatabase().query<{ present: number }, [string]>("SELECT 1 AS present FROM secret_records WHERE id = ?1").get(id)?.present === 1;
+  const id = secretRef.startsWith("secret:")
+    ? secretRef.slice("secret:".length)
+    : secretRef;
+  return (
+    getDatabase()
+      .query<{ present: number }, [string]>(
+        "SELECT 1 AS present FROM secret_records WHERE id = ?1",
+      )
+      .get(id)?.present === 1
+  );
 }
 
 async function readFirstSseChunk(response: Response): Promise<string> {
@@ -114,7 +132,12 @@ const HEVY_WORKOUT = {
   description: "Chest and triceps",
   start_time: "2032-05-10T08:00:00.000Z",
   end_time: "2032-05-10T09:00:00.000Z",
-  exercises: [{ title: "Bench Press", sets: [{ type: "normal", reps: 8, weight_kg: 60 }] }],
+  exercises: [
+    {
+      title: "Bench Press",
+      sets: [{ type: "normal", reps: 8, weight_kg: 60 }],
+    },
+  ],
 };
 
 function withFakeHevyFetch(handler: () => HevyFetchResult): {
@@ -125,11 +148,20 @@ function withFakeHevyFetch(handler: () => HevyFetchResult): {
   const original = globalThis.fetch;
   const apiKeys: string[] = [];
   const requestedUrls: string[] = [];
-  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  globalThis.fetch = ((
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
     const url =
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
     if (!url.startsWith(HEVY_WORKOUTS_URL)) {
-      return Promise.reject(new Error(`unexpected network fetch in test: ${url}`));
+      return Promise.reject(
+        new Error(`unexpected network fetch in test: ${url}`),
+      );
     }
     requestedUrls.push(url);
     const headers = new Headers(
@@ -145,14 +177,20 @@ function withFakeHevyFetch(handler: () => HevyFetchResult): {
       }),
     );
   }) as typeof fetch;
-  return { apiKeys, requestedUrls, restore: () => void (globalThis.fetch = original) };
+  return {
+    apiKeys,
+    requestedUrls,
+    restore: () => void (globalThis.fetch = original),
+  };
 }
 
 const HEVY_ROUTINES_URL = "https://api.hevyapp.com/v1/routines";
 
 // Like withFakeHevyFetch, but scoped to GET /v1/routines and keyed by page so a test can
 // serve a distinct payload per page and observe exactly which pages were fetched.
-function withFakeHevyRoutinesFetch(handler: (page: number) => HevyFetchResult): {
+function withFakeHevyRoutinesFetch(
+  handler: (page: number) => HevyFetchResult,
+): {
   apiKeys: string[];
   requestedPages: number[];
   restore: () => void;
@@ -160,11 +198,20 @@ function withFakeHevyRoutinesFetch(handler: (page: number) => HevyFetchResult): 
   const original = globalThis.fetch;
   const apiKeys: string[] = [];
   const requestedPages: number[] = [];
-  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  globalThis.fetch = ((
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
     const url =
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
     if (!url.startsWith(HEVY_ROUTINES_URL)) {
-      return Promise.reject(new Error(`unexpected network fetch in test: ${url}`));
+      return Promise.reject(
+        new Error(`unexpected network fetch in test: ${url}`),
+      );
     }
     const page = Number(new URL(url).searchParams.get("page") ?? "1");
     requestedPages.push(page);
@@ -181,7 +228,97 @@ function withFakeHevyRoutinesFetch(handler: (page: number) => HevyFetchResult): 
       }),
     );
   }) as typeof fetch;
-  return { apiKeys, requestedPages, restore: () => void (globalThis.fetch = original) };
+  return {
+    apiKeys,
+    requestedPages,
+    restore: () => void (globalThis.fetch = original),
+  };
+}
+
+type RoutineCreateFetchResult = { status?: number; payload: unknown };
+
+function withFakeHevyRoutineCreateFetch(
+  handler: (request: {
+    url: string;
+    method: string;
+    apiKey: string | null;
+    contentType: string | null;
+    body: unknown;
+  }) => RoutineCreateFetchResult,
+): {
+  requests: Array<{
+    url: string;
+    method: string;
+    apiKey: string | null;
+    contentType: string | null;
+    body: unknown;
+  }>;
+  restore: () => void;
+} {
+  const original = globalThis.fetch;
+  const requests: Array<{
+    url: string;
+    method: string;
+    apiKey: string | null;
+    contentType: string | null;
+    body: unknown;
+  }> = [];
+  globalThis.fetch = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    if (url !== HEVY_ROUTINES_URL) {
+      throw new Error(`unexpected network fetch in test: ${url}`);
+    }
+    const headers = new Headers(
+      init?.headers ?? (input instanceof Request ? input.headers : undefined),
+    );
+    const rawBody =
+      init?.body ?? (input instanceof Request ? await input.text() : undefined);
+    const parsedBody: unknown =
+      typeof rawBody === "string" ? (JSON.parse(rawBody) as unknown) : rawBody;
+    const request = {
+      url,
+      method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+      apiKey: headers.get("api-key"),
+      contentType: headers.get("content-type"),
+      body: parsedBody,
+    };
+    requests.push(request);
+    const { status = 201, payload } = handler(request);
+    return new Response(JSON.stringify(payload), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  return { requests, restore: () => void (globalThis.fetch = original) };
+}
+
+function withUnexpectedFetchGuard(): { calls: number; restore: () => void } {
+  const original = globalThis.fetch;
+  const guard = {
+    calls: 0,
+    restore: () => void (globalThis.fetch = original),
+  };
+  globalThis.fetch = ((input: string | URL | Request): Promise<Response> => {
+    guard.calls += 1;
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    return Promise.reject(
+      new Error(`unexpected network fetch in test: ${url}`),
+    );
+  }) as typeof fetch;
+  return guard;
 }
 
 describe("Hevy secret gateway contracts", () => {
@@ -197,15 +334,24 @@ describe("Hevy secret gateway contracts", () => {
       expect(await response.json()).toEqual({ error: "apiKey is required" });
       expect(hevyConnection()).toBeNull();
 
-      const settingsResponse = await app.request("/v1/integrations/hevy/settings");
+      const settingsResponse = await app.request(
+        "/v1/integrations/hevy/settings",
+      );
       expect(settingsResponse.status).toBe(200);
-      expect(await settingsResponse.json()).toEqual({ connected: false, hasApiKey: false, lastCheckedAt: null, secretProvider: null });
+      expect(await settingsResponse.json()).toEqual({
+        connected: false,
+        hasApiKey: false,
+        lastCheckedAt: null,
+        secretProvider: null,
+      });
     });
   });
 
   test("forbids Hevy sync until an API key is connected", async () => {
     await withIsolatedGateway(async (app) => {
-      const response = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+      const response = await app.request("/v1/integrations/hevy/sync", {
+        method: "POST",
+      });
 
       expect(response.status).toBe(403);
       expect(await response.json()).toEqual({
@@ -229,7 +375,7 @@ describe("Hevy secret gateway contracts", () => {
       });
 
       expect(response.status).toBe(200);
-      const settings = await response.json() as HevySettingsResponse;
+      const settings = (await response.json()) as HevySettingsResponse;
       expect(settings.ok).toBe(true);
       expect(settings.status).toBe("connected");
       expect(settings.connected).toBe(true);
@@ -239,17 +385,26 @@ describe("Hevy secret gateway contracts", () => {
       const row = hevyConnection();
       expect(row?.status).toBe("connected");
       const secretRef = hevySecretRef(row);
-      if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
+      if (typeof secretRef !== "string")
+        throw new Error("Expected a stored secret reference.");
       expect(secretRef).not.toContain(apiKey);
       expect(secretRef).not.toContain(base64ApiKey);
       expect(row?.settings_json ?? "").not.toContain(apiKey);
       expect(row?.settings_json ?? "").not.toContain(base64ApiKey);
 
-      const fetchFake = withFakeHevyFetch(() => ({ payload: { workouts: [] } }));
+      const fetchFake = withFakeHevyFetch(() => ({
+        payload: { workouts: [] },
+      }));
       try {
-        const syncResponse = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+        const syncResponse = await app.request("/v1/integrations/hevy/sync", {
+          method: "POST",
+        });
         expect(syncResponse.status).toBe(200);
-        expect(await syncResponse.json()).toEqual({ fetched: 0, created: 0, updated: 0 });
+        expect(await syncResponse.json()).toEqual({
+          fetched: 0,
+          created: 0,
+          updated: 0,
+        });
       } finally {
         fetchFake.restore();
       }
@@ -266,16 +421,23 @@ describe("Hevy secret gateway contracts", () => {
       });
       expect(saveResponse.status).toBe(200);
       const secretRef = hevySecretRef(hevyConnection());
-      if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
+      if (typeof secretRef !== "string")
+        throw new Error("Expected a stored secret reference.");
       expect(localSecretRecordExists(secretRef)).toBe(true);
 
-      const disconnectResponse = await app.request("/v1/integrations/hevy/disconnect", { method: "POST" });
+      const disconnectResponse = await app.request(
+        "/v1/integrations/hevy/disconnect",
+        { method: "POST" },
+      );
       expect(disconnectResponse.status).toBe(200);
       expect(await disconnectResponse.json()).toEqual({ ok: true });
 
-      const settingsResponse = await app.request("/v1/integrations/hevy/settings");
+      const settingsResponse = await app.request(
+        "/v1/integrations/hevy/settings",
+      );
       expect(settingsResponse.status).toBe(200);
-      const disconnectedSettings = await settingsResponse.json() as HevySettingsResponse;
+      const disconnectedSettings =
+        (await settingsResponse.json()) as HevySettingsResponse;
       expect(disconnectedSettings.connected).toBe(false);
       expect(disconnectedSettings.hasApiKey).toBe(false);
       expect(disconnectedSettings.secretProvider).toBeNull();
@@ -286,7 +448,9 @@ describe("Hevy secret gateway contracts", () => {
       expect(disconnected?.secret_refs_json).toBe("{}");
       expect(localSecretRecordExists(secretRef)).toBe(false);
 
-      const syncResponse = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+      const syncResponse = await app.request("/v1/integrations/hevy/sync", {
+        method: "POST",
+      });
       expect(syncResponse.status).toBe(403);
       expect(await syncResponse.json()).toEqual({
         ok: false,
@@ -297,7 +461,6 @@ describe("Hevy secret gateway contracts", () => {
     });
   });
 
-
   test("forbids Hevy sync when the stored secret reference is stale", async () => {
     await withIsolatedGateway(async (app) => {
       const saveResponse = await app.request("/v1/integrations/hevy/settings", {
@@ -307,11 +470,16 @@ describe("Hevy secret gateway contracts", () => {
       });
       expect(saveResponse.status).toBe(200);
       const secretRef = hevySecretRef(hevyConnection());
-      if (typeof secretRef !== "string") throw new Error("Expected a stored secret reference.");
-      const id = secretRef.startsWith("secret:") ? secretRef.slice("secret:".length) : secretRef;
+      if (typeof secretRef !== "string")
+        throw new Error("Expected a stored secret reference.");
+      const id = secretRef.startsWith("secret:")
+        ? secretRef.slice("secret:".length)
+        : secretRef;
       getDatabase().query("DELETE FROM secret_records WHERE id = ?1").run(id);
 
-      const response = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+      const response = await app.request("/v1/integrations/hevy/sync", {
+        method: "POST",
+      });
 
       expect(response.status).toBe(403);
       expect(await response.json()).toEqual({
@@ -331,7 +499,7 @@ describe("Hevy secret gateway contracts", () => {
         body: JSON.stringify({ title: "Already received before reconnect" }),
       });
       expect(firstResponse.status).toBe(201);
-      const firstTask = await firstResponse.json() as { id: string };
+      const firstTask = (await firstResponse.json()) as { id: string };
 
       const secondResponse = await app.request("/v1/tasks", {
         method: "POST",
@@ -339,11 +507,15 @@ describe("Hevy secret gateway contracts", () => {
         body: JSON.stringify({ title: "Created while disconnected" }),
       });
       expect(secondResponse.status).toBe(201);
-      const secondTask = await secondResponse.json() as { id: string };
+      const secondTask = (await secondResponse.json()) as { id: string };
 
-      const eventsResponse = await app.request("/v1/events", { headers: { "Last-Event-ID": "1" } });
+      const eventsResponse = await app.request("/v1/events", {
+        headers: { "Last-Event-ID": "1" },
+      });
       expect(eventsResponse.status).toBe(200);
-      expect(eventsResponse.headers.get("content-type")).toBe("text/event-stream");
+      expect(eventsResponse.headers.get("content-type")).toBe(
+        "text/event-stream",
+      );
 
       const sseChunk = await readFirstSseChunk(eventsResponse);
       expect(sseChunk).toContain("event: task.changed\n");
@@ -364,9 +536,13 @@ describe("Hevy sync surfaces workouts on the life calendar", () => {
       });
       expect(saveResponse.status).toBe(200);
 
-      const fetchFake = withFakeHevyFetch(() => ({ payload: { workouts: [HEVY_WORKOUT], page_count: 1 } }));
+      const fetchFake = withFakeHevyFetch(() => ({
+        payload: { workouts: [HEVY_WORKOUT], page_count: 1 },
+      }));
       try {
-        const syncResponse = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+        const syncResponse = await app.request("/v1/integrations/hevy/sync", {
+          method: "POST",
+        });
         expect(syncResponse.status).toBe(200);
         const summary = (await syncResponse.json()) as SyncSummary;
         expect(summary).toEqual({ fetched: 1, created: 1, updated: 0 });
@@ -379,13 +555,19 @@ describe("Hevy sync surfaces workouts on the life calendar", () => {
 
       // The calendar surfaces the stored workout with no live provider fetch.
       const guard = withFakeHevyFetch(() => {
-        throw new Error("calendar aggregation must read stored workouts, not hit the Hevy API");
+        throw new Error(
+          "calendar aggregation must read stored workouts, not hit the Hevy API",
+        );
       });
       try {
         const calendarResponse = await app.request(CALENDAR_RANGE);
         expect(calendarResponse.status).toBe(200);
-        const body = (await calendarResponse.json()) as { items: CalendarItem[] };
-        const hevyEvent = body.items.find((item) => item.id === "workout:hevy:workout-abc-123");
+        const body = (await calendarResponse.json()) as {
+          items: CalendarItem[];
+        };
+        const hevyEvent = body.items.find(
+          (item) => item.id === "workout:hevy:workout-abc-123",
+        );
         expect(hevyEvent).toBeDefined();
         expect(hevyEvent).toMatchObject({
           summary: "Morning Push",
@@ -413,14 +595,20 @@ describe("Hevy sync surfaces workouts on the life calendar", () => {
       });
       expect(saveResponse.status).toBe(200);
 
-      const fetchFake = withFakeHevyFetch(() => ({ payload: { workouts: [HEVY_WORKOUT], page_count: 1 } }));
+      const fetchFake = withFakeHevyFetch(() => ({
+        payload: { workouts: [HEVY_WORKOUT], page_count: 1 },
+      }));
       try {
-        const first = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+        const first = await app.request("/v1/integrations/hevy/sync", {
+          method: "POST",
+        });
         expect(first.status).toBe(200);
         const firstSummary = (await first.json()) as SyncSummary;
         expect(firstSummary).toEqual({ fetched: 1, created: 1, updated: 0 });
 
-        const second = await app.request("/v1/integrations/hevy/sync", { method: "POST" });
+        const second = await app.request("/v1/integrations/hevy/sync", {
+          method: "POST",
+        });
         expect(second.status).toBe(200);
         const secondSummary = (await second.json()) as SyncSummary;
         expect(secondSummary).toEqual({ fetched: 1, created: 0, updated: 1 });
@@ -429,12 +617,16 @@ describe("Hevy sync surfaces workouts on the life calendar", () => {
       }
 
       const guard = withFakeHevyFetch(() => {
-        throw new Error("calendar aggregation must read stored workouts, not hit the Hevy API");
+        throw new Error(
+          "calendar aggregation must read stored workouts, not hit the Hevy API",
+        );
       });
       try {
         const calendarResponse = await app.request(CALENDAR_RANGE);
         expect(calendarResponse.status).toBe(200);
-        const body = (await calendarResponse.json()) as { items: CalendarItem[] };
+        const body = (await calendarResponse.json()) as {
+          items: CalendarItem[];
+        };
         const hevyEvents = body.items.filter((item) => item.source === "hevy");
         expect(hevyEvents).toHaveLength(1);
         expect(hevyEvents[0]?.id).toBe("workout:hevy:workout-abc-123");
@@ -470,8 +662,10 @@ describe("Hevy routine listing pages past a filtered raw routine", () => {
       const pageTwoRaw = [{ id: "routine-p2-1", title: "Routine P2 1" }];
 
       const fetchFake = withFakeHevyRoutinesFetch((page) => {
-        if (page === 1) return { payload: { routines: pageOneRaw, page_count: 2 } };
-        if (page === 2) return { payload: { routines: pageTwoRaw, page_count: 2 } };
+        if (page === 1)
+          return { payload: { routines: pageOneRaw, page_count: 2 } };
+        if (page === 2)
+          return { payload: { routines: pageTwoRaw, page_count: 2 } };
         throw new Error(`unexpected routines page requested: ${page}`);
       });
 
@@ -491,8 +685,321 @@ describe("Hevy routine listing pages past a filtered raw routine", () => {
         // present, proving pagination did not stop early on the shortened page-1 result.
         expect(ids).not.toContain("routine-p1-invalid");
         expect(ids).toContain("routine-p2-1");
-        expect(ids.filter((id) => id.startsWith("routine-p1-"))).toHaveLength(9);
+        expect(ids.filter((id) => id.startsWith("routine-p1-"))).toHaveLength(
+          9,
+        );
         expect(ids).toHaveLength(10);
+      } finally {
+        fetchFake.restore();
+      }
+    });
+  });
+});
+
+describe("Hevy routine creation", () => {
+  test("POST /v1/integrations/hevy/routines sends the official create request and returns a normalized 201 routine from a bare Routine response", async () => {
+    await withIsolatedGateway(async (app) => {
+      const apiKey = "hevy_create_routine_token";
+      const saveResponse = await app.request("/v1/integrations/hevy/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      expect(saveResponse.status).toBe(200);
+
+      const expectedProviderBody = {
+        routine: {
+          title: "Strength A",
+          folder_id: 321,
+          notes: "Program day one",
+          exercises: [
+            {
+              exercise_template_id: "bench-template",
+              superset_id: 7,
+              rest_seconds: 120,
+              notes: "Pause first rep",
+              sets: [
+                {
+                  type: "normal",
+                  weight_kg: 100,
+                  reps: 5,
+                  distance_meters: 0,
+                  duration_seconds: 0,
+                  custom_metric: 0,
+                  rep_range: { start: 4, end: 6 },
+                },
+              ],
+            },
+          ],
+        },
+      };
+
+      const fetchFake = withFakeHevyRoutineCreateFetch((request) => {
+        expect(request).toEqual({
+          url: HEVY_ROUTINES_URL,
+          method: "POST",
+          apiKey,
+          contentType: "application/json",
+          body: expectedProviderBody,
+        });
+        return {
+          payload: {
+            id: "routine-created-1",
+            title: "Strength A",
+            updated_at: "2033-01-02T03:04:05.000Z",
+            exercises: [
+              {
+                title: "Barbell Bench Press",
+                exercise_template_id: "bench-template",
+                superset_id: 7,
+                rest_seconds: 120,
+                notes: "Pause first rep",
+                sets: [
+                  {
+                    type: "normal",
+                    weight_kg: 100,
+                    reps: 5,
+                    distance_meters: 0,
+                    duration_seconds: 0,
+                    custom_metric: 0,
+                    rep_range: { start: 4, end: 6 },
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      });
+
+      try {
+        const response = await app.request("/v1/integrations/hevy/routines", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title: "Strength A",
+            folderId: 321,
+            notes: "Program day one",
+            exercises: [
+              {
+                exerciseTemplateId: "bench-template",
+                supersetId: 7,
+                restSeconds: 120,
+                notes: "Pause first rep",
+                sets: [
+                  {
+                    type: "normal",
+                    weightKg: 100,
+                    reps: 5,
+                    distanceMeters: 0,
+                    durationSeconds: 0,
+                    customMetric: 0,
+                    repRange: { start: 4, end: 6 },
+                  },
+                ],
+              },
+            ],
+          }),
+        });
+
+        expect(response.status).toBe(201);
+        expect(await response.json()).toEqual({
+          id: "routine-created-1",
+          title: "Strength A",
+          updatedAt: "2033-01-02T03:04:05.000Z",
+          exercises: [
+            {
+              title: "Barbell Bench Press",
+              exerciseTemplateId: "bench-template",
+              supersetId: 7,
+              restSeconds: 120,
+              notes: "Pause first rep",
+              sets: [
+                {
+                  type: "normal",
+                  weightKg: 100,
+                  reps: 5,
+                  distanceMeters: 0,
+                  durationSeconds: 0,
+                  customMetric: 0,
+                  repRange: { start: 4, end: 6 },
+                },
+              ],
+            },
+          ],
+        });
+        expect(fetchFake.requests).toHaveLength(1);
+      } finally {
+        fetchFake.restore();
+      }
+    });
+  });
+
+  test("normalizes a wrapped Hevy routine create response", async () => {
+    await withIsolatedGateway(async (app) => {
+      const apiKey = "hevy_create_wrapper_token";
+      const saveResponse = await app.request("/v1/integrations/hevy/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      expect(saveResponse.status).toBe(200);
+
+      const fetchFake = withFakeHevyRoutineCreateFetch(() => ({
+        payload: {
+          routine: {
+            id: "routine-wrapped-1",
+            title: "Wrapped Routine",
+            exercises: [
+              {
+                title: "Run",
+                exercise_template_id: "run-template",
+                sets: [{ type: "warmup", distance_meters: 1000 }],
+              },
+            ],
+          },
+        },
+      }));
+
+      try {
+        const response = await app.request("/v1/integrations/hevy/routines", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title: "Wrapped Routine",
+            exercises: [
+              {
+                exerciseTemplateId: "run-template",
+                sets: [{ type: "warmup", distanceMeters: 1000 }],
+              },
+            ],
+          }),
+        });
+
+        expect(response.status).toBe(201);
+        expect(await response.json()).toMatchObject({
+          id: "routine-wrapped-1",
+          title: "Wrapped Routine",
+          exercises: [
+            {
+              title: "Run",
+              exerciseTemplateId: "run-template",
+              sets: [
+                expect.objectContaining({
+                  type: "warmup",
+                  distanceMeters: 1000,
+                }),
+              ],
+            },
+          ],
+        });
+        expect(fetchFake.requests).toHaveLength(1);
+      } finally {
+        fetchFake.restore();
+      }
+    });
+  });
+
+  test("returns 403 for a missing Hevy connection without fetching", async () => {
+    await withIsolatedGateway(async (app) => {
+      const guard = withUnexpectedFetchGuard();
+      try {
+        const response = await app.request("/v1/integrations/hevy/routines", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title: "No Connection",
+            exercises: [
+              {
+                exerciseTemplateId: "template-1",
+                sets: [{ type: "normal", reps: 5 }],
+              },
+            ],
+          }),
+        });
+
+        expect(response.status).toBe(403);
+        expect(await response.json()).toEqual({
+          ok: false,
+          error: "integration not connected",
+          code: "integration_not_connected",
+          provider: "hevy",
+        });
+        expect(guard.calls).toBe(0);
+      } finally {
+        guard.restore();
+      }
+    });
+  });
+
+  test("returns 400 for an invalid routine payload without fetching", async () => {
+    await withIsolatedGateway(async (app) => {
+      const saveResponse = await app.request("/v1/integrations/hevy/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "hevy_invalid_create_token" }),
+      });
+      expect(saveResponse.status).toBe(200);
+
+      const guard = withUnexpectedFetchGuard();
+      try {
+        const response = await app.request("/v1/integrations/hevy/routines", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title: "   ",
+            exercises: [
+              {
+                exerciseTemplateId: "template-1",
+                sets: [{ type: "normal", reps: 5 }],
+              },
+            ],
+          }),
+        });
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: "invalid routine" });
+        expect(guard.calls).toBe(0);
+      } finally {
+        guard.restore();
+      }
+    });
+  });
+
+  test("returns 502 when Hevy rejects the create request", async () => {
+    await withIsolatedGateway(async (app) => {
+      const saveResponse = await app.request("/v1/integrations/hevy/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "hevy_remote_error_token" }),
+      });
+      expect(saveResponse.status).toBe(200);
+
+      const fetchFake = withFakeHevyRoutineCreateFetch(() => ({
+        status: 422,
+        payload: { error: "routine exercises is invalid" },
+      }));
+
+      try {
+        const response = await app.request("/v1/integrations/hevy/routines", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title: "Remote Reject",
+            exercises: [
+              {
+                exerciseTemplateId: "template-1",
+                sets: [{ type: "failure", reps: 12 }],
+              },
+            ],
+          }),
+        });
+
+        expect(response.status).toBe(502);
+        expect(await response.json()).toEqual({
+          error:
+            'Hevy routine create failed: 422 {"error":"routine exercises is invalid"}',
+        });
+        expect(fetchFake.requests).toHaveLength(1);
       } finally {
         fetchFake.restore();
       }

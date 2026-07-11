@@ -5,6 +5,7 @@ import { emitInvalidation } from "../../core/events/events";
 import { json, parseJsonRequest } from "../../core/http/http";
 import type { RouteRegistrar } from "../../core/service/service";
 import {
+  createHevyRoutine,
   disconnectGoogle,
   disconnectHevy,
   getGoogleIntegrationSettings,
@@ -247,6 +248,30 @@ export function integrationRoutes(): RouteRegistrar {
                 : "could not fetch Hevy routines",
           },
           502,
+        );
+      }
+    });
+
+    route.post("/v1/integrations/hevy/routines", async (c) => {
+      const parsed = await parseJsonRequest(c.req.raw);
+      if (!parsed.ok) return json({ error: parsed.error }, 400);
+      try {
+        const result = await createHevyRoutine(parsed.value);
+        if ("ok" in result && !result.ok) return json(result, 403);
+        emitInvalidation({
+          type: "integration.changed",
+          entityId: "hevy",
+          domain: "integration",
+        });
+        return json(result, 201);
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "could not create Hevy routine";
+        return json(
+          { error: message },
+          message === "invalid routine" ? 400 : 502,
         );
       }
     });

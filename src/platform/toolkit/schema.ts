@@ -1,6 +1,6 @@
 import { JSONSchema, type Schema } from "effect";
 
-export type ToolkitMethod = "GET" | "POST" | "PATCH" | "DELETE";
+export type ToolkitMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 export type ToolkitOperation =
   "read" | "create" | "update" | "complete" | "delete" | "start" | "stop";
 export type ToolkitResource =
@@ -10,7 +10,20 @@ export type ToolkitResource =
   | "life_snapshot"
   | "finance_dashboard"
   | "finance_account"
-  | "finance_import";
+  | "finance_import"
+  | "health_dashboard"
+  | "meal"
+  | "macro_profile"
+  | "workout"
+  | "body_measurement"
+  | "recipe"
+  | "recipe_import"
+  | "recipe_search"
+  | "food_search"
+  | "hevy_settings"
+  | "hevy_sync"
+  | "hevy_routine"
+  | "hevy_exercise_template";
 
 export type ToolkitTool = {
   id: string;

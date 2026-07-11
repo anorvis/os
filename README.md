@@ -23,12 +23,12 @@ http://127.0.0.1:8787
 
 Everything works with defaults; override with environment variables when needed:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ANORVIS_OS_HOST` | `127.0.0.1` | Bind host |
-| `ANORVIS_OS_PORT` (or `PORT`) | `8787` | Bind port |
-| `ANORVIS_DB_PATH` | `~/.anorvis/data/anorvis.sqlite` | SQLite database file |
-| `ANORVIS_OS_API_TOKEN_PATH` | `~/.anorvis/os/api-token` | API token file |
+| Variable                      | Default                          | Purpose              |
+| ----------------------------- | -------------------------------- | -------------------- |
+| `ANORVIS_OS_HOST`             | `127.0.0.1`                      | Bind host            |
+| `ANORVIS_OS_PORT` (or `PORT`) | `8787`                           | Bind port            |
+| `ANORVIS_DB_PATH`             | `~/.anorvis/data/anorvis.sqlite` | SQLite database file |
+| `ANORVIS_OS_API_TOKEN_PATH`   | `~/.anorvis/os/api-token`        | API token file       |
 
 Auth: loopback requests work without a token. Binding to a non-loopback host
 requires a configured token; the first `POST /v1/auth/handshake` writes one to
@@ -70,6 +70,19 @@ Current toolkit resources:
 - `finance_dashboard`
 - `finance_account`
 - `finance_import`
+- `health_dashboard`
+- `meal`
+- `macro_profile`
+- `workout`
+- `body_measurement`
+- `recipe`
+- `recipe_import`
+- `recipe_search`
+- `food_search`
+- `hevy_settings`
+- `hevy_sync`
+- `hevy_routine`
+- `hevy_exercise_template`
 
 The extension keeps the toolkit manifest out of model context by default. Its always-active `anorvis_tool` router reads this manifest, performs reads directly where possible, and activates precise action tools only when a mutation is needed.
 
