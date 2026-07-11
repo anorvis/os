@@ -16,6 +16,7 @@ export type AnorvisWikiInput = {
   allowWeb?: boolean;
   dryRun?: boolean;
   vault?: string;
+  timeoutMs?: number;
 };
 
 export type AnorvisWikiResult = {
@@ -46,7 +47,7 @@ const VaultRegistryTextSchema = Schema.parseJson(
 );
 
 type VaultRef = { name: string; path: string };
-type WikiAgentRun = { task: string; rootDir: string; now: Date; allowWeb?: boolean; dryRun?: boolean; vault?: VaultRef };
+type WikiAgentRun = { task: string; rootDir: string; now: Date; allowWeb?: boolean; dryRun?: boolean; vault?: VaultRef; timeoutMs?: number };
 type WikiAgentRunner = (input: WikiAgentRun) => Promise<AnorvisWikiResult>;
 type Deps = { rootDir?: string; now?: Date; legacyRoot?: string; wikiAgent?: WikiAgentRunner };
 
@@ -57,7 +58,7 @@ export async function runWikiAgent(input: AnorvisWikiInput, deps: Deps = {}): Pr
 
   const first = input.task.toLowerCase().includes("migrat")
     ? runMigration(input, { rootDir, now, legacyRoot: deps.legacyRoot })
-    : await (deps.wikiAgent ?? runCliWikiAgent)({ task: input.task, rootDir, now, allowWeb: input.allowWeb, dryRun: input.dryRun, vault: input.vault ? resolveVault(rootDir, input.vault) : undefined });
+    : await (deps.wikiAgent ?? runCliWikiAgent)({ task: input.task, rootDir, now, allowWeb: input.allowWeb, dryRun: input.dryRun, vault: input.vault ? resolveVault(rootDir, input.vault) : undefined, timeoutMs: input.timeoutMs });
   if (input.dryRun) return first;
 
   let result = first;
@@ -87,9 +88,24 @@ async function runCliWikiAgent(input: WikiAgentRun): Promise<AnorvisWikiResult> 
   args.push(prompt);
 
   const agent = resolveWikiAgentCommand();
-  const { stdout, stderr, code } = await runCommand(agent.command, args, input.vault?.path ?? input.rootDir, 180_000);
+  const timeoutMs = wikiAgentTimeoutMs(input.timeoutMs);
+  const { stdout, stderr, code, timedOut } = await runCommand(agent.command, args, input.vault?.path ?? input.rootDir, timeoutMs);
   const parsed = parseAgentJson(stdout);
   if (parsed) return normalizeResult(input.task, parsed, stderr.trim() ? [`${agent.label} stderr: ${stderr.trim().slice(0, 500)}`] : []);
+  if (timedOut) {
+    const seconds = Math.round(timeoutMs / 1000);
+    return {
+      task: input.task,
+      answer: `${agent.label} timed out after ${seconds}s before reporting a result. Any file changes it made were still applied; check log.md and recently modified pages to verify.`,
+      confidence: "low",
+      sources: [],
+      changed: [],
+      readNext: [],
+      contradictions: [],
+      gaps: [`${agent.label} run is unverified: it hit the ${seconds}s timeout before returning JSON. Pass a larger timeoutMs for long tasks.`],
+      warnings: [`${agent.label} did not return parseable JSON.`, ...(stderr.trim() ? [stderr.trim().slice(0, 1000)] : [])],
+    };
+  }
   return {
     task: input.task,
     answer: stdout.trim() || `${agent.label} failed with exit code ${code}.`,
@@ -101,6 +117,17 @@ async function runCliWikiAgent(input: WikiAgentRun): Promise<AnorvisWikiResult> 
     gaps: code === 0 ? [] : [`${agent.label} exited with code ${code}.`],
     warnings: [`${agent.label} did not return parseable JSON.`, ...(stderr.trim() ? [stderr.trim().slice(0, 1000)] : [])],
   };
+}
+
+const DEFAULT_WIKI_AGENT_TIMEOUT_MS = 300_000;
+const MAX_WIKI_AGENT_TIMEOUT_MS = 3_600_000;
+const KILL_GRACE_MS = 10_000;
+const STREAM_DRAIN_MS = 1_000;
+
+function wikiAgentTimeoutMs(requested?: number): number {
+  const env = Number(process.env.ANORVIS_WIKI_AGENT_TIMEOUT_MS);
+  const candidate = requested ?? (Number.isFinite(env) ? env : undefined) ?? DEFAULT_WIKI_AGENT_TIMEOUT_MS;
+  return Number.isFinite(candidate) && candidate > 0 ? Math.min(candidate, MAX_WIKI_AGENT_TIMEOUT_MS) : DEFAULT_WIKI_AGENT_TIMEOUT_MS;
 }
 
 function wikiAgentPrompt(input: WikiAgentRun): string {
@@ -168,23 +195,38 @@ function commandExists(command: string): boolean {
   return spawnSync(shell, args, { stdio: "ignore", shell: process.platform !== "win32" }).status === 0;
 }
 
-function runCommand(command: string, args: string[], cwd: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; code: number | null }> {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
-    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({ stdout, stderr: `${stderr}${error.message}`, code: 1 });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ stdout, stderr, code });
-    });
+type CommandResult = { stdout: string; stderr: string; code: number | null; timedOut: boolean };
+
+function runCommand(command: string, args: string[], cwd: string, timeoutMs: number): Promise<CommandResult> {
+  const { promise, resolve } = Promise.withResolvers<CommandResult>();
+  const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS).unref();
+  }, timeoutMs);
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  child.on("error", (error) => {
+    clearTimeout(killTimer);
+    stderr = `${stderr}${error.message}`;
+    resolve({ stdout, stderr, code: 1, timedOut });
   });
+  // 'close' waits for the stdio pipes to drain; orphaned grandchildren of a killed
+  // CLI agent can hold those pipes open, so 'exit' force-settles shortly after the
+  // process itself dies. An earlier 'close' wins and carries any tail output.
+  child.on("exit", (code) => {
+    clearTimeout(killTimer);
+    setTimeout(() => resolve({ stdout, stderr, code, timedOut }), STREAM_DRAIN_MS).unref();
+  });
+  child.on("close", (code) => {
+    clearTimeout(killTimer);
+    resolve({ stdout, stderr, code, timedOut });
+  });
+  return promise;
 }
 
 function parseAgentJson(stdout: string): unknown {

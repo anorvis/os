@@ -20,6 +20,7 @@ export const WikiAgentRequestSchema = Schema.Struct({
   vault: Schema.optional(Schema.String),
   allowWeb: Schema.optional(Schema.Boolean),
   dryRun: Schema.optional(Schema.Boolean),
+  timeoutMs: Schema.optional(Schema.Positive),
 });
 
 export type VaultEntry = typeof VaultEntrySchema.Type;

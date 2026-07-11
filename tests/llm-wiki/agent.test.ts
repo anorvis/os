@@ -144,6 +144,27 @@ describe("runWikiAgent", () => {
     expect(recalled.changed).toHaveLength(0);
   });
 
+  test("reports a timed-out agent run as unverified rather than failed, even when an orphan holds the stdio pipes", async () => {
+    const rootDir = tmpRoot();
+    const script = join(tmpRoot(), "slow-agent.sh");
+    // The backgrounded sleep inherits the stdio pipes and outlives the killed agent,
+    // so 'close' stays pending; the runner must settle from 'exit' instead of hanging.
+    writeFileSync(script, "#!/bin/sh\nsleep 30 &\nexec sleep 30\n", { mode: 0o755 });
+    const previous = process.env.ANORVIS_AGENT_COMMAND;
+    process.env.ANORVIS_AGENT_COMMAND = script;
+    try {
+      const result = await runWikiAgent({ task: "Long maintenance task", dryRun: true, timeoutMs: 300 }, { rootDir });
+      expect(result.confidence).toBe("low");
+      expect(result.answer).toContain("timed out");
+      expect(result.answer).not.toContain("failed");
+      expect(result.answer).toContain("changes it made were still applied");
+      expect(result.gaps.some((gap) => gap.includes("unverified"))).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.ANORVIS_AGENT_COMMAND;
+      else process.env.ANORVIS_AGENT_COMMAND = previous;
+    }
+  });
+
   test("migrates legacy memory through anorvis_wiki dry-run and approved run", async () => {
     const rootDir = tmpRoot();
     const legacyRoot = tmpRoot();

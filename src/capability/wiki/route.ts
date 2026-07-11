@@ -44,7 +44,7 @@ export function llmWikiRoutes(options: LlmWikiRouteOptions): RouteRegistrar {
       if (!input.ok) return json({ error: input.error.message }, 400);
       const task = input.value.task?.trim() ? input.value.task : "Orient the Anorvis LLM Wiki.";
       const vault = input.value.vault?.trim() ? input.value.vault : undefined;
-      const result = await runWikiAgent({ task, allowWeb: input.value.allowWeb === true, dryRun: input.value.dryRun === true, vault }, { wikiAgent: options.wikiAgent });
+      const result = await runWikiAgent({ task, allowWeb: input.value.allowWeb === true, dryRun: input.value.dryRun === true, vault, timeoutMs: input.value.timeoutMs }, { wikiAgent: options.wikiAgent });
       return json(wikiResultAsJson(result));
     });
 
