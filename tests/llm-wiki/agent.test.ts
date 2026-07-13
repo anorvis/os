@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { lintLlmWiki, recordInteractionMemory, runWikiAgent } from "../../src/llm-wiki";
+import { resolveAgentModel } from "../../src/core/config/agent-settings";
 import { resolveWikiAgentCommand } from "../../src/llm-wiki/agent";
 
 function tmpRoot() {
@@ -52,6 +53,25 @@ describe("resolveWikiAgentCommand", () => {
 
     for (const { available, expected } of cases) {
       expect(resolveWikiAgentCommand({}, (command) => available[command] === true)).toEqual(expected);
+    }
+  });
+});
+
+describe("Wiki Agent model settings", () => {
+  test("reads a changed shared model setting on every invocation", () => {
+    const root = tmpRoot();
+    const path = join(root, "agents.json");
+    const env = { ANORVIS_AGENT_SETTINGS_PATH: path };
+    try {
+      writeFileSync(path, JSON.stringify({ wikiModel: "openai-codex/gpt-5.6-sol" }));
+      expect(resolveAgentModel("wiki", env)).toBe("openai-codex/gpt-5.6-sol");
+
+      writeFileSync(path, JSON.stringify({ wikiModel: "anthropic/claude-sonnet-4-5" }));
+      expect(resolveAgentModel("wiki", env)).toBe(
+        "anthropic/claude-sonnet-4-5",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
