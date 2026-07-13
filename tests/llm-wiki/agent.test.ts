@@ -1,9 +1,9 @@
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { lintLlmWiki, recordInteractionMemory, runWikiAgent } from "../../src/llm-wiki";
-import { resolveAgentModel } from "../../src/core/config/agent-settings";
+import { resolveAgentModel, resolveAgentThinking } from "../../src/core/config/agent-settings";
 import { resolveWikiAgentCommand } from "../../src/llm-wiki/agent";
 
 function tmpRoot() {
@@ -63,8 +63,12 @@ describe("Wiki Agent model settings", () => {
     const path = join(root, "agents.json");
     const env = { ANORVIS_AGENT_SETTINGS_PATH: path };
     try {
-      writeFileSync(path, JSON.stringify({ wikiModel: "openai-codex/gpt-5.6-sol" }));
+      writeFileSync(path, JSON.stringify({
+        wikiModel: "openai-codex/gpt-5.6-sol",
+        wikiThinking: "high",
+      }));
       expect(resolveAgentModel("wiki", env)).toBe("openai-codex/gpt-5.6-sol");
+      expect(resolveAgentThinking("wiki", env)).toBe("high");
 
       writeFileSync(path, JSON.stringify({ wikiModel: "anthropic/claude-sonnet-4-5" }));
       expect(resolveAgentModel("wiki", env)).toBe(
@@ -77,6 +81,64 @@ describe("Wiki Agent model settings", () => {
 });
 
 describe("runWikiAgent", () => {
+  test("passes saved model and reasoning to the Wiki Agent CLI", async () => {
+    const rootDir = tmpRoot();
+    const command = join(rootDir, "capture-wiki-agent.js");
+    const argsPath = join(rootDir, "args.json");
+    const settingsPath = join(rootDir, "agents.json");
+    writeFileSync(
+      command,
+      `#!${process.execPath}
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.ANORVIS_TEST_ARGS_PATH, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({
+  answer: "Captured.",
+  confidence: "high",
+  sources: [],
+  changed: []
+}));
+`,
+    );
+    chmodSync(command, 0o755);
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        wikiModel: "openai-codex/gpt-5.6-sol",
+        wikiThinking: "xhigh",
+      }),
+    );
+    const previousCommand = process.env.ANORVIS_AGENT_COMMAND;
+    const previousSettings = process.env.ANORVIS_AGENT_SETTINGS_PATH;
+    const previousArgsPath = process.env.ANORVIS_TEST_ARGS_PATH;
+    process.env.ANORVIS_AGENT_COMMAND = command;
+    process.env.ANORVIS_AGENT_SETTINGS_PATH = settingsPath;
+    process.env.ANORVIS_TEST_ARGS_PATH = argsPath;
+    try {
+      const result = await runWikiAgent(
+        { task: "Capture model arguments." },
+        { rootDir },
+      );
+      const args = JSON.parse(readFileSync(argsPath, "utf8")) as string[];
+      const modelIndex = args.indexOf("--model");
+      const thinkingIndex = args.indexOf("--thinking");
+
+      expect(result.answer).toBe("Captured.");
+      expect(args[modelIndex + 1]).toBe("openai-codex/gpt-5.6-sol");
+      expect(args[thinkingIndex + 1]).toBe("xhigh");
+    } finally {
+      if (previousCommand === undefined)
+        delete process.env.ANORVIS_AGENT_COMMAND;
+      else process.env.ANORVIS_AGENT_COMMAND = previousCommand;
+      if (previousSettings === undefined)
+        delete process.env.ANORVIS_AGENT_SETTINGS_PATH;
+      else process.env.ANORVIS_AGENT_SETTINGS_PATH = previousSettings;
+      if (previousArgsPath === undefined)
+        delete process.env.ANORVIS_TEST_ARGS_PATH;
+      else process.env.ANORVIS_TEST_ARGS_PATH = previousArgsPath;
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
   test("delegates normal wiki tasks to the Pi Wiki Agent runner", async () => {
     const rootDir = tmpRoot();
     let called = false;

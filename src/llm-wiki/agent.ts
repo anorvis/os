@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFi
 import { dirname, join, relative, resolve } from "node:path";
 import { Schema } from "effect";
 import { decodeUnknownResult } from "../core/effect/schema";
-import { resolveAgentModel } from "../core/config/agent-settings";
+import { resolveAgentModel, resolveAgentThinking } from "../core/config/agent-settings";
 import { getHomeDir } from "../paths";
 import { initLlmWiki } from "./init";
 import { rebuildManifest } from "./manifest";
@@ -86,6 +86,8 @@ async function runCliWikiAgent(input: WikiAgentRun): Promise<AnorvisWikiResult> 
   const args = ["--print", "--no-extensions", "--no-skills", "--tools", tools, "--name", "Anorvis Wiki Agent"];
   const model = resolveAgentModel("wiki");
   if (model) args.push("--model", model);
+  const thinking = resolveAgentThinking("wiki");
+  if (thinking) args.push("--thinking", thinking);
   args.push(prompt);
 
   const agent = resolveWikiAgentCommand();
