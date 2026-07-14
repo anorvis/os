@@ -175,6 +175,12 @@ const schema = defineSchema({
       "provider",
       "providerEventId",
     ])
+    .index("by_workspace_provider_calendar_event", [
+      "workspaceId",
+      "provider",
+      "calendarId",
+      "providerEventId",
+    ])
     .index("by_workspace_calendar_start", ["workspaceId", "calendarId", "startDay"]),
 
   lifeTags: defineTable({

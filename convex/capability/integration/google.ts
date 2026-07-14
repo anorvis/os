@@ -73,7 +73,7 @@ function previousDay(value: string): string {
   return date.toISOString().slice(0, 10);
 }
 
-function parseEvent(event: GoogleEvent) {
+function parseEvent(event: GoogleEvent, calendarId: string) {
   const providerEventId = string(event.id);
   if (!providerEventId || !event.start || !event.end) return undefined;
   const startDate = string(event.start.date);
@@ -105,7 +105,7 @@ function parseEvent(event: GoogleEvent) {
   }
   return {
     providerEventId,
-    calendarId: "primary",
+    calendarId,
     summary: string(event.summary) ?? "Untitled event",
     schedule,
     startDay,
@@ -193,21 +193,44 @@ export const saveSettings = action({
 export const start = action({
   args: {
     workspaceId: v.optional(v.id("workspaces")),
-    clientId: v.string(),
-    clientSecret: v.string(),
+    clientId: v.optional(v.string()),
+    clientSecret: v.optional(v.string()),
     redirectUri: v.string(),
     returnTo: v.string(),
     scopes: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
-    const clientId = required(args.clientId, "Google client ID");
-    const clientSecret = required(args.clientSecret, "Google client secret");
+    const workspaceId = await ctx.runQuery(
+      internal.capability.integration.authorizeWorkspace,
+      { workspaceId: args.workspaceId },
+    );
+    let clientId = args.clientId?.trim() ?? "";
+    let clientSecret = args.clientSecret?.trim() ?? "";
+    if (!clientId || !clientSecret) {
+      // Re-sign-in path: the OAuth client configuration survives disconnect,
+      // so signing back in never requires re-entering the keys.
+      const connection = await ctx.runQuery(
+        internal.capability.integration.connectionByWorkspace,
+        { workspaceId, provider: "google" },
+      );
+      if (connection?.provider === "google" && connection.credentials !== undefined) {
+        const stored = credentials(decryptCredentials(connection.credentials));
+        clientId = clientId || stored.clientId;
+        clientSecret = clientSecret || stored.clientSecret;
+      }
+    }
+    if (!clientId || !clientSecret) {
+      throw new ConvexError({
+        code: "INVALID_INPUT",
+        message: "Google client ID and secret are required for the first sign-in",
+      });
+    }
     const redirectUri = safeUrl(args.redirectUri, "Google redirect URI");
     const returnTo = safeUrl(args.returnTo, "Google return URL");
     const scopes = args.scopes?.map((scope) => scope.trim()).filter(Boolean) ?? defaultScopes;
     const state = randomState();
     await ctx.runMutation(internal.capability.integration.beginGoogle, {
-      workspaceId: args.workspaceId,
+      workspaceId,
       credentials: encryptCredentials({ clientId, clientSecret }),
       scopes,
       stateHash: stateHash(state),
@@ -224,6 +247,47 @@ export const start = action({
     url.searchParams.set("prompt", "consent");
     url.searchParams.set("state", state);
     return { authorizationUrl: url.toString() };
+  },
+});
+
+export const disconnect = action({
+  args: { workspaceId: v.optional(v.id("workspaces")) },
+  handler: async (ctx, args): Promise<{ ok: true; hasClientConfig: boolean }> => {
+    const workspaceId = await ctx.runQuery(
+      internal.capability.integration.authorizeWorkspace,
+      { workspaceId: args.workspaceId },
+    );
+    const connection = await ctx.runQuery(
+      internal.capability.integration.connectionByWorkspace,
+      { workspaceId, provider: "google" },
+    );
+    if (connection?.provider !== "google") return { ok: true, hasClientConfig: false };
+    let kept: { clientId: string; clientSecret: string } | null = null;
+    let revoke: string | undefined;
+    if (connection.credentials !== undefined) {
+      try {
+        const stored = credentials(decryptCredentials(connection.credentials));
+        kept = { clientId: stored.clientId, clientSecret: stored.clientSecret };
+        revoke = stored.refreshToken ?? stored.accessToken;
+      } catch {
+        kept = null;
+      }
+    }
+    // Disconnect locally first: revocation is best-effort and must never
+    // gate or delay dropping the connection and its queued sync work.
+    await ctx.runMutation(internal.capability.integration.resetGoogleConnection, {
+      workspaceId,
+      credentials: kept === null ? undefined : encryptCredentials(kept),
+    });
+    if (revoke) {
+      await fetch("https://oauth2.googleapis.com/revoke", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ token: revoke }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => undefined);
+    }
+    return { ok: true, hasClientConfig: kept !== null };
   },
 });
 
@@ -269,13 +333,103 @@ export const completeOAuth = internalAction({
       scopes,
       accessTokenExpiresAt: Date.now() + expiresIn * 1000,
     });
-    return oauthState.returnTo;
+    // Populate the calendar immediately instead of waiting for the cron, and
+    // hand the landing page the exact job so it can refresh when it finishes.
+    const jobId = await ctx.runMutation(
+      internal.capability.integration.jobs.enqueueProviderSync,
+      {
+        workspaceId: oauthState.workspaceId,
+        provider: "google",
+        kind: "manual",
+      },
+    );
+    const landing = new URL(oauthState.returnTo);
+    landing.searchParams.set("googleSync", String(jobId));
+    return landing.toString();
   },
 });
+
+async function googleAccess(
+  ctx: ActionCtx,
+  workspaceId: Id<"workspaces">,
+): Promise<{ accessToken: string }> {
+  const connection = await ctx.runQuery(
+    internal.capability.integration.connectionByWorkspace,
+    { workspaceId, provider: "google" },
+  );
+  if (
+    connection?.provider !== "google" ||
+    connection.status !== "connected" ||
+    connection.credentials === undefined
+  ) {
+    throw new ConvexError({ code: "NOT_CONNECTED", message: "Google is not connected" });
+  }
+  const current = credentials(decryptCredentials(connection.credentials));
+  let accessToken = current.accessToken;
+  if (
+    !accessToken ||
+    connection.accessTokenExpiresAt === undefined ||
+    connection.accessTokenExpiresAt <= Date.now() + 60_000
+  ) {
+    if (!current.refreshToken) throw new Error("Google refresh token is missing");
+    const payload = await tokenRequest(
+      new URLSearchParams({
+        refresh_token: current.refreshToken,
+        client_id: current.clientId,
+        client_secret: current.clientSecret,
+        grant_type: "refresh_token",
+      }),
+    );
+    accessToken = string(payload.access_token);
+    if (!accessToken) throw new Error("Google token refresh returned no access token");
+    const expiresIn = typeof payload.expires_in === "number" ? payload.expires_in : 3600;
+    await ctx.runMutation(internal.capability.integration.finishGoogle, {
+      workspaceId: connection.workspaceId,
+      credentials: encryptCredentials({
+        clientId: current.clientId,
+        clientSecret: current.clientSecret,
+        accessToken,
+        refreshToken: current.refreshToken,
+      }),
+      scopes: connection.scopes,
+      accessTokenExpiresAt: Date.now() + expiresIn * 1000,
+    });
+  }
+  return { accessToken };
+}
+
+// The calendars the user actually displays in Google Calendar; the primary
+// calendar keeps the literal id "primary" so existing rows retain identity.
+async function listSelectedCalendars(accessToken: string): Promise<string[]> {
+  const response = await fetch(
+    "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250",
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new Error(
+      string(payload.error) ?? `Google calendar list failed: HTTP ${response.status}`,
+    );
+  }
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const calendars: string[] = [];
+  for (const item of items) {
+    if (item === null || typeof item !== "object") continue;
+    const entry = item as { id?: unknown; selected?: unknown; primary?: unknown };
+    const primary = entry.primary === true;
+    if (entry.selected !== true && !primary) continue;
+    const id = primary ? "primary" : string(entry.id);
+    if (id && !calendars.includes(id)) calendars.push(id);
+  }
+  if (!calendars.includes("primary")) calendars.unshift("primary");
+  return calendars;
+}
 
 async function syncPage(
   ctx: ActionCtx,
   workspaceId: Id<"workspaces">,
+  accessToken: string,
+  calendarId: string,
   timeMin: string,
   timeMax: string,
   pageToken?: string,
@@ -286,79 +440,41 @@ async function syncPage(
   skipped: number;
   nextPageToken?: string;
 }> {
-    const connection = await ctx.runQuery(
-      internal.capability.integration.connectionByWorkspace,
-      { workspaceId, provider: "google" },
-    );
-    if (connection?.provider !== "google" || connection.credentials === undefined) {
-      throw new ConvexError({ code: "NOT_CONNECTED", message: "Google is not connected" });
-    }
-    const current = credentials(decryptCredentials(connection.credentials));
-    let accessToken = current.accessToken;
-    if (
-      !accessToken ||
-      connection.accessTokenExpiresAt === undefined ||
-      connection.accessTokenExpiresAt <= Date.now() + 60_000
-    ) {
-      if (!current.refreshToken) throw new Error("Google refresh token is missing");
-      const payload = await tokenRequest(
-        new URLSearchParams({
-          refresh_token: current.refreshToken,
-          client_id: current.clientId,
-          client_secret: current.clientSecret,
-          grant_type: "refresh_token",
-        }),
-      );
-      accessToken = string(payload.access_token);
-      if (!accessToken) throw new Error("Google token refresh returned no access token");
-      const expiresIn = typeof payload.expires_in === "number" ? payload.expires_in : 3600;
-      await ctx.runMutation(internal.capability.integration.finishGoogle, {
-        workspaceId: connection.workspaceId,
-        credentials: encryptCredentials({
-          clientId: current.clientId,
-          clientSecret: current.clientSecret,
-          accessToken,
-          refreshToken: current.refreshToken,
-        }),
-        scopes: connection.scopes,
-        accessTokenExpiresAt: Date.now() + expiresIn * 1000,
-      });
-    }
-    const url = new URL(
-      "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-    );
-    url.searchParams.set("timeMin", new Date(timeMin).toISOString());
-    url.searchParams.set("timeMax", new Date(timeMax).toISOString());
-    url.searchParams.set("singleEvents", "true");
-    url.searchParams.set("maxResults", "250");
-    if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` },
+  const url = new URL(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`,
+  );
+  url.searchParams.set("timeMin", new Date(timeMin).toISOString());
+  url.searchParams.set("timeMax", new Date(timeMax).toISOString());
+  url.searchParams.set("singleEvents", "true");
+  url.searchParams.set("maxResults", "250");
+  if (pageToken) url.searchParams.set("pageToken", pageToken);
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new Error(string(payload.error) ?? "Google Calendar request failed");
+  }
+  const items = Array.isArray(payload.items) ? (payload.items as GoogleEvent[]) : [];
+  const events = items.flatMap((event) => parseEvent(event, calendarId) ?? []);
+  let created = 0;
+  let updated = 0;
+  for (let offset = 0; offset < events.length; offset += 100) {
+    const result = await ctx.runMutation(internal.capability.integration.upsertGoogleEvents, {
+      workspaceId,
+      system: true,
+      events: events.slice(offset, offset + 100),
     });
-    const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!response.ok) {
-      throw new Error(string(payload.error) ?? "Google Calendar request failed");
-    }
-    const items = Array.isArray(payload.items) ? (payload.items as GoogleEvent[]) : [];
-    const events = items.flatMap((event) => parseEvent(event) ?? []);
-    let created = 0;
-    let updated = 0;
-    for (let offset = 0; offset < events.length; offset += 100) {
-      const result = await ctx.runMutation(internal.capability.integration.upsertGoogleEvents, {
-        workspaceId,
-        system: true,
-        events: events.slice(offset, offset + 100),
-      });
-      created += result.created;
-      updated += result.updated;
-    }
-    return {
-      fetched: items.length,
-      created,
-      updated,
-      skipped: items.length - events.length,
-      nextPageToken: string(payload.nextPageToken),
-    };
+    created += result.created;
+    updated += result.updated;
+  }
+  return {
+    fetched: items.length,
+    created,
+    updated,
+    skipped: items.length - events.length,
+    nextPageToken: string(payload.nextPageToken),
+  };
 }
 
 
@@ -369,28 +485,39 @@ export const syncScheduledStep = internalAction({
   },
   handler: async (ctx, args) => {
     const now = Date.now();
+    const access = await googleAccess(ctx, args.workspaceId);
     const state = args.cursor
       ? (JSON.parse(args.cursor) as {
+          calendars: string[];
+          index: number;
           pageToken?: string;
           timeMin: string;
           timeMax: string;
         })
       : {
+          calendars: await listSelectedCalendars(access.accessToken),
+          index: 0,
           timeMin: new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString(),
           timeMax: new Date(now + 365 * 24 * 60 * 60 * 1000).toISOString(),
         };
+    const calendarId = state.calendars[state.index] ?? "primary";
     const result = await syncPage(
       ctx,
       args.workspaceId,
+      access.accessToken,
+      calendarId,
       state.timeMin,
       state.timeMax,
       state.pageToken,
     );
+    const next = result.nextPageToken
+      ? { ...state, pageToken: result.nextPageToken }
+      : state.index + 1 < state.calendars.length
+        ? { ...state, index: state.index + 1, pageToken: undefined }
+        : null;
     return {
-      done: result.nextPageToken === undefined,
-      cursor: result.nextPageToken
-        ? JSON.stringify({ ...state, pageToken: result.nextPageToken })
-        : undefined,
+      done: next === null,
+      cursor: next === null ? undefined : JSON.stringify(next),
       fetched: result.fetched,
       applied: result.created + result.updated,
       skipped: result.skipped,

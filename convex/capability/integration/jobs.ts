@@ -1,8 +1,122 @@
 import { v } from "convex/values";
 import { internal } from "../../_generated/api";
-import { internalMutation } from "../../_generated/server";
+import type { Id } from "../../_generated/dataModel";
+import { internalMutation, type MutationCtx } from "../../_generated/server";
 
 const staleAfterMs = 20 * 60 * 1000;
+
+type SyncProvider = "google" | "hevy" | "snaptrade";
+
+// Single enqueue path for scheduled, manual, and post-OAuth syncs. A runner
+// that dies before claiming leaves its job pending forever, so an existing
+// pending job gets the runner rescheduled — idempotent because the claim
+// transitions pending -> running exactly once.
+export async function enqueueSync(
+  ctx: MutationCtx,
+  workspaceId: Id<"workspaces">,
+  provider: SyncProvider,
+  kind: "manual" | "scheduled",
+): Promise<{ jobId: Id<"syncJobs">; scheduled: boolean }> {
+  const now = Date.now();
+  const active = async (status: "pending" | "running") =>
+    ctx.db
+      .query("syncJobs")
+      .withIndex("by_workspace_provider_status", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("provider", provider)
+          .eq("status", status),
+      )
+      .first();
+  const pending = await active("pending");
+  if (pending !== null) {
+    await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
+      jobId: pending._id,
+    });
+    return { jobId: pending._id, scheduled: true };
+  }
+  const running = await active("running");
+  if (running !== null && running.updatedAt >= now - staleAfterMs) {
+    return { jobId: running._id, scheduled: false };
+  }
+  if (running !== null) {
+    await ctx.db.patch(running._id, {
+      status: "pending",
+      error: "Recovered stale provider sync lease",
+      updatedAt: now,
+    });
+    await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
+      jobId: running._id,
+    });
+    return { jobId: running._id, scheduled: true };
+  }
+  const jobId = await ctx.db.insert("syncJobs", {
+    workspaceId,
+    provider,
+    kind,
+    status: "pending",
+    fetchedCount: 0,
+    appliedCount: 0,
+    skippedCount: 0,
+    attempt: 0,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
+    jobId,
+  });
+  return { jobId, scheduled: true };
+}
+
+// System-context enqueue for flows without a signed-in user, such as the
+// OAuth HTTP callback finishing a connection.
+export const enqueueProviderSync = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    provider: v.union(
+      v.literal("google"),
+      v.literal("hevy"),
+      v.literal("snaptrade"),
+    ),
+    kind: v.union(v.literal("manual"), v.literal("scheduled")),
+  },
+  handler: async (ctx, args) =>
+    (await enqueueSync(ctx, args.workspaceId, args.provider, args.kind)).jobId,
+});
+
+// Disconnecting a provider must stop its in-flight and queued work; a lease
+// bump invalidates any runner step that is still executing.
+export async function cancelActiveSyncs(
+  ctx: MutationCtx,
+  workspaceId: Id<"workspaces">,
+  provider: SyncProvider,
+  reason: string,
+): Promise<number> {
+  const now = Date.now();
+  let cancelled = 0;
+  for (const status of ["pending", "running"] as const) {
+    const jobs = await ctx.db
+      .query("syncJobs")
+      .withIndex("by_workspace_provider_status", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("provider", provider)
+          .eq("status", status),
+      )
+      .collect();
+    for (const job of jobs) {
+      await ctx.db.patch(job._id, {
+        status: "failed",
+        error: reason,
+        lease: (job.lease ?? 0) + 1,
+        finishedAt: now,
+        updatedAt: now,
+      });
+      cancelled += 1;
+    }
+  }
+  return cancelled;
+}
 
 export const enqueueProviderSyncs = internalMutation({
   args: {},
@@ -15,57 +129,20 @@ export const enqueueProviderSyncs = internalMutation({
         connection.credentials !== undefined,
     );
     let enqueued = 0;
-    const now = Date.now();
     for (const connection of connections) {
-      const pending = await ctx.db
-        .query("syncJobs")
-        .withIndex("by_workspace_provider_status", (q) =>
-          q
-            .eq("workspaceId", connection.workspaceId)
-            .eq("provider", connection.provider)
-            .eq("status", "pending"),
-        )
-        .first();
-      if (pending !== null) continue;
-      const running = await ctx.db
-        .query("syncJobs")
-        .withIndex("by_workspace_provider_status", (q) =>
-          q
-            .eq("workspaceId", connection.workspaceId)
-            .eq("provider", connection.provider)
-            .eq("status", "running"),
-        )
-        .first();
-      if (running !== null && running.updatedAt >= now - staleAfterMs) continue;
-      if (running !== null) {
-        await ctx.db.patch(running._id, {
-          status: "pending",
-          error: "Recovered stale provider sync lease",
-          updatedAt: now,
-        });
-        await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
-          jobId: running._id,
-        });
-        enqueued += 1;
+      if (
+        connection.provider !== "google" &&
+        connection.provider !== "hevy" &&
+        connection.provider !== "snaptrade"
+      )
         continue;
-      }
-      const provider = connection.provider as "google" | "hevy" | "snaptrade";
-      const jobId = await ctx.db.insert("syncJobs", {
-        workspaceId: connection.workspaceId,
-        provider,
-        kind: "scheduled",
-        status: "pending",
-        fetchedCount: 0,
-        appliedCount: 0,
-        skippedCount: 0,
-        attempt: 0,
-        createdAt: now,
-        updatedAt: now,
-      });
-      await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
-        jobId,
-      });
-      enqueued += 1;
+      const result = await enqueueSync(
+        ctx,
+        connection.workspaceId,
+        connection.provider,
+        "scheduled",
+      );
+      if (result.scheduled) enqueued += 1;
     }
     return enqueued;
   },
