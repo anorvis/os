@@ -158,6 +158,9 @@ describe("minimal Anorvis OS gateway", () => {
       const unauthenticated = await app.request("/v1/os/status");
       expect(unauthenticated.status).toBe(401);
 
+      const unauthenticatedToolkit = await app.request("/v1/os/toolkit");
+      expect(unauthenticatedToolkit.status).toBe(401);
+
       const authorized = await app.request("/v1/os/status", {
         headers: { authorization: `Bearer ${token}` },
       });
@@ -165,6 +168,12 @@ describe("minimal Anorvis OS gateway", () => {
       expect((await authorized.json()) as { storage: unknown }).toMatchObject({
         storage: { sqlite: "disabled", sync: "files-only" },
       });
+
+      const toolkit = await app.request("/v1/os/toolkit", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(toolkit.status).toBe(200);
+      expect(await toolkit.json()).toEqual({ version: 1, tools: [] });
 
       const retiredCrud = await app.request("/v1/overview", {
         headers: { authorization: `Bearer ${token}` },
