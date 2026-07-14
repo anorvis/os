@@ -2,7 +2,7 @@ import { httpRouter } from "convex/server";
 import { internal } from "./_generated/api";
 import { httpAction } from "./_generated/server";
 import { auth } from "./auth";
-import { serveAttachment } from "./wikiHttp";
+import { serveAttachment } from "./capability/wiki/http";
 
 const http = httpRouter();
 
@@ -21,7 +21,7 @@ http.route({
       });
     }
     try {
-      const returnTo = await ctx.runAction(internal.google.completeOAuth, {
+      const returnTo = await ctx.runAction(internal.capability.integration.google.completeOAuth, {
         code,
         state,
       });
@@ -51,7 +51,7 @@ http.route({
       });
     }
     try {
-      const returnTo = await ctx.runAction(internal.pinterest.completeOAuth, {
+      const returnTo = await ctx.runAction(internal.capability.integration.pinterest.completeOAuth, {
         code,
         state,
       });

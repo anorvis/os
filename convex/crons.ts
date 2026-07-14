@@ -6,13 +6,13 @@ const crons = cronJobs();
 crons.interval(
   "synchronize connected providers",
   { hours: 6 },
-  internal.maintenance.enqueueProviderSyncs,
+  internal.capability.integration.jobs.enqueueProviderSyncs,
 );
 
 crons.interval(
   "remove expired OAuth states",
   { hours: 1 },
-  internal.maintenance.cleanupOAuthStates,
+  internal.capability.integration.jobs.cleanupOAuthStates,
 );
 
 export default crons;

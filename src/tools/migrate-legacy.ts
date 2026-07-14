@@ -363,8 +363,7 @@ async function importRemote(payload: Payload, size: number): Promise<ImportResul
   if (!token) throw new Error("ANORVIS_CONVEX_AUTH_TOKEN is required for remote import. For local admin import, pass --identity-subject=<owner-user-id>.");
   const client = new ConvexHttpClient(url);
   client.setAuth(token);
-  // The generated API type is refreshed by Convex codegen in normal dev flow; this new module is present at runtime now.
-  const legacyApply = api.legacyImport.applyBatch as unknown as FunctionReference<"mutation", "public", Payload, ImportResult>;
+  const legacyApply = api.platform.migration.legacyImport.applyBatch as unknown as FunctionReference<"mutation", "public", Payload, ImportResult>;
   const results: ImportResult[] = [];
   for (const batch of batches(payload, size)) results.push(await client.mutation(legacyApply, batch));
   return results;
@@ -385,7 +384,7 @@ async function importLocal(payload: Payload, size: number, subject: string): Pro
     issuer: "https://convex.test",
     tokenIdentifier: `https://convex.test|${subject}`,
   });
-  const legacyApply = api.legacyImport.applyBatch as unknown as FunctionReference<"mutation", "public", Payload, ImportResult>;
+  const legacyApply = api.platform.migration.legacyImport.applyBatch as unknown as FunctionReference<"mutation", "public", Payload, ImportResult>;
   const results: ImportResult[] = [];
   for (const batch of batches(payload, size)) results.push(await client.mutation(legacyApply, batch));
   return results;

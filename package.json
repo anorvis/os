@@ -13,10 +13,10 @@
     "dev:wiki-gateway": "bun src/platform/gateway/server.ts",
     "test": "bun test tests",
     "test:convex": "vitest run convex",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint src tests",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p convex/tsconfig.json",
+    "lint": "eslint src tests convex",
     "lint:wiki": "bun src/llm-wiki/lint.ts",
-    "check": "bun run test && bun run typecheck && bun run lint"
+    "check": "bun run test && bun run test:convex && bun run typecheck && bun run lint"
   },
   "dependencies": {
     "@convex-dev/auth": "0.0.94",
