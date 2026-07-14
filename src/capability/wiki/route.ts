@@ -140,6 +140,7 @@ function parseInteractionMemoryRequest(value: JsonValue): InteractionMemoryParse
   const input: InteractionMemoryInput = {
     background: value.background !== false,
   };
+  if (value.compile === false) input.compile = false;
   if (typeof value.sessionId === "string" && value.sessionId.trim()) input.sessionId = value.sessionId;
   if (typeof value.turnIndex === "number" && Number.isInteger(value.turnIndex)) input.turnIndex = value.turnIndex;
   if (typeof value.eventName === "string" && value.eventName.trim()) input.eventName = value.eventName;

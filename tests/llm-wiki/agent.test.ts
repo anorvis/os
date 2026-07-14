@@ -318,6 +318,32 @@ describe("recordInteractionMemory", () => {
     expect((await lintLlmWiki({ rootDir })).ok).toBe(true);
   });
 
+  test("captures raw interactions without compiling when Monitor owns the decision", async () => {
+    const rootDir = tmpRoot();
+    let compiled = false;
+    const result = await recordInteractionMemory(
+      {
+        sessionId: "monitor-session",
+        turnIndex: 1,
+        prompt: "Potentially durable information.",
+        assistant: "Captured.",
+        compile: false,
+      },
+      {
+        rootDir,
+        wikiAgent: () => {
+          compiled = true;
+          return Promise.reject(new Error("Wiki Agent must not run"));
+        },
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.queued).toBe(false);
+    expect(compiled).toBe(false);
+    expect(result.ok && existsSync(join(rootDir, result.rawPath))).toBe(true);
+  });
+
 
   test("redacts prompt secrets before writing raw memory", async () => {
     const rootDir = tmpRoot();

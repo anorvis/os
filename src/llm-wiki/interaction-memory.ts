@@ -17,6 +17,7 @@ export type InteractionMemoryInput = {
   toolResults?: JsonValue;
   interaction?: JsonValue;
   background?: boolean;
+  compile?: boolean;
 };
 
 export type InteractionMemoryResult = {
@@ -55,6 +56,8 @@ export async function recordInteractionMemory(input: InteractionMemoryInput, dep
     initLlmWiki({ rootDir, now });
 
     const rawPath = writeRawInteraction(rootDir, now, input);
+    if (input.compile === false)
+      return { ok: true, rawPath, queued: false };
     const compile = () => compileInteractionMemory(input, rawPath, { ...deps, rootDir, now });
 
     if (input.background !== false) {
