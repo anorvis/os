@@ -155,19 +155,21 @@ describe("minimal Anorvis OS gateway", () => {
         readFileSync(join(home, ".anorvis", "os", "api-token"), "utf8").trim(),
       ).toBe(token);
 
-      const unauthenticated = await app.request("/v1/overview");
+      const unauthenticated = await app.request("/v1/os/status");
       expect(unauthenticated.status).toBe(401);
 
-      const authorized = await app.request("/v1/overview", {
+      const authorized = await app.request("/v1/os/status", {
         headers: { authorization: `Bearer ${token}` },
       });
       expect(authorized.status).toBe(200);
+      expect((await authorized.json()) as { storage: unknown }).toMatchObject({
+        storage: { sqlite: "disabled", sync: "files-only" },
+      });
 
-      const eventStream = await app.request(
-        `/v1/events?access_token=${encodeURIComponent(token)}`,
-      );
-      expect(eventStream.status).toBe(200);
-      await eventStream.body?.cancel().catch(() => undefined);
+      const retiredCrud = await app.request("/v1/overview", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(retiredCrud.status).toBe(404);
 
       const secondHandshake = await app.request("/v1/auth/handshake", {
         method: "POST",
@@ -276,7 +278,7 @@ describe("minimal Anorvis OS gateway", () => {
     );
   });
 
-  test("advertises PUT and rejects unknown task-session moves", async () => {
+  test("does not expose retired SQLite CRUD routes", async () => {
     await withIsolatedGateway(async ({ app }) => {
       const preflight = await app.request("/v1/health/meals/example", {
         method: "OPTIONS",
@@ -298,17 +300,15 @@ describe("minimal Anorvis OS gateway", () => {
         },
       );
       expect(missingSession.status).toBe(404);
-      expect(await missingSession.json()).toEqual({
-        error: "task session not found",
-      });
+      expect(await missingSession.json()).toEqual({ error: "not_found" });
 
       const tasksResponse = await app.request("/v1/tasks");
-      const tasksBody = (await tasksResponse.json()) as { tasks: unknown[] };
-      expect(tasksBody.tasks).toHaveLength(0);
+      expect(tasksResponse.status).toBe(404);
+      expect(await tasksResponse.json()).toEqual({ error: "not_found" });
     });
   });
 
-  test("persists calendar events through sqlite gateway routes", async () => {
+  test("calendar CRUD is retired from the wiki gateway", async () => {
     await withIsolatedGateway(async ({ app }) => {
       const createdResponse = await app.request("/v1/calendar/events", {
         method: "POST",
@@ -320,83 +320,14 @@ describe("minimal Anorvis OS gateway", () => {
           tag: "work",
         }),
       });
-
-      expect(createdResponse.status).toBe(201);
-      const created = (await createdResponse.json()) as {
-        id: string;
-        summary: string;
-        startAt: string;
-        endAt: string;
-        tag?: string;
-        source?: string;
-      };
-      expect(created.summary).toBe("Work shift");
-      expect(created.startAt).toBe("2026-07-06T16:00:00.000Z");
-      expect(created.tag).toBe("work");
-      expect(created.source).toBe("local");
+      expect(createdResponse.status).toBe(404);
+      expect(await createdResponse.json()).toEqual({ error: "not_found" });
 
       const listResponse = await app.request(
         "/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z",
       );
-      expect(listResponse.status).toBe(200);
-      const listed = (await listResponse.json()) as {
-        events: Array<{ id: string; summary: string; source?: string }>;
-      };
-      expect(listed.events.some((event) => event.id === created.id)).toBe(true);
-      expect(
-        listed.events.find((event) => event.id === created.id)?.source,
-      ).toBe("local");
-
-      const invalidPatchResponse = await app.request(
-        `/v1/calendar/events/${encodeURIComponent(created.id)}`,
-        {
-          method: "PATCH",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ startAt: "2026-07-06T23:00:00.000Z" }),
-        },
-      );
-      expect(invalidPatchResponse.status).toBe(400);
-      const afterInvalidResponse = await app.request(
-        "/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z",
-      );
-      const afterInvalid = (await afterInvalidResponse.json()) as {
-        events: Array<{ id: string; startAt: string; endAt: string }>;
-      };
-      const unchanged = afterInvalid.events.find(
-        (event) => event.id === created.id,
-      );
-      expect(unchanged?.startAt).toBe("2026-07-06T16:00:00.000Z");
-      expect(unchanged?.endAt).toBe("2026-07-06T22:00:00.000Z");
-
-      const patchResponse = await app.request(
-        `/v1/calendar/events/${encodeURIComponent(created.id)}`,
-        {
-          method: "PATCH",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            summary: "Updated work shift",
-            location: "store",
-          }),
-        },
-      );
-      expect(patchResponse.status).toBe(200);
-      const patched = (await patchResponse.json()) as {
-        summary: string;
-        location?: string;
-      };
-      expect(patched.summary).toBe("Updated work shift");
-      expect(patched.location).toBe("store");
-
-      const deleteResponse = await app.request(
-        `/v1/calendar/events/${encodeURIComponent(created.id)}`,
-        { method: "DELETE" },
-      );
-      expect(deleteResponse.status).toBe(200);
-      const emptyResponse = await app.request(
-        "/v1/calendar/events?timeMin=2026-07-06T00:00:00.000Z&timeMax=2026-07-07T00:00:00.000Z",
-      );
-      const empty = (await emptyResponse.json()) as { events: unknown[] };
-      expect(empty.events).toHaveLength(0);
+      expect(listResponse.status).toBe(404);
+      expect(await listResponse.json()).toEqual({ error: "not_found" });
     });
   });
 });

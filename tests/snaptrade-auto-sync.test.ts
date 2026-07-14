@@ -14,9 +14,9 @@ describe("createSnapTradeAutoSync tick", () => {
     let synced = 0;
     const loop = createSnapTradeAutoSync({
       settings: () => ({ connected: false }),
-      sync: async () => {
+      sync: () => {
         synced += 1;
-        return { warnings: [] };
+        return Promise.resolve({ warnings: [] });
       },
       invalidate: () => {},
       log: () => {},
@@ -30,9 +30,9 @@ describe("createSnapTradeAutoSync tick", () => {
     const calls: string[] = [];
     const loop = createSnapTradeAutoSync({
       settings: () => ({ connected: true }),
-      sync: async () => {
+      sync: () => {
         calls.push("sync");
-        return { warnings: ["one balance skipped"] };
+        return Promise.resolve({ warnings: ["one balance skipped"] });
       },
       invalidate: () => calls.push("invalidate"),
       log: (message) => calls.push(message),
@@ -75,9 +75,7 @@ describe("createSnapTradeAutoSync tick", () => {
     let invalidated = 0;
     const loop = createSnapTradeAutoSync({
       settings: () => ({ connected: true }),
-      sync: async () => {
-        throw new Error("upstream 429");
-      },
+      sync: () => Promise.reject(new Error("upstream 429")),
       invalidate: () => {
         invalidated += 1;
       },

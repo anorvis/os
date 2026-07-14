@@ -3,3 +3,5 @@
 :memory:-wal
 node_modules/
 .playwright/
+
+.env.local

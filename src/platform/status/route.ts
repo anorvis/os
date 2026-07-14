@@ -7,7 +7,7 @@ export function osRoutes(input: { config: LocalAuthorityConfig; serviceIds: () =
     route.get("/v1/os/status", () => json({
       ok: true,
       authority: input.config,
-      storage: { sqlite: "centralized", sync: "files-only" },
+      storage: { sqlite: "disabled", sync: "files-only" },
       services: input.serviceIds(),
     }));
   };

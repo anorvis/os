@@ -44,9 +44,9 @@ describe("service registry", () => {
     try {
       const response = await createApp().request("/v1/os/status");
       expect(response.status).toBe(200);
-      const body = await response.json() as { services: string[] };
-      expect(body.services).toContain("integrations");
-      expect(body.services).toContain("llm-wiki");
+      const body = await response.json() as { services: string[]; storage: { sqlite: string; sync: string } };
+      expect(body.services).toEqual(["llm-wiki", "toolkit", "os"]);
+      expect(body.storage).toEqual({ sqlite: "disabled", sync: "files-only" });
     } finally {
       resetDatabaseForTests();
       restoreEnvironment(environment);
