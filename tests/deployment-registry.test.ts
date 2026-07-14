@@ -24,8 +24,8 @@ describe("Convex deployment registry", () => {
     expect(published).toMatchObject({
       url: "http://127.0.0.1:41210",
       siteUrl: "http://127.0.0.1:41211",
+      projectRoot: root,
     });
-
     const written: unknown = JSON.parse(readFileSync(registryPath, "utf8"));
     expect(written).toMatchObject({ url: "http://127.0.0.1:41210" });
   });
