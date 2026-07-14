@@ -9,7 +9,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "dev": "convex dev",
+    "dev": "bun src/tools/dev.ts",
     "dev:wiki-gateway": "bun src/platform/gateway/server.ts",
     "test": "bun test tests",
     "test:convex": "vitest run convex",
