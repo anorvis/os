@@ -1,8 +1,8 @@
 import { ConvexError, v } from "convex/values";
-import { internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { internalMutation, internalQuery, mutation, query } from "../_generated/server";
 import { requireWorkspace } from "../platform/auth/access";
+import { cancelActiveSyncs, enqueueSync } from "./integration/jobs";
 import { parseDecimal } from "./finance/decimal";
 
 const provider = v.union(
@@ -67,6 +67,12 @@ export const startSync = mutation({
   },
   handler: async (ctx, args) => {
     const access = await requireWorkspace(ctx, args.workspaceId);
+    if (args.provider === "pinterest") {
+      throw new ConvexError({
+        code: "INVALID_INPUT",
+        message: "Pinterest has no background sync",
+      });
+    }
     const connection = await ctx.db
       .query("providerConnections")
       .withIndex("by_workspace_provider", (q) =>
@@ -80,35 +86,29 @@ export const startSync = mutation({
     ) {
       throw new ConvexError({ code: "NOT_CONNECTED", message: "Provider is not connected" });
     }
-    for (const status of ["pending", "running"] as const) {
-      const active = await ctx.db
-        .query("syncJobs")
-        .withIndex("by_workspace_provider_status", (q) =>
-          q
-            .eq("workspaceId", access.workspaceId)
-            .eq("provider", args.provider)
-            .eq("status", status),
-        )
-        .first();
-      if (active !== null) return active._id;
-    }
-    const now = Date.now();
-    const jobId = await ctx.db.insert("syncJobs", {
-      workspaceId: access.workspaceId,
-      provider: args.provider,
-      kind: "manual",
-      status: "pending",
-      fetchedCount: 0,
-      appliedCount: 0,
-      skippedCount: 0,
-      attempt: 0,
-      createdAt: now,
-      updatedAt: now,
-    });
-    await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
-      jobId,
-    });
-    return jobId;
+    return (await enqueueSync(ctx, access.workspaceId, args.provider, "manual")).jobId;
+  },
+});
+
+// Lets a landing page follow the one sync job it was handed (for example the
+// initial sync queued by the Google OAuth callback).
+export const syncJobStatus = query({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    jobId: v.id("syncJobs"),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const job = await ctx.db.get(args.jobId);
+    if (job === null || job.workspaceId !== access.workspaceId) return null;
+    return {
+      provider: job.provider,
+      status: job.status,
+      fetchedCount: job.fetchedCount,
+      appliedCount: job.appliedCount,
+      error: job.error,
+      updatedAt: job.updatedAt,
+    };
   },
 });
 
@@ -134,8 +134,48 @@ export const disconnect = mutation({
         connectedAt: undefined,
         updatedAt: Date.now(),
       });
+      if (args.provider !== "pinterest") {
+        await cancelActiveSyncs(
+          ctx,
+          access.workspaceId,
+          args.provider,
+          "Provider was disconnected",
+        );
+      }
     }
     return args.provider;
+  },
+});
+
+// Google keeps its OAuth client configuration on disconnect so signing back
+// in never requires re-entering the client ID and secret.
+export const resetGoogleConnection = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    credentials: v.optional(encryptedCredentials),
+  },
+  handler: async (ctx, args) => {
+    const connection = await ctx.db
+      .query("providerConnections")
+      .withIndex("by_workspace_provider", (q) =>
+        q.eq("workspaceId", args.workspaceId).eq("provider", "google"),
+      )
+      .unique();
+    if (connection === null) return null;
+    await ctx.db.patch(connection._id, {
+      status: "available",
+      credentials: args.credentials,
+      connectedAt: undefined,
+      accessTokenExpiresAt: undefined,
+      updatedAt: Date.now(),
+    });
+    await cancelActiveSyncs(
+      ctx,
+      args.workspaceId,
+      "google",
+      "Google was disconnected",
+    );
+    return connection._id;
   },
 });
 
@@ -531,10 +571,11 @@ export const upsertGoogleEvents = internalMutation({
     for (const event of args.events) {
       const existing = await ctx.db
         .query("calendarEvents")
-        .withIndex("by_workspace_provider_event", (q) =>
+        .withIndex("by_workspace_provider_calendar_event", (q) =>
           q
             .eq("workspaceId", access.workspaceId)
             .eq("provider", "google")
+            .eq("calendarId", event.calendarId)
             .eq("providerEventId", event.providerEventId),
         )
         .unique();

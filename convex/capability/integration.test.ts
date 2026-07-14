@@ -1,6 +1,7 @@
 import { convexTest } from "convex-test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, internal } from "../_generated/api";
+import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
 import { modules } from "../test.setup";
 
@@ -21,6 +22,7 @@ async function sha256(value: string): Promise<string> {
     .join("");
 }
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -232,5 +234,185 @@ describe("provider connections", () => {
       appliedCount: 335,
       skippedCount: 15,
     });
+  });
+});
+
+describe("Google calendar lifecycle", () => {
+  function googleResponses(): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+    return (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith("https://oauth2.googleapis.com/token")) {
+        return Promise.resolve(Response.json({
+          access_token: "fresh-access",
+          refresh_token: "fresh-refresh",
+          expires_in: 3600,
+          scope: "https://www.googleapis.com/auth/calendar.readonly",
+        }));
+      }
+      if (url.includes("/users/me/calendarList")) {
+        return Promise.resolve(Response.json({
+          items: [
+            { id: "owner@example.test", primary: true, selected: true },
+            { id: "team@group.calendar.google.com", selected: true },
+            { id: "ignored@group.calendar.google.com", selected: false },
+          ],
+        }));
+      }
+      if (url.includes("/calendars/primary/events")) {
+        return Promise.resolve(Response.json({
+          items: [{
+            id: "event-1",
+            summary: "Primary standup",
+            start: { dateTime: "2026-07-15T10:00:00.000Z" },
+            end: { dateTime: "2026-07-15T10:30:00.000Z" },
+          }],
+        }));
+      }
+      if (url.includes("/calendars/team%40group.calendar.google.com/events")) {
+        return Promise.resolve(Response.json({
+          items: [{
+            id: "event-1",
+            summary: "Team review",
+            start: { dateTime: "2026-07-15T15:00:00.000Z" },
+            end: { dateTime: "2026-07-15T16:00:00.000Z" },
+          }],
+        }));
+      }
+      return Promise.resolve(Response.json({ error: `unexpected ${url}` }, { status: 500 }));
+    };
+  }
+
+  // Fake timers must be active while scheduling happens, or
+  // finishAllScheduledFunctions cannot drain the runner chain.
+  async function connectedGoogle() {
+    const { t, client, workspaceId } = await owner();
+    // Store credentials through the real encryption path.
+    const start = await client.action(api.capability.integration.google.start, {
+      clientId: "google-client",
+      clientSecret: "google-secret",
+      redirectUri: "http://127.0.0.1:3211/oauth/google/callback",
+      returnTo: "http://127.0.0.1:3000/life",
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(googleResponses());
+    vi.useFakeTimers();
+    const returnTo = await t.action(internal.capability.integration.google.completeOAuth, {
+      code: "auth-code",
+      state: state!,
+    });
+    const drain = () => t.finishAllScheduledFunctions(vi.runAllTimers);
+    return { t, client, workspaceId, fetchMock, returnTo, drain };
+  }
+
+  it("queues an initial sync on OAuth completion and hands the job to the landing page", async () => {
+    const { t, client, returnTo, drain } = await connectedGoogle();
+    const landing = new URL(returnTo);
+    expect(`${landing.origin}${landing.pathname}`).toBe("http://127.0.0.1:3000/life");
+    // Branded ID from a URL parameter; the query rejects foreign workspaces.
+    const handedJobId = landing.searchParams.get("googleSync") as Id<"syncJobs"> | null;
+    expect(handedJobId).toBeTruthy();
+
+    // The landing page can follow exactly the job it was handed.
+    const queued = await client.query(api.capability.integration.syncJobStatus, {
+      jobId: handedJobId!,
+    });
+    expect(queued).toMatchObject({ provider: "google", status: "pending" });
+
+    await drain();
+
+    const finished = await client.query(api.capability.integration.syncJobStatus, {
+      jobId: handedJobId!,
+    });
+    expect(finished).toMatchObject({ status: "completed" });
+
+    const jobs = await t.run((ctx) => ctx.db.query("syncJobs").collect());
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ provider: "google", status: "completed" });
+
+    const events = await t.run((ctx) => ctx.db.query("calendarEvents").collect());
+    expect(events).toHaveLength(2);
+    const byCalendar = new Map(events.map((event) => [event.calendarId, event]));
+    expect(byCalendar.get("primary")).toMatchObject({
+      providerEventId: "event-1",
+      summary: "Primary standup",
+    });
+    expect(byCalendar.get("team@group.calendar.google.com")).toMatchObject({
+      providerEventId: "event-1",
+      summary: "Team review",
+    });
+
+    // Same raw event id on two calendars must never collide.
+    const second = await client.mutation(api.capability.integration.startSync, {
+      provider: "google",
+    });
+    await drain();
+    expect(second).toBeTruthy();
+    const after = await t.run((ctx) => ctx.db.query("calendarEvents").collect());
+    expect(after).toHaveLength(2);
+  });
+
+  it("reschedules the runner for a job stuck pending after a dead runner", async () => {
+    const { t, client, workspaceId, drain } = await connectedGoogle();
+    await drain();
+
+    // Simulate a runner that died before claiming: pending, never started.
+    const stuckId = await t.run((ctx) =>
+      ctx.db.insert("syncJobs", {
+        workspaceId,
+        provider: "google",
+        kind: "manual",
+        status: "pending",
+        fetchedCount: 0,
+        appliedCount: 0,
+        skippedCount: 0,
+        attempt: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }),
+    );
+
+    const jobId = await client.mutation(api.capability.integration.startSync, {
+      provider: "google",
+    });
+    expect(jobId).toBe(stuckId);
+    await drain();
+
+    const job = await t.run((ctx) => ctx.db.get(stuckId));
+    expect(job).toMatchObject({ status: "completed" });
+  });
+
+  it("keeps the OAuth client config on disconnect and signs back in without it", async () => {
+    const { t, client, workspaceId } = await connectedGoogle();
+
+    const result = await client.action(api.capability.integration.google.disconnect, {});
+    expect(result).toEqual({ ok: true, hasClientConfig: true });
+
+    const connection = await t.run((ctx) =>
+      ctx.db
+        .query("providerConnections")
+        .withIndex("by_workspace_provider", (q) =>
+          q.eq("workspaceId", workspaceId).eq("provider", "google"),
+        )
+        .unique(),
+    );
+    expect(connection).toMatchObject({ status: "available" });
+    expect(connection?.credentials).toBeDefined();
+    expect(
+      connection?.provider === "google" ? connection.accessTokenExpiresAt : "wrong provider",
+    ).toBeUndefined();
+
+    // Any queued or running sync work stops with the disconnect.
+    const jobs = await t.run((ctx) => ctx.db.query("syncJobs").collect());
+    for (const job of jobs) {
+      expect(job.status === "completed" || job.status === "failed").toBe(true);
+    }
+
+    // Re-sign-in requires no client keys: start uses the preserved config.
+    const restart = await client.action(api.capability.integration.google.start, {
+      redirectUri: "http://127.0.0.1:3211/oauth/google/callback",
+      returnTo: "http://127.0.0.1:3000/life",
+    });
+    const url = new URL(restart.authorizationUrl);
+    expect(url.searchParams.get("client_id")).toBe("google-client");
   });
 });
