@@ -15,6 +15,7 @@ export type AgentProcessInput = {
   cwd: string;
   label: string;
   timeoutMs: number;
+  env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   maxOutputBytes?: number;
   killGraceMs?: number;
@@ -31,7 +32,7 @@ export function runAgentProcess(
   const { promise, resolve } = Promise.withResolvers<AgentProcessResult>();
   const child = spawn(input.command, input.args, {
     cwd: input.cwd,
-    env: process.env,
+    env: input.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
