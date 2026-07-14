@@ -24,8 +24,7 @@
     "convex": "1.42.1",
     "effect": "3.21.2",
     "hono": "^4.12.28",
-    "markdownlint": "0.41.0",
-    "snaptrade-typescript-sdk": "10.0.18"
+    "markdownlint": "0.41.0"
   },
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",

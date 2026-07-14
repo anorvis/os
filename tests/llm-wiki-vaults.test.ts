@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resetDatabaseForTests } from "../src/core/db/database";
 import { createApp, type App } from "../src/platform/gateway/app";
 
 describe("LLM Wiki vault registry routes", () => {
@@ -39,17 +38,14 @@ describe("LLM Wiki vault registry routes", () => {
 });
 
 async function withIsolatedGateway(run: (app: App, home: string) => Promise<void>): Promise<void> {
-  const environment = captureEnvironment("HOME", "ANORVIS_DB_PATH", "ANORVIS_OS_API_TOKEN", "ANORVIS_OS_API_TOKEN_PATH");
+  const environment = captureEnvironment("HOME", "ANORVIS_OS_API_TOKEN", "ANORVIS_OS_API_TOKEN_PATH");
   const home = mkdtempSync(join(tmpdir(), "anorvis-vaults-"));
   process.env.HOME = home;
-  process.env.ANORVIS_DB_PATH = join(home, "anorvis.sqlite");
   process.env.ANORVIS_OS_API_TOKEN_PATH = join(home, "missing-token");
   delete process.env.ANORVIS_OS_API_TOKEN;
-  resetDatabaseForTests();
   try {
     await run(createApp(), home);
   } finally {
-    resetDatabaseForTests();
     restoreEnvironment(environment);
   }
 }

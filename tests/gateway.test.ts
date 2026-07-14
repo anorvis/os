@@ -3,7 +3,6 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, type App, type CreateAppOptions } from "../src/platform/gateway/app";
-import { resetDatabaseForTests } from "../src/core/db/database";
 
 type GatewayFixture = {
   app: App;
@@ -20,21 +19,17 @@ async function withIsolatedGateway(
 ): Promise<void> {
   const environment = captureEnvironment(
     "HOME",
-    "ANORVIS_DB_PATH",
     "ANORVIS_OS_API_TOKEN",
     "ANORVIS_OS_API_TOKEN_PATH",
     "ANORVIS_OS_HANDSHAKE_ORIGINS",
   );
   const home = tmpHome();
   process.env.HOME = home;
-  process.env.ANORVIS_DB_PATH = join(home, ".anorvis", "data", "test.sqlite");
   delete process.env.ANORVIS_OS_API_TOKEN;
-  resetDatabaseForTests();
 
   try {
     await run({ app: createApp(options), home });
   } finally {
-    resetDatabaseForTests();
     restoreEnvironment(environment);
   }
 }
@@ -158,22 +153,19 @@ describe("minimal Anorvis OS gateway", () => {
       const unauthenticated = await app.request("/v1/os/status");
       expect(unauthenticated.status).toBe(401);
 
-      const unauthenticatedToolkit = await app.request("/v1/os/toolkit");
-      expect(unauthenticatedToolkit.status).toBe(401);
+      const retiredToolkit = await app.request("/v1/os/toolkit", {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(retiredToolkit.status).toBe(404);
 
       const authorized = await app.request("/v1/os/status", {
         headers: { authorization: `Bearer ${token}` },
       });
       expect(authorized.status).toBe(200);
-      expect((await authorized.json()) as { storage: unknown }).toMatchObject({
-        storage: { sqlite: "disabled", sync: "files-only" },
+      expect((await authorized.json()) as { ok: boolean }).toMatchObject({
+        ok: true,
       });
 
-      const toolkit = await app.request("/v1/os/toolkit", {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      expect(toolkit.status).toBe(200);
-      expect(await toolkit.json()).toEqual({ version: 1, tools: [] });
 
       const retiredCrud = await app.request("/v1/overview", {
         headers: { authorization: `Bearer ${token}` },

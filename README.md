@@ -55,10 +55,10 @@ workspace and registered vault list.
   - `POST /v1/llm-wiki/wiki`
   - `POST /v1/llm-wiki/interaction`
   - `GET /v1/llm-wiki/lint`
-- Serve the platform toolkit manifest at `GET /v1/os/toolkit`.
-- Keep historical durable capability modules out of gateway runtime reachability;
-  authenticated Convex functions own browser-facing task, calendar, health,
-  finance, integration, and wiki CRUD records.
+- Keep durable capability modules out of the sidecar entirely; authenticated
+  Convex functions own browser-facing task, calendar, health, finance,
+  integration, and wiki CRUD records, and the extension builds its agent
+  toolkit directly from those Convex functions.
 
 ## Legacy data migration
 
@@ -89,11 +89,10 @@ bun run lint:wiki
 
 ## Toolkit
 
-`GET /v1/os/toolkit` returns the local sidecar manifest consumed by extension
-routers. Durable task, calendar, health, finance, integration, and Life tools
-are intentionally absent because those records live behind the authenticated
-Convex backend. The sidecar only exposes machine-local LLM Wiki execution and
-local authority routes.
+There is no sidecar toolkit endpoint. Agent-callable durable actions are
+authenticated Convex functions; the extension registers them from its own
+Convex-backed manifest. The sidecar only exposes machine-local LLM Wiki
+execution and local authority routes.
 
 ## License
 
