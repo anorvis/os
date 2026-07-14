@@ -9,6 +9,9 @@ import { dirname, join } from "node:path";
 export type ConvexDeployment = {
   url: string;
   siteUrl: string;
+  // The project directory owning the deployment state, so a supervisor can
+  // restart this exact deployment instead of provisioning an empty one.
+  projectRoot: string;
   updatedAt: string;
 };
 
@@ -53,6 +56,7 @@ export function publishConvexDeployment(
   const deployment: ConvexDeployment = {
     url: `http://127.0.0.1:${ports.cloud}`,
     siteUrl: `http://127.0.0.1:${ports.site}`,
+    projectRoot,
     updatedAt: new Date().toISOString(),
   };
   mkdirSync(dirname(registryPath), { recursive: true });
