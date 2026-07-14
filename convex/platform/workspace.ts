@@ -1,6 +1,20 @@
 import { ConvexError, v } from "convex/values";
-import { mutation, query } from "../_generated/server";
+import { internalMutation, mutation, query } from "../_generated/server";
 import { requireUser, requireWorkspace } from "./auth/access";
+
+// Resolves the single local owner for machine-key sign-in: this deployment is
+// single-owner, so the first user is authoritative and is created on demand.
+export const ensureLocalOwnerUser = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const existing = await ctx.db.query("users").first();
+    if (existing !== null) return existing._id;
+    const email =
+      process.env.ANORVIS_OWNER_EMAIL?.trim().toLowerCase() ||
+      "owner@anorvis.local";
+    return ctx.db.insert("users", { email, name: "Owner" });
+  },
+});
 
 export const ensureDefault = mutation({
   args: {},

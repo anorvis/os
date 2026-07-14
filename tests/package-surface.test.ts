@@ -13,7 +13,7 @@ describe("OS package surface after Convex cutover", () => {
       readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"),
     ) as PackageJson;
 
-    expect(pkg.scripts?.dev).toBe("convex dev");
+    expect(pkg.scripts?.dev).toBe("bun src/tools/dev.ts");
     expect(pkg.scripts?.dev).not.toContain("platform/gateway/server");
     expect(pkg.scripts?.["dev:wiki-gateway"]).toBe(
       "bun src/platform/gateway/server.ts",
