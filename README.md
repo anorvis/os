@@ -13,9 +13,12 @@ bun install --frozen-lockfile
 bun run dev
 ```
 
-`bun run dev` starts the local Convex backend. Browser-facing task, calendar,
-health, finance, integration, memory, and Wiki records are served by
-authenticated Convex functions.
+`bun run dev` starts the local Convex backend and publishes its actual URLs to
+`~/.anorvis/convex/deployment.json` so the web app and extension discover the
+running deployment instead of assuming fixed ports. Browser-facing task,
+calendar, health, finance, integration, memory, and Wiki records are served by
+authenticated Convex functions, and local clients sign in silently with the
+machine key at `~/.anorvis/convex-setup-key`.
 
 The optional machine-local LLM Wiki sidecar is isolated behind:
 
