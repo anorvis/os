@@ -1,54 +1,84 @@
 # Anorvis OS
 
-Local-first Anorvis backend and LLM Wiki engine.
+Local Anorvis sidecar for LLM Wiki agent execution and machine-local operations.
 
 ## Requirements
 
 - [Bun](https://bun.sh) 1.3+
 
-## Install & run
+## Install and run
 
 ```bash
 bun install --frozen-lockfile
 bun run dev
 ```
 
-The gateway listens on:
+`bun run dev` starts the local Convex backend. Browser-facing task, calendar,
+health, finance, integration, memory, and Wiki records are served by
+authenticated Convex functions.
 
-```text
-http://127.0.0.1:8787
+The optional machine-local LLM Wiki sidecar is isolated behind:
+
+```bash
+bun run dev:wiki-gateway
 ```
+
+It listens on `http://127.0.0.1:8787`.
 
 ## Configuration
 
-Everything works with defaults; override with environment variables when needed:
+The optional Wiki sidecar works with defaults; override these variables when needed:
 
-| Variable                      | Default                          | Purpose              |
-| ----------------------------- | -------------------------------- | -------------------- |
-| `ANORVIS_OS_HOST`             | `127.0.0.1`                      | Bind host            |
-| `ANORVIS_OS_PORT` (or `PORT`) | `8787`                           | Bind port            |
-| `ANORVIS_DB_PATH`             | `~/.anorvis/data/anorvis.sqlite` | SQLite database file |
-| `ANORVIS_OS_API_TOKEN_PATH`   | `~/.anorvis/os/api-token`        | API token file       |
+| Variable                      | Default                   | Purpose        |
+| ----------------------------- | ------------------------- | -------------- |
+| `ANORVIS_OS_HOST`             | `127.0.0.1`               | Bind host      |
+| `ANORVIS_OS_PORT` (or `PORT`) | `8787`                    | Bind port      |
+| `ANORVIS_OS_API_TOKEN_PATH`   | `~/.anorvis/os/api-token` | API token file |
 
 Auth: loopback requests work without a token. Binding to a non-loopback host
 requires a configured token; the first `POST /v1/auth/handshake` writes one to
 the token file.
 
-Data lives under `~/.anorvis/` — `data/anorvis.sqlite` for structured records
-and `llm-wiki/` for the wiki. Database migrations run automatically on start.
+Machine-local state lives under `~/.anorvis/`, including the local LLM Wiki
+workspace and registered vault list.
 
 ## Responsibilities
 
-- Serve `GET /health` for extension startup checks.
-- Serve LLM Wiki endpoints:
+- Serve `GET /health` for sidecar startup checks.
+- Serve local authority endpoints:
+  - `POST /v1/auth/handshake`
+  - `GET /v1/os/status`
+- Serve LLM Wiki machine-local endpoints:
   - `POST /v1/llm-wiki/init`
+  - `GET /v1/llm-wiki/vaults`
+  - `POST /v1/llm-wiki/vaults`
   - `POST /v1/llm-wiki/wiki`
+  - `POST /v1/llm-wiki/interaction`
   - `GET /v1/llm-wiki/lint`
-- Serve the platform toolkit manifest at `GET /v1/os/toolkit`.
-- Own toolkit metadata for tasks, calendar events, task sessions, Life
-  snapshot reads, and Finance (dashboard, accounts, CSV imports).
-- Own the local LLM Wiki scaffold, write loop, lint loop, and migration task.
-- Own canonical Life, Health, and Finance records in SQLite.
+- Keep durable capability modules out of the sidecar entirely; authenticated
+  Convex functions own browser-facing task, calendar, health, finance,
+  integration, and wiki CRUD records, and the extension builds its agent
+  toolkit directly from those Convex functions.
+
+## Legacy data migration
+
+Preview the SQLite and filesystem migration before applying it:
+
+```bash
+bun src/tools/migrate-legacy.ts --dry-run
+```
+
+For a local Convex deployment, apply the reviewed payload as the existing owner:
+
+```bash
+bun src/tools/migrate-legacy.ts \
+  --identity-subject=<owner-user-id> \
+  --allow-unsupported
+```
+
+The importer is relationship-aware and idempotent. `--allow-unsupported`
+acknowledges transient agent-run, delivery, projection, and monitor records that
+are intentionally not canonical Convex state.
 
 ## Checks
 
@@ -59,32 +89,10 @@ bun run lint:wiki
 
 ## Toolkit
 
-`GET /v1/os/toolkit` returns the curated manifest consumed by the extension. The manifest is not route reflection; each capability owns explicit agent-facing metadata beside its route/schema code.
-
-Current toolkit resources:
-
-- `task`
-- `calendar_event`
-- `task_session`
-- `life_snapshot`
-- `finance_dashboard`
-- `finance_account`
-- `finance_import`
-- `health_dashboard`
-- `meal`
-- `macro_profile`
-- `workout`
-- `body_measurement`
-- `recipe`
-- `recipe_import`
-- `recipe_search`
-- `food_search`
-- `hevy_settings`
-- `hevy_sync`
-- `hevy_routine`
-- `hevy_exercise_template`
-
-The extension keeps the toolkit manifest out of model context by default. Its always-active `anorvis_tool` router reads this manifest, performs reads directly where possible, and activates precise action tools only when a mutation is needed.
+There is no sidecar toolkit endpoint. Agent-callable durable actions are
+authenticated Convex functions; the extension registers them from its own
+Convex-backed manifest. The sidecar only exposes machine-local LLM Wiki
+execution and local authority routes.
 
 ## License
 

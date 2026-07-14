@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resetDatabaseForTests } from "../src/core/db/database";
 import { createApp } from "../src/platform/gateway/app";
 
 describe("OS status and auth", () => {
@@ -10,19 +9,18 @@ describe("OS status and auth", () => {
     await withEnv({ host: "0.0.0.0", token: "tailnet-token", tailnetName: "pi-tailnet" }, async () => {
       const response = await createApp().request("/v1/os/status", { headers: { authorization: "Bearer tailnet-token" } });
       expect(response.status).toBe(200);
-      const body = await response.json() as { authority: { bindHost: string; tailnetName: string | null; storageMode: string } };
+      const body = await response.json() as { authority: { bindHost: string; tailnetName: string | null } };
       expect(body.authority.bindHost).toBe("0.0.0.0");
       expect(body.authority.tailnetName).toBe("pi-tailnet");
-      expect(body.authority.storageMode).toBe("centralized");
     });
   });
 
   test("non-loopback without token rejects protected routes but leaves public routes reachable", async () => {
     await withEnv({ host: "0.0.0.0" }, async () => {
       const app = createApp();
-      const overview = await app.request("/v1/overview");
-      expect(overview.status).toBe(503);
-      expect(await overview.json()).toEqual({ error: "auth_token_required" });
+      const status = await app.request("/v1/os/status");
+      expect(status.status).toBe(503);
+      expect(await status.json()).toEqual({ error: "auth_token_required" });
 
       const health = await app.request("/health");
       expect(health.status).toBe(200);
@@ -39,7 +37,7 @@ describe("OS status and auth", () => {
 
   test("loopback without token allows protected same-device routes", async () => {
     await withEnv({ host: "127.0.0.1" }, async () => {
-      const response = await createApp().request("/v1/overview");
+      const response = await createApp().request("/v1/os/status");
       expect(response.status).toBe(200);
     });
   });
@@ -50,7 +48,6 @@ type EnvOptions = { host: string; token?: string; tailnetName?: string };
 async function withEnv(options: EnvOptions, run: () => Promise<void>): Promise<void> {
   const environment = captureEnvironment(
     "HOME",
-    "ANORVIS_DB_PATH",
     "ANORVIS_OS_API_TOKEN",
     "ANORVIS_OS_API_TOKEN_PATH",
     "ANORVIS_OS_HOST",
@@ -58,18 +55,15 @@ async function withEnv(options: EnvOptions, run: () => Promise<void>): Promise<v
   );
   const home = mkdtempSync(join(tmpdir(), "anorvis-auth-"));
   process.env.HOME = home;
-  process.env.ANORVIS_DB_PATH = join(home, "anorvis.sqlite");
   process.env.ANORVIS_OS_API_TOKEN_PATH = join(home, "missing-token");
   process.env.ANORVIS_OS_HOST = options.host;
   if (options.token) process.env.ANORVIS_OS_API_TOKEN = options.token;
   else delete process.env.ANORVIS_OS_API_TOKEN;
   if (options.tailnetName) process.env.ANORVIS_TAILNET_NAME = options.tailnetName;
   else delete process.env.ANORVIS_TAILNET_NAME;
-  resetDatabaseForTests();
   try {
     await run();
   } finally {
-    resetDatabaseForTests();
     restoreEnvironment(environment);
   }
 }

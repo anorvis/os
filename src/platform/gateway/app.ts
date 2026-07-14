@@ -114,7 +114,6 @@ export function requiresConfiguredToken(config: LocalAuthorityConfig): boolean {
 }
 
 function authorize(request: Request, url: URL, config: LocalAuthorityConfig): Response | undefined {
-  if (url.pathname === "/v1/integrations/google/auth/callback") return undefined;
   const expected = process.env.ANORVIS_OS_API_TOKEN || readToken();
   if (!expected) {
     return requiresConfiguredToken(config)

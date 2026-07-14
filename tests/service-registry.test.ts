@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { readLocalAuthorityConfig } from "../src/core/config/local-authority";
 import { createServiceRegistry, type ServiceFactory } from "../src/core/service/service";
-import { resetDatabaseForTests } from "../src/core/db/database";
 import { createApp } from "../src/platform/gateway/app";
 
 describe("service registry", () => {
@@ -33,22 +32,18 @@ describe("service registry", () => {
   });
 
   test("os status lists registry service ids", async () => {
-    const environment = captureEnvironment("HOME", "ANORVIS_DB_PATH", "ANORVIS_OS_API_TOKEN", "ANORVIS_OS_API_TOKEN_PATH", "ANORVIS_OS_HOST");
+    const environment = captureEnvironment("HOME", "ANORVIS_OS_API_TOKEN", "ANORVIS_OS_API_TOKEN_PATH", "ANORVIS_OS_HOST");
     const home = mkdtempSync(join(tmpdir(), "anorvis-registry-"));
     process.env.HOME = home;
-    process.env.ANORVIS_DB_PATH = join(home, "data.sqlite");
     process.env.ANORVIS_OS_HOST = "127.0.0.1";
     delete process.env.ANORVIS_OS_API_TOKEN;
     process.env.ANORVIS_OS_API_TOKEN_PATH = join(home, "missing-token");
-    resetDatabaseForTests();
     try {
       const response = await createApp().request("/v1/os/status");
       expect(response.status).toBe(200);
       const body = await response.json() as { services: string[] };
-      expect(body.services).toContain("integrations");
-      expect(body.services).toContain("llm-wiki");
+      expect(body.services).toEqual(["llm-wiki", "os"]);
     } finally {
-      resetDatabaseForTests();
       restoreEnvironment(environment);
     }
   });

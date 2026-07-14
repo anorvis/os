@@ -45,22 +45,16 @@ Separate mechanics, reusable capabilities, and product-specific read models.
 
 ## Toolkit Metadata
 
-Agent-callable OS actions are exposed through `src/platform/toolkit`.
+Agent-callable durable actions are authenticated Convex functions; the
+extension registers them from its own Convex-backed toolkit manifest. The
+sidecar serves no toolkit endpoint.
 
-- Put toolkit metadata beside the capability route it exposes, e.g. `src/capability/task/toolkit.ts`.
-- Export arrays named `<capability>ToolkitTools`.
-- Add those arrays to `src/platform/toolkit/manifest.ts`; do not use runtime filesystem scanning.
 - Tool names use `anorvis_<verb>_<noun>`, e.g. `anorvis_create_task`, not product-page names like `anorvis_life_task_create`.
 - Avoid storage verbs like `upsert` in tool names. Use user-intent verbs such as `create`, `update`, `complete`, `delete`, `list`, `read`, `start`, or `stop`.
 - Keep product/domain labels in metadata (`domain: "life"`), not in the tool name.
-- Expose only curated, user-intent actions. Never reflect every HTTP route automatically.
-- Derive `parameters` from Effect schemas with the platform toolkit helper where possible; do not hand-copy JSON Schema for route bodies.
-- Add small toolkit-specific Effect schemas for combined tool inputs, such as route `id` path params plus body fields.
-- Describe schema fields with Effect annotations so generated tool parameters tell the agent what `id`, dates, and timestamps mean.
-- Metadata must include a stable `id`, `name`, `label`, `description`, `domain`, `operation`, `resource`, `mutates`, `method`, `path`, and strict `parameters` schema.
-- Use `pathParams` for `:id`-style route parameters and `queryParams` for GET filters.
+- Expose only curated, user-intent actions. Never reflect every Convex function automatically.
+- Metadata must include a stable `id`, `name`, `label`, `description`, `domain`, `operation`, `resource`, `mutates`, and a strict `parameters` schema.
 - Keep schemas strict with `additionalProperties: false`.
-- Platform toolkit aggregates and serves metadata; capabilities own their own action metadata.
 
 ## Toolkit Context Safety
 
