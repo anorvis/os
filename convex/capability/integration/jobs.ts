@@ -5,17 +5,78 @@ import { internalMutation, type MutationCtx } from "../../_generated/server";
 
 const staleAfterMs = 20 * 60 * 1000;
 
-type SyncProvider = "google" | "hevy" | "snaptrade";
+export type SyncProvider = "google" | "hevy" | "snaptrade";
+export type SyncKind = "manual" | "scheduled" | "live";
 
-// Single enqueue path for scheduled, manual, and post-OAuth syncs. A runner
-// that dies before claiming leaves its job pending forever, so an existing
-// pending job gets the runner rescheduled — idempotent because the claim
-// transitions pending -> running exactly once.
+function newerWatermark(
+  current: string | undefined,
+  candidate: string | undefined,
+): string | undefined {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const currentNumeric = Number(current);
+  const candidateNumeric = Number(candidate);
+  if (
+    /^-?\d+(?:\.\d+)?$/.test(current) &&
+    /^-?\d+(?:\.\d+)?$/.test(candidate) &&
+    Number.isFinite(currentNumeric) &&
+    Number.isFinite(candidateNumeric)
+  ) {
+    return candidateNumeric >= currentNumeric ? candidate : current;
+  }
+  const currentTime = Date.parse(current);
+  const candidateTime = Date.parse(candidate);
+  if (Number.isFinite(currentTime) && Number.isFinite(candidateTime)) {
+    return candidateTime >= currentTime ? candidate : current;
+  }
+  return candidate >= current ? candidate : current;
+}
+
+export async function recordProviderSyncCompletion(
+  ctx: { db: MutationCtx["db"] },
+  workspaceId: Id<"workspaces">,
+  provider: SyncProvider,
+  watermark?: string,
+): Promise<void> {
+  const now = Date.now();
+  const existing = await ctx.db
+    .query("providerSyncStates")
+    .withIndex("by_workspace_provider", (q) =>
+      q.eq("workspaceId", workspaceId).eq("provider", provider),
+    )
+    .unique();
+  if (existing === null) {
+    await ctx.db.insert("providerSyncStates", {
+      workspaceId,
+      provider,
+      sequence: 1,
+      lastSyncedAt: now,
+      ...(watermark ? { watermark } : {}),
+      createdAt: now,
+      updatedAt: now,
+    });
+    return;
+  }
+  const nextWatermark = newerWatermark(existing.watermark, watermark);
+  await ctx.db.patch(existing._id, {
+    sequence: existing.sequence + 1,
+    lastSyncedAt: now,
+    ...(nextWatermark !== existing.watermark
+      ? { watermark: nextWatermark }
+      : {}),
+    updatedAt: now,
+  });
+}
+
+// Single enqueue path for scheduled, manual, post-OAuth, and live syncs. A
+// runner that dies before claiming leaves its job pending forever, so an
+// existing pending job gets the runner rescheduled. Completed live jobs are
+// recycled so the 30-second cron cannot grow syncJobs without bound.
 export async function enqueueSync(
   ctx: MutationCtx,
   workspaceId: Id<"workspaces">,
   provider: SyncProvider,
-  kind: "manual" | "scheduled",
+  kind: SyncKind,
 ): Promise<{ jobId: Id<"syncJobs">; scheduled: boolean }> {
   const now = Date.now();
   const active = async (status: "pending" | "running") =>
@@ -50,6 +111,54 @@ export async function enqueueSync(
     });
     return { jobId: running._id, scheduled: true };
   }
+
+  if (kind === "live") {
+    const previous = await ctx.db
+      .query("syncJobs")
+      .withIndex("by_workspace_provider_kind_status", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("provider", provider)
+          .eq("kind", "live")
+          .eq("status", "completed"),
+      )
+      .order("desc")
+      .first();
+    const failed = previous === null
+      ? await ctx.db
+          .query("syncJobs")
+          .withIndex("by_workspace_provider_kind_status", (q) =>
+            q
+              .eq("workspaceId", workspaceId)
+              .eq("provider", provider)
+              .eq("kind", "live")
+              .eq("status", "failed"),
+          )
+          .order("desc")
+          .first()
+      : null;
+    const reusable = previous ?? failed;
+    if (reusable !== null) {
+      await ctx.db.patch(reusable._id, {
+        status: "pending",
+        cursor: undefined,
+        checkpoint: undefined,
+        fetchedCount: 0,
+        appliedCount: 0,
+        skippedCount: 0,
+        attempt: 0,
+        error: undefined,
+        startedAt: undefined,
+        finishedAt: undefined,
+        updatedAt: now,
+      });
+      await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
+        jobId: reusable._id,
+      });
+      return { jobId: reusable._id, scheduled: true };
+    }
+  }
+
   const jobId = await ctx.db.insert("syncJobs", {
     workspaceId,
     provider,
@@ -78,10 +187,30 @@ export const enqueueProviderSync = internalMutation({
       v.literal("hevy"),
       v.literal("snaptrade"),
     ),
-    kind: v.union(v.literal("manual"), v.literal("scheduled")),
+    kind: v.union(v.literal("manual"), v.literal("scheduled"), v.literal("live")),
   },
   handler: async (ctx, args) =>
     (await enqueueSync(ctx, args.workspaceId, args.provider, args.kind)).jobId,
+});
+
+export const publishProviderSyncCompletion = internalMutation({
+  args: {
+    workspaceId: v.id("workspaces"),
+    provider: v.union(
+      v.literal("google"),
+      v.literal("hevy"),
+      v.literal("snaptrade"),
+    ),
+    watermark: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await recordProviderSyncCompletion(
+      ctx,
+      args.workspaceId,
+      args.provider,
+      args.watermark,
+    );
+  },
 });
 
 // Disconnecting a provider must stop its in-flight and queued work; a lease
@@ -148,6 +277,27 @@ export const enqueueProviderSyncs = internalMutation({
   },
 });
 
+export const enqueueLiveHevySyncs = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const connections = (await ctx.db.query("providerConnections").collect()).filter(
+      (connection) =>
+        connection.provider === "hevy" &&
+        connection.status === "connected" &&
+        connection.credentials !== undefined,
+    );
+    let enqueued = 0;
+    for (const connection of connections) {
+      if (connection.status !== "connected" || connection.credentials === undefined) {
+        continue;
+      }
+      const result = await enqueueSync(ctx, connection.workspaceId, "hevy", "live");
+      if (result.scheduled) enqueued += 1;
+    }
+    return enqueued;
+  },
+});
+
 export const claimProviderSync = internalMutation({
   args: { jobId: v.id("syncJobs") },
   handler: async (ctx, args) => {
@@ -167,6 +317,7 @@ export const claimProviderSync = internalMutation({
       lease,
       workspaceId: job.workspaceId,
       provider: job.provider,
+      kind: job.kind,
     };
   },
 });
@@ -177,6 +328,7 @@ export const advanceProviderSync = internalMutation({
     lease: v.number(),
     done: v.boolean(),
     cursor: v.optional(v.string()),
+    watermark: v.optional(v.string()),
     fetched: v.number(),
     applied: v.number(),
     skipped: v.number(),
@@ -201,6 +353,19 @@ export const advanceProviderSync = internalMutation({
       finishedAt: args.done ? now : undefined,
       updatedAt: now,
     });
+    if (
+      args.done &&
+      (job.provider === "google" ||
+        job.provider === "hevy" ||
+        job.provider === "snaptrade")
+    ) {
+      await recordProviderSyncCompletion(
+        ctx,
+        job.workspaceId,
+        job.provider,
+        args.watermark,
+      );
+    }
     if (!args.done) {
       await ctx.scheduler.runAfter(0, internal.capability.integration.runner.run, {
         jobId: args.jobId,

@@ -10,6 +10,12 @@ crons.interval(
 );
 
 crons.interval(
+  "synchronize connected Hevy workout events",
+  { seconds: 30 },
+  internal.capability.integration.jobs.enqueueLiveHevySyncs,
+);
+
+crons.interval(
   "remove expired OAuth states",
   { hours: 1 },
   internal.capability.integration.jobs.cleanupOAuthStates,

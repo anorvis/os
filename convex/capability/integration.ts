@@ -12,6 +12,11 @@ const provider = v.union(
   v.literal("hevy"),
   v.literal("snaptrade"),
 );
+const syncProvider = v.union(
+  v.literal("google"),
+  v.literal("hevy"),
+  v.literal("snaptrade"),
+);
 const encryptedCredentials = v.object({
   algorithm: v.literal("aes-256-gcm"),
   keyVersion: v.number(),
@@ -43,6 +48,14 @@ const hevyExercise = v.object({
   muscleGroups: v.array(v.string()),
   sets: v.array(hevySet),
 });
+const hevyWorkout = v.object({
+  sourceId: v.string(),
+  title: v.string(),
+  startedAt: v.number(),
+  durationSeconds: v.number(),
+  notes: v.optional(v.string()),
+  exercises: v.array(hevyExercise),
+});
 
 export const list = query({
   args: { workspaceId: v.optional(v.id("workspaces")) },
@@ -54,11 +67,44 @@ export const list = query({
         q.eq("workspaceId", access.workspaceId),
       )
       .collect();
-    return connections.map(({ credentials, ...connection }) => ({
-      ...connection,
-      hasCredentials: credentials !== undefined,
-    }));
+    return Promise.all(
+      connections.map(async ({ credentials, ...connection }) => {
+        const syncState =
+          connection.provider === "pinterest"
+            ? null
+            : await ctx.db
+                .query("providerSyncStates")
+                .withIndex("by_workspace_provider", (q) =>
+                  q
+                    .eq("workspaceId", access.workspaceId)
+                    .eq("provider", connection.provider),
+                )
+                .unique();
+        return {
+          ...connection,
+          hasCredentials: credentials !== undefined,
+          sync: {
+            sequence: syncState?.sequence ?? 0,
+            lastSyncedAt: syncState?.lastSyncedAt ?? null,
+          },
+        };
+      }),
+    );
   },
+});
+
+export const providerSyncState = internalQuery({
+  args: {
+    workspaceId: v.id("workspaces"),
+    provider: syncProvider,
+  },
+  handler: (ctx, args) =>
+    ctx.db
+      .query("providerSyncStates")
+      .withIndex("by_workspace_provider", (q) =>
+        q.eq("workspaceId", args.workspaceId).eq("provider", args.provider),
+      )
+      .unique(),
 });
 
 export const startSync = mutation({
@@ -691,6 +737,7 @@ export const backfillGoogleEventTags = internalMutation({
         .query("calendarEvents")
         .withIndex("by_workspace_provider_calendar_event", (q) =>
           q.eq("workspaceId", workspace._id).eq("provider", "google"),
+
         )
         .collect();
       if (events.length === 0) continue;
@@ -705,79 +752,62 @@ export const backfillGoogleEventTags = internalMutation({
   },
 });
 
-export const upsertHevyWorkouts = internalMutation({
-  args: {
-    workspaceId: v.optional(v.id("workspaces")),
-    system: v.optional(v.boolean()),
-    workouts: v.array(
-      v.object({
-        sourceId: v.string(),
-        title: v.string(),
-        startedAt: v.number(),
-        durationSeconds: v.number(),
-        notes: v.optional(v.string()),
-        exercises: v.array(hevyExercise),
-      }),
-    ),
-  },
-  handler: async (ctx, args) => {
-    const access = args.system
-      ? { workspaceId: args.workspaceId! }
-      : await requireWorkspace(ctx, args.workspaceId);
-    await ensureSystemTag(ctx, access.workspaceId, HEVY_TAG);
-    let created = 0;
-    let updated = 0;
-    for (const input of args.workouts) {
-      const existing = await ctx.db
-        .query("workouts")
-        .withIndex("by_workspace_source_id", (q) =>
-          q
-            .eq("workspaceId", access.workspaceId)
-            .eq("source", "hevy")
-            .eq("sourceId", input.sourceId),
-        )
-        .unique();
-      const now = Date.now();
-      let workoutId: Id<"workouts">;
-      if (existing === null) {
-        workoutId = await ctx.db.insert("workouts", {
-          workspaceId: access.workspaceId,
-          source: "hevy",
-          sourceId: input.sourceId,
-          title: input.title,
-          startedAt: input.startedAt,
-          durationSeconds: input.durationSeconds,
-          notes: input.notes,
-          createdAt: now,
-          updatedAt: now,
-        });
-        created += 1;
-      } else {
-        workoutId = existing._id;
-        updated += 1;
-        const [exercises, sets] = await Promise.all([
-          ctx.db
-            .query("workoutExercises")
-            .withIndex("by_workout_order", (q) => q.eq("workoutId", workoutId))
-            .collect(),
-          ctx.db
-            .query("exerciseSets")
-            .withIndex("by_workout", (q) => q.eq("workoutId", workoutId))
-            .collect(),
-        ]);
-        for (const set of sets) await ctx.db.delete(set._id);
-        for (const exercise of exercises) await ctx.db.delete(exercise._id);
-        await ctx.db.patch(workoutId, {
-          title: input.title,
-          startedAt: input.startedAt,
-          durationSeconds: input.durationSeconds,
-          notes: input.notes,
-          updatedAt: now,
-        });
-      }
+type HevyWorkoutInput = {
+  sourceId: string;
+  title: string;
+  startedAt: number;
+  durationSeconds: number;
+  notes?: string;
+  exercises: Array<{
+    title: string;
+    muscleGroups: string[];
+    sets: Array<{
+      setType: string;
+      reps?: number;
+      weightKg?: number;
+      durationSeconds?: number;
+      distanceMeters?: number;
+    }>;
+  }>;
+};
+
+async function applyHevyWorkoutRows(
+  ctx: { db: MutationCtx["db"] },
+  workspaceId: Id<"workspaces">,
+  workouts: HevyWorkoutInput[],
+  deletedSourceIds: string[],
+): Promise<{ created: number; updated: number; deleted: number; skipped: number }> {
+  if (workouts.length > 0) await ensureSystemTag(ctx, workspaceId, HEVY_TAG);
+  let created = 0;
+  let updated = 0;
+  let deleted = 0;
+  let skipped = 0;
+  for (const input of workouts) {
+    const existing = await ctx.db
+      .query("workouts")
+      .withIndex("by_workspace_source_id", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("source", "hevy")
+          .eq("sourceId", input.sourceId),
+      )
+      .unique();
+    const now = Date.now();
+    if (existing === null) {
+      const workoutId = await ctx.db.insert("workouts", {
+        workspaceId,
+        source: "hevy",
+        sourceId: input.sourceId,
+        title: input.title,
+        startedAt: input.startedAt,
+        durationSeconds: input.durationSeconds,
+        notes: input.notes,
+        createdAt: now,
+        updatedAt: now,
+      });
       for (const [order, exercise] of input.exercises.entries()) {
         const exerciseId = await ctx.db.insert("workoutExercises", {
-          workspaceId: access.workspaceId,
+          workspaceId,
           workoutId,
           title: exercise.title,
           muscleGroups: exercise.muscleGroups,
@@ -785,7 +815,7 @@ export const upsertHevyWorkouts = internalMutation({
         });
         for (const [setOrder, set] of exercise.sets.entries()) {
           await ctx.db.insert("exerciseSets", {
-            workspaceId: access.workspaceId,
+            workspaceId,
             workoutId,
             workoutExerciseId: exerciseId,
             ...set,
@@ -793,8 +823,151 @@ export const upsertHevyWorkouts = internalMutation({
           });
         }
       }
+      created += 1;
+      continue;
     }
-    return { created, updated };
+
+    const [exercises, sets] = await Promise.all([
+      ctx.db
+        .query("workoutExercises")
+        .withIndex("by_workout_order", (q) => q.eq("workoutId", existing._id))
+        .collect(),
+      ctx.db
+        .query("exerciseSets")
+        .withIndex("by_workout", (q) => q.eq("workoutId", existing._id))
+        .collect(),
+    ]);
+    const childrenMatch =
+      exercises.length === input.exercises.length &&
+      input.exercises.every((exercise, order) => {
+        const current = exercises.find((row) => row.order === order);
+        if (
+          current === undefined ||
+          current.title !== exercise.title ||
+          JSON.stringify(current.muscleGroups) !== JSON.stringify(exercise.muscleGroups)
+        ) {
+          return false;
+        }
+        const currentSets = sets
+          .filter((set) => set.workoutExerciseId === current._id)
+          .sort((a, b) => a.order - b.order);
+        return (
+          currentSets.length === exercise.sets.length &&
+          exercise.sets.every((set, setOrder) => {
+            const currentSet = currentSets[setOrder];
+            return (
+              currentSet !== undefined &&
+              currentSet.setType === set.setType &&
+              currentSet.reps === set.reps &&
+              currentSet.weightKg === set.weightKg &&
+              currentSet.durationSeconds === set.durationSeconds &&
+              currentSet.distanceMeters === set.distanceMeters
+            );
+          })
+        );
+      });
+    const parentChanged =
+      existing.title !== input.title ||
+      existing.startedAt !== input.startedAt ||
+      existing.durationSeconds !== input.durationSeconds ||
+      existing.notes !== input.notes;
+    if (!parentChanged && childrenMatch) {
+      skipped += 1;
+      continue;
+    }
+    if (parentChanged) {
+      await ctx.db.patch(existing._id, {
+        title: input.title,
+        startedAt: input.startedAt,
+        durationSeconds: input.durationSeconds,
+        notes: input.notes,
+        updatedAt: now,
+      });
+    }
+    if (!childrenMatch) {
+      for (const set of sets) await ctx.db.delete(set._id);
+      for (const exercise of exercises) await ctx.db.delete(exercise._id);
+      for (const [order, exercise] of input.exercises.entries()) {
+        const exerciseId = await ctx.db.insert("workoutExercises", {
+          workspaceId,
+          workoutId: existing._id,
+          title: exercise.title,
+          muscleGroups: exercise.muscleGroups,
+          order,
+        });
+        for (const [setOrder, set] of exercise.sets.entries()) {
+          await ctx.db.insert("exerciseSets", {
+            workspaceId,
+            workoutId: existing._id,
+            workoutExerciseId: exerciseId,
+            ...set,
+            order: setOrder,
+          });
+        }
+      }
+    }
+    updated += 1;
+  }
+  for (const sourceId of new Set(deletedSourceIds)) {
+    const existing = await ctx.db
+      .query("workouts")
+      .withIndex("by_workspace_source_id", (q) =>
+        q.eq("workspaceId", workspaceId).eq("source", "hevy").eq("sourceId", sourceId),
+      )
+      .unique();
+    if (existing === null) {
+      skipped += 1;
+      continue;
+    }
+    const [exercises, sets] = await Promise.all([
+      ctx.db
+        .query("workoutExercises")
+        .withIndex("by_workout_order", (q) => q.eq("workoutId", existing._id))
+        .collect(),
+      ctx.db
+        .query("exerciseSets")
+        .withIndex("by_workout", (q) => q.eq("workoutId", existing._id))
+        .collect(),
+    ]);
+    for (const set of sets) await ctx.db.delete(set._id);
+    for (const exercise of exercises) await ctx.db.delete(exercise._id);
+    await ctx.db.delete(existing._id);
+    deleted += 1;
+  }
+  return { created, updated, deleted, skipped };
+}
+
+export const upsertHevyWorkouts = internalMutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    system: v.optional(v.boolean()),
+    workouts: v.array(hevyWorkout),
+  },
+  handler: async (ctx, args) => {
+    const access = args.system
+      ? { workspaceId: args.workspaceId! }
+      : await requireWorkspace(ctx, args.workspaceId);
+    return applyHevyWorkoutRows(ctx, access.workspaceId, args.workouts, []);
+  },
+});
+
+export const applyHevyLiveWorkouts = internalMutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    system: v.optional(v.boolean()),
+    workouts: v.array(hevyWorkout),
+    deletedSourceIds: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const access = args.system
+      ? { workspaceId: args.workspaceId! }
+      : await requireWorkspace(ctx, args.workspaceId);
+    return applyHevyWorkoutRows(
+      ctx,
+      access.workspaceId,
+      args.workouts,
+      args.deletedSourceIds,
+    );
   },
 });
 

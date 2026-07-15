@@ -171,10 +171,12 @@ export const syncNow = action({
     let measurementsFetched = 0;
     let measurementsCreated = 0;
     let measurementsUpdated = 0;
+    let completed = false;
+    let watermark: string | undefined;
     for (let guard = 0; guard < 200; guard += 1) {
       const result: ProviderStepResult = await ctx.runAction(
         internal.capability.integration.hevy.syncScheduledStep,
-        { workspaceId, cursor },
+        { workspaceId, cursor, mode: "full" },
       );
       const syncingMeasurements = cursor?.includes("\"measurements\"") ?? false;
       if (syncingMeasurements) {
@@ -186,9 +188,19 @@ export const syncNow = action({
         workoutsCreated += result.created;
         workoutsUpdated += result.updated;
       }
-      if (result.done) break;
+      if (result.done) {
+        completed = true;
+        watermark = result.watermark;
+        break;
+      }
       cursor = result.cursor;
       if (!cursor) break;
+    }
+    if (completed) {
+      await ctx.runMutation(
+        internal.capability.integration.jobs.publishProviderSyncCompletion,
+        { workspaceId, provider: "hevy", watermark },
+      );
     }
     return {
       fetched: workoutsFetched,
@@ -411,6 +423,7 @@ export const saveRoutine = action({
 type ProviderStepResult = {
   done: boolean;
   cursor?: string;
+  watermark?: string;
   fetched: number;
   applied: number;
   skipped: number;
@@ -418,10 +431,104 @@ type ProviderStepResult = {
   updated: number;
 };
 
+function replaySince(watermark: string): string {
+  const numeric = Number(watermark);
+  if (/^-?\d+(?:\.\d+)?$/.test(watermark) && Number.isFinite(numeric)) {
+    return String(Math.max(0, numeric - 5 * 60 * 1000));
+  }
+  const parsed = Date.parse(watermark);
+  if (Number.isFinite(parsed)) {
+    return new Date(parsed - 5 * 60 * 1000).toISOString();
+  }
+  return watermark;
+}
+
+function eventValues(payload: Record<string, unknown>): unknown[] {
+  if (Array.isArray(payload.events)) return payload.events;
+  if (Array.isArray(payload.workout_events)) return payload.workout_events;
+  const values: unknown[] = [];
+  for (const key of ["created", "updated"]) {
+    const items = payload[key];
+    if (!Array.isArray(items)) continue;
+    for (const workout of items as unknown[]) values.push({ type: key, workout });
+  }
+  for (const key of ["deleted", "deleted_workout_ids", "deleted_ids"]) {
+    const items = payload[key];
+    if (!Array.isArray(items)) continue;
+    for (const deleted of items as unknown[]) {
+      values.push(
+        typeof deleted === "string"
+          ? { type: "deleted", workout_id: deleted }
+          : { type: "deleted", workout: deleted },
+      );
+    }
+  }
+  return values;
+}
+
+function eventWatermark(value: unknown): string | undefined {
+  const row = record(value);
+  if (!row) return undefined;
+  let watermark: string | undefined;
+  const nested = record(row.workout ?? row.data ?? row.payload);
+  for (const [candidateRow, keys] of [
+    [
+      row,
+      [
+        "watermark",
+        "cursor",
+        "occurred_at",
+        "deleted_at",
+        "created_at",
+        "updated_at",
+        "timestamp",
+      ],
+    ],
+    [nested, ["updated_at", "created_at", "start_time"]],
+  ] as const) {
+    if (!candidateRow) continue;
+    for (const key of keys) {
+      const candidate =
+        string(candidateRow[key]) ?? number(candidateRow[key])?.toString();
+      const time = candidate === undefined ? Number.NaN : Date.parse(candidate);
+      watermark = maxWatermark(
+        watermark,
+        Number.isFinite(time) ? new Date(time).toISOString() : candidate,
+      );
+    }
+  }
+  return watermark;
+}
+
+function maxWatermark(
+  current: string | undefined,
+  candidate: string | undefined,
+): string | undefined {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const currentNumeric = Number(current);
+  const candidateNumeric = Number(candidate);
+  if (
+    /^-?\d+(?:\.\d+)?$/.test(current) &&
+    /^-?\d+(?:\.\d+)?$/.test(candidate) &&
+    Number.isFinite(currentNumeric) &&
+    Number.isFinite(candidateNumeric)
+  ) {
+    return candidateNumeric >= currentNumeric ? candidate : current;
+  }
+  const currentTime = Date.parse(current);
+  const candidateTime = Date.parse(candidate);
+  if (Number.isFinite(currentTime) && Number.isFinite(candidateTime)) {
+    return candidateTime >= currentTime ? candidate : current;
+  }
+  return candidate >= current ? candidate : current;
+}
+
 export const syncScheduledStep = internalAction({
   args: {
     workspaceId: v.id("workspaces"),
     cursor: v.optional(v.string()),
+    mode: v.optional(v.union(v.literal("full"), v.literal("live"))),
   },
   handler: async (ctx, args): Promise<ProviderStepResult> => {
     const connection = await ctx.runQuery(
@@ -433,12 +540,161 @@ export const syncScheduledStep = internalAction({
     }
     const apiKey = decryptCredentials(connection.credentials).apiKey;
     if (!apiKey) throw new Error("Hevy API key is missing");
+
+    if (args.mode === "live" || args.cursor?.includes("\"mode\":\"live\"")) {
+      const persisted = args.cursor
+        ? undefined
+        : await ctx.runQuery(internal.capability.integration.providerSyncState, {
+            workspaceId: args.workspaceId,
+            provider: "hevy",
+          });
+      const state = args.cursor
+        ? (JSON.parse(args.cursor) as {
+            mode: "live";
+            page: number;
+            since: string;
+            watermark?: string;
+            descending?: boolean;
+          })
+        : persisted?.watermark
+          ? {
+              mode: "live" as const,
+              page: 1,
+              since: replaySince(persisted.watermark),
+              watermark: persisted.watermark,
+              descending: false,
+            }
+          : null;
+      if (state === null) {
+        return {
+          done: true,
+          fetched: 0,
+          applied: 0,
+          skipped: 0,
+          created: 0,
+          updated: 0,
+        };
+      }
+      const payload = await getJson(
+        `https://api.hevyapp.com/v1/workouts/events?since=${encodeURIComponent(state.since)}&page=${state.page}&pageSize=10`,
+        apiKey,
+      );
+      const values = eventValues(payload);
+      const payloadWatermark =
+        string(payload.watermark) ??
+        number(payload.watermark)?.toString() ??
+        string(payload.next_since) ??
+        number(payload.next_since)?.toString() ??
+        string(payload.next_cursor) ??
+        number(payload.next_cursor)?.toString();
+      let candidateWatermark = maxWatermark(state.watermark, payloadWatermark);
+      for (const value of values) {
+        candidateWatermark = maxWatermark(candidateWatermark, eventWatermark(value));
+      }
+      const pageCount = Math.max(1, number(payload.page_count) ?? 1);
+      if (!state.descending && state.page === 1 && pageCount > 1) {
+        return {
+          done: false,
+          cursor: JSON.stringify({
+            mode: "live",
+            page: pageCount,
+            since: state.since,
+            watermark: candidateWatermark,
+            descending: true,
+          }),
+          watermark: candidateWatermark,
+          fetched: 0,
+          applied: 0,
+          created: 0,
+          updated: 0,
+          skipped: 0,
+        };
+      }
+
+      let created = 0;
+      let updated = 0;
+      let deletedCount = 0;
+      let skipped = 0;
+      for (const value of [...values].reverse()) {
+        const event = record(value);
+        if (!event) {
+          skipped += 1;
+          continue;
+        }
+        const eventType =
+          string(event.type)?.toLowerCase() ??
+          string(event.event_type)?.toLowerCase() ??
+          string(event.action)?.toLowerCase() ??
+          string(event.kind)?.toLowerCase() ??
+          "";
+        const isDeleted =
+          event.deleted === true ||
+          eventType.includes("delete") ||
+          eventType === "workout_removed";
+        const workoutValue = event.workout ?? event.data ?? event.payload ?? event;
+        const workout = record(workoutValue);
+        const sourceId =
+          string(event.workout_id) ??
+          string(event.workoutId) ??
+          string(workout?.id) ??
+          string(workoutValue) ??
+          string(event.id);
+        const parsed = isDeleted ? undefined : parseWorkout(workoutValue);
+        if ((!isDeleted && parsed === undefined) || (isDeleted && sourceId === undefined)) {
+          skipped += 1;
+          continue;
+        }
+        const counts: {
+          created: number;
+          updated: number;
+          deleted: number;
+          skipped: number;
+        } = await ctx.runMutation(
+          internal.capability.integration.applyHevyLiveWorkouts,
+          {
+            workspaceId: args.workspaceId,
+            system: true,
+            workouts: parsed ? [parsed] : [],
+            deletedSourceIds: isDeleted && sourceId ? [sourceId] : [],
+          },
+        );
+        created += counts.created;
+        updated += counts.updated;
+        deletedCount += counts.deleted;
+        skipped += counts.skipped;
+      }
+      const more = state.descending === true && state.page > 1;
+      return {
+        done: !more,
+        cursor: more
+          ? JSON.stringify({
+              mode: "live",
+              page: state.page - 1,
+              since: state.since,
+              watermark: candidateWatermark,
+              descending: true,
+            })
+          : undefined,
+        watermark: candidateWatermark,
+        fetched: values.length,
+        applied: created + updated + deletedCount,
+        created,
+        updated: updated + deletedCount,
+        skipped,
+      };
+    }
+
     const state = args.cursor
       ? (JSON.parse(args.cursor) as {
           kind: "workouts" | "measurements";
           page: number;
+          watermark?: string;
         })
-      : { kind: "workouts" as const, page: 1 };
+      : {
+          kind: "workouts" as const,
+          page: 1,
+          watermark: new Date().toISOString(),
+        };
     if (state.kind === "workouts") {
       const payload = await getJson(
         `https://api.hevyapp.com/v1/workouts?page=${state.page}&pageSize=10`,
@@ -446,7 +702,7 @@ export const syncScheduledStep = internalAction({
       );
       const values = Array.isArray(payload.workouts) ? payload.workouts : [];
       const workouts = values.flatMap((value) => parseWorkout(value) ?? []);
-      const counts: { created: number; updated: number } =
+      const counts: { created: number; updated: number; skipped?: number } =
         await ctx.runMutation(internal.capability.integration.upsertHevyWorkouts, {
           workspaceId: args.workspaceId,
           system: true,
@@ -458,14 +714,15 @@ export const syncScheduledStep = internalAction({
         done: false,
         cursor: JSON.stringify(
           more
-            ? { kind: "workouts", page: state.page + 1 }
-            : { kind: "measurements", page: 1 },
+            ? { kind: "workouts", page: state.page + 1, watermark: state.watermark }
+            : { kind: "measurements", page: 1, watermark: state.watermark },
         ),
+        watermark: state.watermark,
         fetched: values.length,
         applied: counts.created + counts.updated,
         created: counts.created,
         updated: counts.updated,
-        skipped: values.length - workouts.length,
+        skipped: values.length - workouts.length + (counts.skipped ?? 0),
       };
     }
     const payload = await getJson(
@@ -487,8 +744,13 @@ export const syncScheduledStep = internalAction({
     return {
       done: !more,
       cursor: more
-        ? JSON.stringify({ kind: "measurements", page: state.page + 1 })
+        ? JSON.stringify({
+            kind: "measurements",
+            page: state.page + 1,
+            watermark: state.watermark,
+          })
         : undefined,
+      watermark: state.watermark,
       fetched: values.length,
       applied: counts.created + counts.updated,
       created: counts.created,

@@ -8,15 +8,17 @@ import { createServiceRegistry } from "../../core/service/service";
 import { runWikiAgent } from "../../llm-wiki";
 import { getHomeDir } from "../../paths";
 import { serviceFactories } from "../../registry";
+import type { MaintenanceSessionRoots } from "../../capability/maintenance";
 
 type CreateServerOptions = {
   port?: number;
   hostname?: string;
 };
-
 export type CreateAppOptions = {
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
   config?: LocalAuthorityConfig;
+  maintenanceRoot?: string;
+  maintenanceSessionRoots?: MaintenanceSessionRoots;
 };
 
 export type App = {
@@ -28,6 +30,8 @@ type AppServiceContext = {
   config: LocalAuthorityConfig;
   now(): Date;
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
+  maintenanceRoot?: string;
+  maintenanceSessionRoots?: MaintenanceSessionRoots;
   serviceIds?: () => string[];
 };
 
@@ -38,6 +42,8 @@ export function createApp(options: CreateAppOptions = {}): App {
     config,
     now: () => new Date(),
     wikiAgent: options.wikiAgent,
+    maintenanceRoot: options.maintenanceRoot,
+    maintenanceSessionRoots: options.maintenanceSessionRoots,
     serviceIds: () => serviceIds,
   };
   const registry = createServiceRegistry(context, serviceFactories);

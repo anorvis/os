@@ -39,6 +39,9 @@ describe("provider connections", () => {
       status: "connected",
       hasCredentials: true,
     });
+    expect(providers[0]).toMatchObject({
+      sync: { sequence: 0, lastSyncedAt: null },
+    });
     expect(providers[0]).not.toHaveProperty("credentials");
 
     const raw = await t.run((ctx) => ctx.db.query("providerConnections").first());
@@ -476,11 +479,12 @@ describe("Google calendar lifecycle", () => {
 });
 
 describe("Hevy sync lifecycle", () => {
-  it("completes a scheduled sync through the runner and stores workouts", async () => {
-    const { t, client } = await owner();
+  it("bootstraps a live sync without prior provider state", async () => {
+    const { t, client, workspaceId } = await owner();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.includes("/v1/workouts")) {
+        expect(url).not.toContain("/v1/workouts/events");
         return Promise.resolve(
           Response.json({
             page_count: 1,
@@ -506,16 +510,17 @@ describe("Hevy sync lifecycle", () => {
       await client.action(api.capability.integration.hevy.saveSettings, {
         apiKey: "hevy-secret-token",
       });
-      const jobId = await client.mutation(api.capability.integration.startSync, {
-        provider: "hevy",
-      });
+      const jobId = await t.mutation(
+        internal.capability.integration.jobs.enqueueProviderSync,
+        { workspaceId, provider: "hevy", kind: "live" },
+      );
       await t.finishAllScheduledFunctions(vi.runAllTimers);
 
       const job = await t.run((ctx) => ctx.db.get(jobId));
       // The runner must forward exactly the progress contract; Hevy's extra
       // created/updated counters previously failed validation and wedged the
       // job in pending forever.
-      expect(job).toMatchObject({ status: "completed", provider: "hevy" });
+      expect(job).toMatchObject({ status: "completed", provider: "hevy", kind: "live" });
       expect(job!.error ?? undefined).toBeUndefined();
 
       const workouts = await t.run((ctx) => ctx.db.query("workouts").collect());
@@ -533,4 +538,221 @@ describe("Hevy sync lifecycle", () => {
       fetchMock.mockRestore();
     }
   });
+
+  it("completes a public startSync scheduled sync through the runner", async () => {
+    const { t, client } = await owner();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/v1/workouts")) {
+        expect(url).not.toContain("/v1/workouts/events");
+        return Promise.resolve(
+          Response.json({
+            page_count: 1,
+            workouts: [
+              {
+                id: "hevy-w-2",
+                title: "pull day",
+                start_time: "2026-07-13T17:00:00Z",
+                end_time: "2026-07-13T18:00:00Z",
+                exercises: [],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.includes("/v1/body_measurements")) {
+        return Promise.resolve(Response.json({ page_count: 1, body_measurements: [] }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      vi.useFakeTimers();
+      await client.action(api.capability.integration.hevy.saveSettings, {
+        apiKey: "hevy-secret-token",
+      });
+      const jobId = await client.mutation(api.capability.integration.startSync, {
+        provider: "hevy",
+      });
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+      const job = await t.run((ctx) => ctx.db.get(jobId));
+      expect(job).toMatchObject({ status: "completed", provider: "hevy" });
+      expect(job!.error ?? undefined).toBeUndefined();
+
+      const workouts = await t.run((ctx) => ctx.db.query("workouts").collect());
+      expect(workouts).toHaveLength(1);
+      expect(workouts[0]).toMatchObject({
+        source: "hevy",
+        sourceId: "hevy-w-2",
+        title: "pull day",
+      });
+    } finally {
+      vi.useRealTimers();
+      fetchMock.mockRestore();
+    }
+  });
+});
+
+  it("applies live event updates and deletes parent children from the persisted watermark", async () => {
+    const { t, client, workspaceId } = await owner();
+    await client.action(api.capability.integration.hevy.saveSettings, {
+      apiKey: "hevy-secret-token",
+    });
+    const now = Date.now();
+    const oldWorkout = await t.run((ctx) =>
+      ctx.db.insert("workouts", {
+        workspaceId,
+        source: "hevy",
+        sourceId: "hevy-old",
+        title: "old",
+        startedAt: now,
+        durationSeconds: 60,
+        createdAt: now,
+        updatedAt: now,
+      }),
+    );
+    const oldExercise = await t.run((ctx) =>
+      ctx.db.insert("workoutExercises", {
+        workspaceId,
+        workoutId: oldWorkout,
+        title: "squat",
+        muscleGroups: ["legs"],
+        order: 0,
+      }),
+    );
+    await t.run((ctx) =>
+      ctx.db.insert("exerciseSets", {
+        workspaceId,
+        workoutId: oldWorkout,
+        workoutExerciseId: oldExercise,
+        setType: "normal",
+        reps: 5,
+        order: 0,
+      }),
+    );
+    await t.run((ctx) =>
+      ctx.db.insert("providerSyncStates", {
+        workspaceId,
+        provider: "hevy",
+        sequence: 1,
+        lastSyncedAt: now,
+        watermark: "2026-07-14T12:00:00.000Z",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes("/v1/workouts/events")) {
+        throw new Error(`Unexpected full-sync fetch: ${url}`);
+      }
+      expect(new URL(url).searchParams.get("since")).toBe("2026-07-14T11:55:00.000Z");
+      expect(new URL(url).searchParams.get("pageSize")).toBe("10");
+      const page = Number(new URL(url).searchParams.get("page"));
+      return Promise.resolve(
+        Response.json({
+          page_count: 2,
+          events:
+            page === 1
+              ? [
+                  {
+                    type: "workout_updated",
+                    workout: {
+                      id: "hevy-new",
+                      title: "new workout",
+                      start_time: "2026-07-14T12:01:00Z",
+                      end_time: "2026-07-14T12:30:00Z",
+                      updated_at: "2026-07-14T12:03:00Z",
+                      exercises: [],
+                    },
+                  },
+                ]
+              : [
+                  {
+                    type: "workout_updated",
+                    workout: {
+                      id: "hevy-new",
+                      title: "stale workout",
+                      start_time: "2026-07-14T12:01:00Z",
+                      end_time: "2026-07-14T12:20:00Z",
+                      updated_at: "2026-07-14T12:02:00Z",
+                      exercises: [],
+                    },
+                  },
+                  {
+                    type: "workout_deleted",
+                    workout_id: "hevy-old",
+                    deleted_at: "2026-07-14T12:01:00Z",
+                  },
+                ],
+        }),
+      );
+    });
+    try {
+      vi.useFakeTimers();
+      const jobId = await t.mutation(
+        internal.capability.integration.jobs.enqueueProviderSync,
+        { workspaceId, provider: "hevy", kind: "live" },
+      );
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(await t.run((ctx) => ctx.db.get(jobId))).toMatchObject({
+        status: "completed",
+      });
+      const state = await t.run((ctx) =>
+        ctx.db
+          .query("providerSyncStates")
+          .withIndex("by_workspace_provider", (q) =>
+            q.eq("workspaceId", workspaceId).eq("provider", "hevy"),
+          )
+          .unique(),
+      );
+      expect(state).toMatchObject({
+        sequence: 2,
+        watermark: "2026-07-14T12:03:00.000Z",
+      });
+      const workouts = await t.run((ctx) => ctx.db.query("workouts").collect());
+      expect(workouts).toHaveLength(1);
+      expect(workouts[0]).toMatchObject({
+        sourceId: "hevy-new",
+        title: "new workout",
+      });
+      expect(
+        await t.run((ctx) =>
+          ctx.db.query("workoutExercises").withIndex("by_workout_order", (q) =>
+            q.eq("workoutId", oldWorkout),
+          ).collect(),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      fetchMock.mockRestore();
+    }
+  });
+
+it("publishes direct SnapTrade sync completion", async () => {
+  const { client } = await owner();
+  await client.action(api.capability.finance.snaptrade.saveSettings, {
+    clientId: "snap-client",
+    consumerKey: "snap-consumer",
+  });
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    expect(url).toContain("/accounts");
+    return Promise.resolve(Response.json([]));
+  });
+  try {
+    await client.action(api.capability.finance.snaptrade.syncNow, {});
+    const connections = await client.query(api.capability.integration.list, {});
+    expect(connections.find((row) => row.provider === "snaptrade")?.sync).toMatchObject({
+      sequence: 1,
+    });
+  } finally {
+    fetchMock.mockRestore();
+  }
 });

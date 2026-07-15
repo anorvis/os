@@ -631,7 +631,28 @@ const schema = defineSchema({
     updatedAt: v.number(),
   })
     .index("by_workspace_created", ["workspaceId", "createdAt"])
-    .index("by_workspace_provider_status", ["workspaceId", "provider", "status"]),
+    .index("by_workspace_provider_status", ["workspaceId", "provider", "status"])
+    .index("by_workspace_provider_kind_status", [
+      "workspaceId",
+      "provider",
+      "kind",
+      "status",
+    ]),
+  providerSyncStates: defineTable({
+    workspaceId: v.id("workspaces"),
+    provider: v.union(
+      v.literal("google"),
+      v.literal("hevy"),
+      v.literal("snaptrade"),
+    ),
+    sequence: v.number(),
+    lastSyncedAt: v.optional(v.number()),
+    watermark: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_workspace_provider", ["workspaceId", "provider"])
+    .index("by_provider", ["provider"]),
 
   wikiPages: defineTable({
     workspaceId: v.id("workspaces"),
