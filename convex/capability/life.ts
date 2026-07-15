@@ -52,7 +52,9 @@ export const upsertTag = mutation({
     const now = Date.now();
     if (existing !== null) {
       await ctx.db.patch(existing._id, {
-        name: value.name,
+        // Integration-owned tags keep their canonical name; a case-variant
+        // upsert must not rename them.
+        name: existing.systemKey === undefined ? value.name : existing.name,
         color: args.color === undefined ? existing.color : cleanOptional(args.color),
         hidden: false,
         updatedAt: now,
@@ -85,9 +87,24 @@ export const updateTag = mutation({
     if (tag === null || tag.workspaceId !== access.workspaceId) {
       throw new ConvexError({ code: "NOT_FOUND", message: "Life tag not found" });
     }
+    const system = tag.systemKey !== undefined;
+    if (system && args.hidden === true) {
+      throw new ConvexError({
+        code: "FORBIDDEN",
+        message: "Automatic integration tags cannot be deleted",
+      });
+    }
     let names = { name: tag.name, normalizedName: tag.normalizedName };
     if (args.name !== undefined) {
       names = normalizeName(args.name);
+      // Events match tags by exact name, so even a case change would orphan
+      // every synced event carrying the canonical name.
+      if (system && names.name !== tag.name) {
+        throw new ConvexError({
+          code: "FORBIDDEN",
+          message: "Automatic integration tags cannot be renamed",
+        });
+      }
       const conflict = await ctx.db
         .query("lifeTags")
         .withIndex("by_workspace_name", (q) =>
@@ -176,7 +193,7 @@ export const snapshot = query({
   },
   handler: async (ctx, args) => {
     const access = await requireWorkspace(ctx, args.workspaceId);
-    const [tasks, sessions, events, tags] = await Promise.all([
+    const [tasks, sessions, events, tags, workouts] = await Promise.all([
       ctx.db
         .query("tasks")
         .withIndex("by_workspace_updated", (q) =>
@@ -206,12 +223,23 @@ export const snapshot = query({
           q.eq("workspaceId", access.workspaceId),
         )
         .collect(),
+      ctx.db
+        .query("workouts")
+        .withIndex("by_workspace_started", (q) =>
+          q.eq("workspaceId", access.workspaceId).lt("startedAt", args.endAt),
+        )
+        .collect(),
     ]);
     return {
       tasks,
       sessions: sessions.filter((session) => session.endAt > args.startAt),
       events: events.filter((event) => event.endDay >= args.startDay),
       tags: tags.filter((tag) => !tag.hidden),
+      workouts: workouts.filter(
+        (workout) =>
+          workout.startedAt + Math.max(workout.durationSeconds, 1) * 1000 >
+          args.startAt,
+      ),
     };
   },
 });

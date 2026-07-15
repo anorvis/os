@@ -1,6 +1,6 @@
 import { convexTest } from "convex-test";
 import { describe, expect, it } from "vitest";
-import { api } from "../_generated/api";
+import { api, internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
 import { modules } from "../test.setup";
@@ -114,5 +114,95 @@ describe("Life capabilities", () => {
     const tags = await client.query(api.capability.life.listTags, {});
     expect(tags).toHaveLength(1);
     expect(tags[0]).toMatchObject({ name: "training", color: "blue", hidden: false });
+  });
+});
+
+describe("system life tags", () => {
+  async function withGoogleTag() {
+    const { t, client, workspaceId } = await owner();
+    const tagId = await t.run((ctx) =>
+      ctx.db.insert("lifeTags", {
+        workspaceId,
+        name: "Google Calendar",
+        normalizedName: "google calendar",
+        color: "#4285f4",
+        hidden: false,
+        systemKey: "google-calendar",
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    return { t, client, workspaceId, tagId };
+  }
+
+  it("rejects deleting (hiding) an automatic tag", async () => {
+    const { client, tagId } = await withGoogleTag();
+    await expect(
+      client.mutation(api.capability.life.updateTag, { id: tagId, hidden: true }),
+    ).rejects.toThrow("cannot be deleted");
+  });
+
+  it("rejects renames of an automatic tag, including case changes", async () => {
+    const { client, tagId } = await withGoogleTag();
+    await expect(
+      client.mutation(api.capability.life.updateTag, { id: tagId, name: "google calendar" }),
+    ).rejects.toThrow("cannot be renamed");
+    // Exact-name no-op payloads (color saves) must still succeed.
+    await client.mutation(api.capability.life.updateTag, {
+      id: tagId,
+      name: "Google Calendar",
+      color: "#123456",
+    });
+    const tags = await client.query(api.capability.life.listTags, {});
+    expect(tags[0]).toMatchObject({ name: "Google Calendar", color: "#123456" });
+  });
+
+  it("keeps the canonical name when a user upserts a case variant", async () => {
+    const { client } = await withGoogleTag();
+    await client.mutation(api.capability.life.upsertTag, { name: "GOOGLE CALENDAR" });
+    const tags = await client.query(api.capability.life.listTags, {});
+    expect(tags).toHaveLength(1);
+    expect(tags[0].name).toBe("Google Calendar");
+  });
+});
+
+describe("workout calendar surface", () => {
+  it("returns overlapping workouts in the snapshot window and seeds the Hevy tag", async () => {
+    const { t, client, workspaceId } = await owner();
+    await t.mutation(internal.capability.integration.upsertHevyWorkouts, {
+      system: true,
+      workspaceId,
+      workouts: [
+        {
+          sourceId: "w-1",
+          title: "push day",
+          startedAt: Date.parse("2026-07-13T17:00:00Z"),
+          durationSeconds: 3600,
+          exercises: [],
+        },
+        {
+          sourceId: "w-2",
+          title: "ancient session",
+          startedAt: Date.parse("2026-01-01T17:00:00Z"),
+          durationSeconds: 3600,
+          exercises: [],
+        },
+      ],
+    });
+
+    const snapshot = await client.query(api.capability.life.snapshot, {
+      startDay: "2026-07-12",
+      endDay: "2026-07-19",
+      startAt: Date.parse("2026-07-12T00:00:00Z"),
+      endAt: Date.parse("2026-07-19T00:00:00Z"),
+    });
+    expect(snapshot.workouts).toHaveLength(1);
+    expect(snapshot.workouts[0]).toMatchObject({ title: "push day", source: "hevy" });
+    // The integration tag is seeded undeletable alongside the workouts.
+    const hevy = snapshot.tags.find((tag) => tag.systemKey === "hevy");
+    expect(hevy).toMatchObject({ name: "Hevy", hidden: false });
+    await expect(
+      client.mutation(api.capability.life.updateTag, { id: hevy!._id, hidden: true }),
+    ).rejects.toThrow("cannot be deleted");
   });
 });
