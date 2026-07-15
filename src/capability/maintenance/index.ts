@@ -189,7 +189,7 @@ export function createMaintenanceStore(options: { root?: string; now?: Date | ((
       const state = read();
       const index = state.tickets.findIndex((ticket) => ticket.id === id);
       if (index < 0) return undefined;
-      const current = state.tickets[index]!;
+      const current = state.tickets[index];
       const updated: PersistedTicket = {
         ...current,
         ...(input.status ? { status: input.status } : {}),
@@ -613,7 +613,7 @@ function numberField(value: Record<string, unknown>, keys: string[]): number {
 }
 
 function stringField(value: Record<string, unknown>, key: string): string {
-  return typeof value[key] === "string" ? value[key]!.trim().slice(0, 200) : "";
+  return typeof value[key] === "string" ? value[key].trim().slice(0, 200) : "";
 }
 
 function isOutputLimitWarning(event: Record<string, unknown>): boolean {

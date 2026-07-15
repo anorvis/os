@@ -1,6 +1,6 @@
 import { json } from "../../core/http/http";
 import type { RouteRegistrar } from "../../core/service/service";
-import { getMaintenanceOverview, type MaintenanceOptions, type MaintenanceSessionRoots } from ".";
+import { getMaintenanceOverview, type MaintenanceOptions } from ".";
 
 export type MaintenanceRouteOptions = Pick<MaintenanceOptions, "root" | "sessionRoots"> & {
   now?: () => Date;
@@ -10,7 +10,7 @@ export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteR
   return (app) => {
     app.get("/v1/maintenance/overview", () => json(getMaintenanceOverview({
       root: options.root,
-      sessionRoots: options.sessionRoots as MaintenanceSessionRoots | undefined,
+      sessionRoots: options.sessionRoots,
       now: options.now,
     })));
   };

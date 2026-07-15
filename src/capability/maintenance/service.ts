@@ -10,7 +10,7 @@ export function createMaintenanceService(context: ServiceContext): ServiceDefini
     routes: [maintenanceRoutes({
       root: options.root,
       sessionRoots: options.sessionRoots,
-      now: context.now,
+      now: () => context.now(),
     })],
   };
 }
