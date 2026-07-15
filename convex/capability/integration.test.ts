@@ -538,6 +538,59 @@ describe("Hevy sync lifecycle", () => {
       fetchMock.mockRestore();
     }
   });
+
+  it("completes a public startSync scheduled sync through the runner", async () => {
+    const { t, client } = await owner();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/v1/workouts")) {
+        expect(url).not.toContain("/v1/workouts/events");
+        return Promise.resolve(
+          Response.json({
+            page_count: 1,
+            workouts: [
+              {
+                id: "hevy-w-2",
+                title: "pull day",
+                start_time: "2026-07-13T17:00:00Z",
+                end_time: "2026-07-13T18:00:00Z",
+                exercises: [],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.includes("/v1/body_measurements")) {
+        return Promise.resolve(Response.json({ page_count: 1, body_measurements: [] }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      vi.useFakeTimers();
+      await client.action(api.capability.integration.hevy.saveSettings, {
+        apiKey: "hevy-secret-token",
+      });
+      const jobId = await client.mutation(api.capability.integration.startSync, {
+        provider: "hevy",
+      });
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+      const job = await t.run((ctx) => ctx.db.get(jobId));
+      expect(job).toMatchObject({ status: "completed", provider: "hevy" });
+      expect(job!.error ?? undefined).toBeUndefined();
+
+      const workouts = await t.run((ctx) => ctx.db.query("workouts").collect());
+      expect(workouts).toHaveLength(1);
+      expect(workouts[0]).toMatchObject({
+        source: "hevy",
+        sourceId: "hevy-w-2",
+        title: "pull day",
+      });
+    } finally {
+      vi.useRealTimers();
+      fetchMock.mockRestore();
+    }
+  });
 });
 
   it("applies live event updates and deletes parent children from the persisted watermark", async () => {
