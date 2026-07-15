@@ -474,3 +474,63 @@ describe("Google calendar lifecycle", () => {
     expect(url.searchParams.get("client_id")).toBe("google-client");
   });
 });
+
+describe("Hevy sync lifecycle", () => {
+  it("completes a scheduled sync through the runner and stores workouts", async () => {
+    const { t, client } = await owner();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/v1/workouts")) {
+        return Promise.resolve(
+          Response.json({
+            page_count: 1,
+            workouts: [
+              {
+                id: "hevy-w-1",
+                title: "push day",
+                start_time: "2026-07-13T17:00:00Z",
+                end_time: "2026-07-13T18:00:00Z",
+                exercises: [],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.includes("/v1/body_measurements")) {
+        return Promise.resolve(Response.json({ page_count: 1, body_measurements: [] }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    try {
+      vi.useFakeTimers();
+      await client.action(api.capability.integration.hevy.saveSettings, {
+        apiKey: "hevy-secret-token",
+      });
+      const jobId = await client.mutation(api.capability.integration.startSync, {
+        provider: "hevy",
+      });
+      await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+      const job = await t.run((ctx) => ctx.db.get(jobId));
+      // The runner must forward exactly the progress contract; Hevy's extra
+      // created/updated counters previously failed validation and wedged the
+      // job in pending forever.
+      expect(job).toMatchObject({ status: "completed", provider: "hevy" });
+      expect(job!.error ?? undefined).toBeUndefined();
+
+      const workouts = await t.run((ctx) => ctx.db.query("workouts").collect());
+      expect(workouts).toHaveLength(1);
+      expect(workouts[0]).toMatchObject({
+        source: "hevy",
+        sourceId: "hevy-w-1",
+        title: "push day",
+        durationSeconds: 3600,
+      });
+      const tags = await t.run((ctx) => ctx.db.query("lifeTags").collect());
+      expect(tags.some((tag) => tag.systemKey === "hevy" && !tag.hidden)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      fetchMock.mockRestore();
+    }
+  });
+});

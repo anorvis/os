@@ -193,7 +193,7 @@ export const snapshot = query({
   },
   handler: async (ctx, args) => {
     const access = await requireWorkspace(ctx, args.workspaceId);
-    const [tasks, sessions, events, tags] = await Promise.all([
+    const [tasks, sessions, events, tags, workouts] = await Promise.all([
       ctx.db
         .query("tasks")
         .withIndex("by_workspace_updated", (q) =>
@@ -223,12 +223,23 @@ export const snapshot = query({
           q.eq("workspaceId", access.workspaceId),
         )
         .collect(),
+      ctx.db
+        .query("workouts")
+        .withIndex("by_workspace_started", (q) =>
+          q.eq("workspaceId", access.workspaceId).lt("startedAt", args.endAt),
+        )
+        .collect(),
     ]);
     return {
       tasks,
       sessions: sessions.filter((session) => session.endAt > args.startAt),
       events: events.filter((event) => event.endDay >= args.startDay),
       tags: tags.filter((tag) => !tag.hidden),
+      workouts: workouts.filter(
+        (workout) =>
+          workout.startedAt + Math.max(workout.durationSeconds, 1) * 1000 >
+          args.startAt,
+      ),
     };
   },
 });

@@ -34,10 +34,16 @@ export const run = internalAction({
                 workspaceId: claim.workspaceId,
                 cursor: claim.cursor,
               });
+      // Steps may return provider-specific extras (e.g. Hevy's created and
+      // updated); the progress contract is exactly these counters.
       await ctx.runMutation(internal.capability.integration.jobs.advanceProviderSync, {
         jobId: args.jobId,
         lease: claim.lease,
-        ...result,
+        done: result.done,
+        cursor: result.cursor,
+        fetched: result.fetched,
+        applied: result.applied,
+        skipped: result.skipped,
       });
     } catch (error) {
       await ctx.runMutation(internal.capability.integration.jobs.failProviderSync, {

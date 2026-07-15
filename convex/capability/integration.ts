@@ -545,23 +545,31 @@ export const finishPinterest = internalMutation({
   },
 });
 
-// The user-visible tag every synced Google event carries. The lifeTags row is
-// keyed by systemKey so renames are impossible and the tag survives hides only
-// through explicit backend seeding, never by name-matching a user tag.
+// The user-visible tags synced records carry. Each lifeTags row is keyed by
+// systemKey so renames are impossible and the tag survives hides only through
+// explicit backend seeding, never by name-matching a user tag.
 const GOOGLE_TAG = {
   systemKey: "google-calendar",
   name: "Google Calendar",
   color: "#4285f4",
 } as const;
+const HEVY_TAG = {
+  systemKey: "hevy",
+  name: "Hevy",
+  color: "#ef4444",
+} as const;
 
-async function ensureGoogleTag(
+type SystemTag = typeof GOOGLE_TAG | typeof HEVY_TAG;
+
+async function ensureSystemTag(
   ctx: { db: MutationCtx["db"] },
   workspaceId: Id<"workspaces">,
+  spec: SystemTag,
 ): Promise<string> {
   const existing = await ctx.db
     .query("lifeTags")
     .withIndex("by_workspace_system", (q) =>
-      q.eq("workspaceId", workspaceId).eq("systemKey", GOOGLE_TAG.systemKey),
+      q.eq("workspaceId", workspaceId).eq("systemKey", spec.systemKey),
     )
     .unique();
   if (existing !== null) {
@@ -577,9 +585,9 @@ async function ensureGoogleTag(
   // already owns the canonical name. Pick the first free integration-owned
   // name instead (two rows with one normalizedName would break every
   // unique() lookup on by_workspace_name).
-  let name: string = GOOGLE_TAG.name;
+  let name: string = spec.name;
   for (let suffix = 0; ; suffix += 1) {
-    if (suffix > 0) name = `${GOOGLE_TAG.name} (integration${suffix > 1 ? ` ${suffix}` : ""})`;
+    if (suffix > 0) name = `${spec.name} (integration${suffix > 1 ? ` ${suffix}` : ""})`;
     const taken = await ctx.db
       .query("lifeTags")
       .withIndex("by_workspace_name", (q) =>
@@ -592,9 +600,9 @@ async function ensureGoogleTag(
     workspaceId,
     name,
     normalizedName: name.toLocaleLowerCase(),
-    color: GOOGLE_TAG.color,
+    color: spec.color,
     hidden: false,
-    systemKey: GOOGLE_TAG.systemKey,
+    systemKey: spec.systemKey,
     createdAt: now,
     updatedAt: now,
   });
@@ -623,7 +631,7 @@ export const upsertGoogleEvents = internalMutation({
     const access = args.system
       ? { workspaceId: args.workspaceId! }
       : await requireWorkspace(ctx, args.workspaceId);
-    const tag = await ensureGoogleTag(ctx, access.workspaceId);
+    const tag = await ensureSystemTag(ctx, access.workspaceId, GOOGLE_TAG);
     let created = 0;
     let updated = 0;
     for (const event of args.events) {
@@ -686,7 +694,7 @@ export const backfillGoogleEventTags = internalMutation({
         )
         .collect();
       if (events.length === 0) continue;
-      const tag = await ensureGoogleTag(ctx, workspace._id);
+      const tag = await ensureSystemTag(ctx, workspace._id, GOOGLE_TAG);
       for (const event of events) {
         if (event.tag === tag) continue;
         await ctx.db.patch(event._id, { tag, updatedAt: Date.now() });
@@ -716,6 +724,7 @@ export const upsertHevyWorkouts = internalMutation({
     const access = args.system
       ? { workspaceId: args.workspaceId! }
       : await requireWorkspace(ctx, args.workspaceId);
+    await ensureSystemTag(ctx, access.workspaceId, HEVY_TAG);
     let created = 0;
     let updated = 0;
     for (const input of args.workouts) {
