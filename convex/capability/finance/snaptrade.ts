@@ -678,6 +678,7 @@ export const syncNow = action({
       returnRates: 0,
       skipped: 0,
     };
+    let completed = false;
     for (let page = 0; page < 1_000; page += 1) {
       const result = await syncScheduledPage(ctx, workspaceId, cursor);
       totals = {
@@ -689,9 +690,17 @@ export const syncNow = action({
         returnRates: totals.returnRates + result.counts.returnRates,
         skipped: totals.skipped + result.skipped,
       };
-      if (result.done) break;
+      if (result.done) {
+        completed = true;
+        break;
+      }
       cursor = result.cursor;
     }
+    if (!completed) throw new Error("SnapTrade sync exceeded its page limit");
+    await ctx.runMutation(
+      internal.capability.integration.jobs.publishProviderSyncCompletion,
+      { workspaceId, provider: "snaptrade" },
+    );
     return {
       ok: true as const,
       accounts: totals.accounts,

@@ -26,6 +26,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_KILL_GRACE_MS = 10_000;
 const STREAM_DRAIN_MS = 1_000;
 
+
 export function runAgentProcess(
   input: AgentProcessInput,
 ): Promise<AgentProcessResult> {
@@ -36,14 +37,21 @@ export function runAgentProcess(
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
-  let stdout = "";
-  let stderr = "";
   let timedOut = false;
   let cancelled = false;
   let outputLimited = false;
   let stopping = false;
   let settled = false;
   let escalationTimer: NodeJS.Timeout | undefined;
+  const maxOutputBytes =
+    Number.isFinite(input.maxOutputBytes) && (input.maxOutputBytes ?? 0) >= 0
+      ? input.maxOutputBytes!
+      : DEFAULT_MAX_OUTPUT_BYTES;
+  const captured: Array<{
+    stream: "stdout" | "stderr";
+    data: Buffer;
+  }> = [];
+  let capturedBytes = 0;
 
   const finish = (code: number | null) => {
     if (settled) return;
@@ -51,6 +59,12 @@ export function runAgentProcess(
     clearTimeout(timer);
     clearTimeout(escalationTimer);
     input.signal?.removeEventListener("abort", abort);
+    const stdout = Buffer.concat(
+      captured.filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.data),
+    ).toString();
+    const stderr = Buffer.concat(
+      captured.filter((chunk) => chunk.stream === "stderr").map((chunk) => chunk.data),
+    ).toString();
     resolve({ stdout, stderr, code, timedOut, cancelled, outputLimited });
   };
   const terminate = (signal: NodeJS.Signals) => {
@@ -85,30 +99,35 @@ export function runAgentProcess(
     timedOut = true;
     stop();
   }, input.timeoutMs);
-  const capture = (current: string, chunk: unknown): string => {
-    if (outputLimited) return current;
+  const capture = (stream: "stdout" | "stderr", chunk: unknown): void => {
     const bytes = Buffer.from(String(chunk));
-    const max = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-    const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
-    const remaining = Math.max(0, max - used);
-    const next = current + bytes.subarray(0, remaining).toString();
-    if (bytes.byteLength > remaining) {
+    if (!bytes.byteLength) return;
+    captured.push({ stream, data: bytes });
+    capturedBytes += bytes.byteLength;
+    while (capturedBytes > maxOutputBytes) {
       outputLimited = true;
-      clearTimeout(timer);
-      stop();
+      const oldest = captured[0];
+      if (!oldest) break;
+      const excess = capturedBytes - maxOutputBytes;
+      if (oldest.data.byteLength <= excess) {
+        captured.shift();
+        capturedBytes -= oldest.data.byteLength;
+      } else {
+        oldest.data = Buffer.from(oldest.data.subarray(excess));
+        capturedBytes -= excess;
+      }
     }
-    return next;
   };
 
   child.stdout.on("data", (chunk) => {
     input.onStdout?.(String(chunk));
-    stdout = capture(stdout, chunk);
+    capture("stdout", chunk);
   });
   child.stderr.on("data", (chunk) => {
-    stderr = capture(stderr, chunk);
+    capture("stderr", chunk);
   });
   child.on("error", (error) => {
-    stderr = capture(stderr, error.message);
+    capture("stderr", error.message);
     finish(1);
   });
   child.on("exit", (code) => {

@@ -6,6 +6,7 @@
   "description": "Local Anorvis sidecar for LLM Wiki agent execution and machine-local operations.",
   "exports": {
     "./agent-process": "./src/core/agent/process.ts",
+    "./maintenance": "./src/capability/maintenance/index.ts",
     "./package.json": "./package.json"
   },
   "scripts": {

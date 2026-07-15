@@ -101,16 +101,14 @@ async function runCliWikiAgent(input: WikiAgentRun): Promise<AnorvisWikiResult> 
     timeoutMs,
   });
   const { stdout, stderr, code, timedOut, cancelled, outputLimited } = run;
+  const runWarnings = [
+    ...(outputLimited ? [`${agent.label} exceeded the output limit.`] : []),
+    ...(stderr.trim() ? [`${agent.label} stderr: ${stderr.trim().slice(0, 500)}`] : []),
+  ];
   const parsed =
-    !timedOut && !cancelled && !outputLimited
-      ? parseAgentJson(stdout)
-      : undefined;
+    !timedOut && !cancelled && code === 0 ? parseAgentJson(stdout) : undefined;
   if (parsed)
-    return normalizeResult(
-      input.task,
-      parsed,
-      stderr.trim() ? [`${agent.label} stderr: ${stderr.trim().slice(0, 500)}`] : [],
-    );
+    return normalizeResult(input.task, parsed, runWarnings);
   if (timedOut) {
     const seconds = Math.round(timeoutMs / 1000);
     return {
@@ -125,20 +123,19 @@ async function runCliWikiAgent(input: WikiAgentRun): Promise<AnorvisWikiResult> 
       warnings: [`${agent.label} did not return parseable JSON.`, ...(stderr.trim() ? [stderr.trim().slice(0, 1000)] : [])],
     };
   }
-  if (outputLimited || cancelled) {
-    const reason = outputLimited ? "exceeded the output limit" : "was cancelled";
+  if (cancelled) {
     return {
       task: input.task,
-      answer: `${agent.label} ${reason} before reporting a verified result.`,
+      answer: `${agent.label} was cancelled before reporting a verified result.`,
       confidence: "low",
       sources: [],
       changed: [],
       readNext: [],
       contradictions: [],
-      gaps: [`${agent.label} run is unverified because it ${reason}.`],
+      gaps: [`${agent.label} run is unverified because it was cancelled.`],
       warnings: [
         `${agent.label} did not return parseable JSON.`,
-        ...(stderr.trim() ? [stderr.trim().slice(0, 1_000)] : []),
+        ...runWarnings,
       ],
     };
   }

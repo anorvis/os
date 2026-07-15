@@ -19,6 +19,20 @@ export const run = internalAction({
       ) {
         throw new Error(`Unsupported sync provider: ${claim.provider}`);
       }
+      let hevyMode: "full" | "live" = "full";
+      if (claim.provider === "hevy" && claim.cursor?.includes("\"mode\":\"live\"")) {
+        hevyMode = "live";
+      } else if (
+        claim.provider === "hevy" &&
+        claim.cursor === undefined &&
+        claim.kind === "live"
+      ) {
+        const state = await ctx.runQuery(
+          internal.capability.integration.providerSyncState,
+          { workspaceId: claim.workspaceId, provider: "hevy" },
+        );
+        hevyMode = state?.watermark ? "live" : "full";
+      }
       const result =
         claim.provider === "google"
           ? await ctx.runAction(internal.capability.integration.google.syncScheduledStep, {
@@ -29,6 +43,7 @@ export const run = internalAction({
             ? await ctx.runAction(internal.capability.integration.hevy.syncScheduledStep, {
                 workspaceId: claim.workspaceId,
                 cursor: claim.cursor,
+                mode: hevyMode,
               })
             : await ctx.runAction(internal.capability.finance.snaptrade.syncScheduledStep, {
                 workspaceId: claim.workspaceId,
@@ -43,6 +58,7 @@ export const run = internalAction({
         cursor: result.cursor,
         fetched: result.fetched,
         applied: result.applied,
+        watermark: "watermark" in result ? result.watermark : undefined,
         skipped: result.skipped,
       });
     } catch (error) {
