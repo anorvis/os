@@ -52,7 +52,9 @@ export const upsertTag = mutation({
     const now = Date.now();
     if (existing !== null) {
       await ctx.db.patch(existing._id, {
-        name: value.name,
+        // Integration-owned tags keep their canonical name; a case-variant
+        // upsert must not rename them.
+        name: existing.systemKey === undefined ? value.name : existing.name,
         color: args.color === undefined ? existing.color : cleanOptional(args.color),
         hidden: false,
         updatedAt: now,
@@ -85,9 +87,24 @@ export const updateTag = mutation({
     if (tag === null || tag.workspaceId !== access.workspaceId) {
       throw new ConvexError({ code: "NOT_FOUND", message: "Life tag not found" });
     }
+    const system = tag.systemKey !== undefined;
+    if (system && args.hidden === true) {
+      throw new ConvexError({
+        code: "FORBIDDEN",
+        message: "Automatic integration tags cannot be deleted",
+      });
+    }
     let names = { name: tag.name, normalizedName: tag.normalizedName };
     if (args.name !== undefined) {
       names = normalizeName(args.name);
+      // Events match tags by exact name, so even a case change would orphan
+      // every synced event carrying the canonical name.
+      if (system && names.name !== tag.name) {
+        throw new ConvexError({
+          code: "FORBIDDEN",
+          message: "Automatic integration tags cannot be renamed",
+        });
+      }
       const conflict = await ctx.db
         .query("lifeTags")
         .withIndex("by_workspace_name", (q) =>
