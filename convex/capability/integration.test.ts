@@ -335,10 +335,20 @@ describe("Google calendar lifecycle", () => {
     expect(byCalendar.get("primary")).toMatchObject({
       providerEventId: "event-1",
       summary: "Primary standup",
+      tag: "Google Calendar",
     });
     expect(byCalendar.get("team@group.calendar.google.com")).toMatchObject({
       providerEventId: "event-1",
       summary: "Team review",
+    });
+
+    // Sync seeds the undeletable catalog entry the events point at.
+    const tags = await t.run((ctx) => ctx.db.query("lifeTags").collect());
+    expect(tags).toHaveLength(1);
+    expect(tags[0]).toMatchObject({
+      name: "Google Calendar",
+      systemKey: "google-calendar",
+      hidden: false,
     });
 
     // Same raw event id on two calendars must never collide.
@@ -379,6 +389,54 @@ describe("Google calendar lifecycle", () => {
 
     const job = await t.run((ctx) => ctx.db.get(stuckId));
     expect(job).toMatchObject({ status: "completed" });
+  });
+
+  it("tags events without stealing a user tag that owns the name", async () => {
+    const { t, client, workspaceId, drain } = await connectedGoogle();
+    const userTagId = await t.run((ctx) =>
+      ctx.db.insert("lifeTags", {
+        workspaceId,
+        name: "google calendar",
+        normalizedName: "google calendar",
+        hidden: false,
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    await drain();
+
+    const tags = await t.run((ctx) => ctx.db.query("lifeTags").collect());
+    expect(tags).toHaveLength(2);
+    const system = tags.find((tag) => tag.systemKey === "google-calendar");
+    expect(system?.name).toBe("Google Calendar (integration)");
+    // The user tag stays user-owned and deletable.
+    const user = tags.find((tag) => tag._id === userTagId);
+    expect(user?.systemKey).toBeUndefined();
+    await client.mutation(api.capability.life.updateTag, { id: userTagId, hidden: true });
+
+    const events = await t.run((ctx) => ctx.db.query("calendarEvents").collect());
+    expect(events.every((event) => event.tag === "Google Calendar (integration)")).toBe(true);
+  });
+
+  it("repairs untagged events and revives a hidden system tag on resync", async () => {
+    const { t, client, drain } = await connectedGoogle();
+    await drain();
+    // Simulate pre-fix state: untagged events, hidden system tag.
+    await t.run(async (ctx) => {
+      for (const event of await ctx.db.query("calendarEvents").collect()) {
+        await ctx.db.patch(event._id, { tag: undefined });
+      }
+      const tag = (await ctx.db.query("lifeTags").collect())[0];
+      await ctx.db.patch(tag._id, { hidden: true });
+    });
+
+    await client.mutation(api.capability.integration.startSync, { provider: "google" });
+    await drain();
+
+    const events = await t.run((ctx) => ctx.db.query("calendarEvents").collect());
+    expect(events.every((event) => event.tag === "Google Calendar")).toBe(true);
+    const tags = await t.run((ctx) => ctx.db.query("lifeTags").collect());
+    expect(tags[0]).toMatchObject({ systemKey: "google-calendar", hidden: false });
   });
 
   it("keeps the OAuth client config on disconnect and signs back in without it", async () => {

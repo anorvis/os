@@ -116,3 +116,52 @@ describe("Life capabilities", () => {
     expect(tags[0]).toMatchObject({ name: "training", color: "blue", hidden: false });
   });
 });
+
+describe("system life tags", () => {
+  async function withGoogleTag() {
+    const { t, client, workspaceId } = await owner();
+    const tagId = await t.run((ctx) =>
+      ctx.db.insert("lifeTags", {
+        workspaceId,
+        name: "Google Calendar",
+        normalizedName: "google calendar",
+        color: "#4285f4",
+        hidden: false,
+        systemKey: "google-calendar",
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    return { t, client, workspaceId, tagId };
+  }
+
+  it("rejects deleting (hiding) an automatic tag", async () => {
+    const { client, tagId } = await withGoogleTag();
+    await expect(
+      client.mutation(api.capability.life.updateTag, { id: tagId, hidden: true }),
+    ).rejects.toThrow("cannot be deleted");
+  });
+
+  it("rejects renames of an automatic tag, including case changes", async () => {
+    const { client, tagId } = await withGoogleTag();
+    await expect(
+      client.mutation(api.capability.life.updateTag, { id: tagId, name: "google calendar" }),
+    ).rejects.toThrow("cannot be renamed");
+    // Exact-name no-op payloads (color saves) must still succeed.
+    await client.mutation(api.capability.life.updateTag, {
+      id: tagId,
+      name: "Google Calendar",
+      color: "#123456",
+    });
+    const tags = await client.query(api.capability.life.listTags, {});
+    expect(tags[0]).toMatchObject({ name: "Google Calendar", color: "#123456" });
+  });
+
+  it("keeps the canonical name when a user upserts a case variant", async () => {
+    const { client } = await withGoogleTag();
+    await client.mutation(api.capability.life.upsertTag, { name: "GOOGLE CALENDAR" });
+    const tags = await client.query(api.capability.life.listTags, {});
+    expect(tags).toHaveLength(1);
+    expect(tags[0].name).toBe("Google Calendar");
+  });
+});

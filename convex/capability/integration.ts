@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { internalMutation, internalQuery, mutation, query } from "../_generated/server";
+import type { MutationCtx } from "../_generated/server";
 import { requireWorkspace } from "../platform/auth/access";
 import { cancelActiveSyncs, enqueueSync } from "./integration/jobs";
 import { parseDecimal } from "./finance/decimal";
@@ -544,6 +545,62 @@ export const finishPinterest = internalMutation({
   },
 });
 
+// The user-visible tag every synced Google event carries. The lifeTags row is
+// keyed by systemKey so renames are impossible and the tag survives hides only
+// through explicit backend seeding, never by name-matching a user tag.
+const GOOGLE_TAG = {
+  systemKey: "google-calendar",
+  name: "Google Calendar",
+  color: "#4285f4",
+} as const;
+
+async function ensureGoogleTag(
+  ctx: { db: MutationCtx["db"] },
+  workspaceId: Id<"workspaces">,
+): Promise<string> {
+  const existing = await ctx.db
+    .query("lifeTags")
+    .withIndex("by_workspace_system", (q) =>
+      q.eq("workspaceId", workspaceId).eq("systemKey", GOOGLE_TAG.systemKey),
+    )
+    .unique();
+  if (existing !== null) {
+    // A hide that predates the deletion guard must not bury the tag forever:
+    // events sync tagged with it, so revive it (keeping any user color).
+    if (existing.hidden) {
+      await ctx.db.patch(existing._id, { hidden: false, updatedAt: Date.now() });
+    }
+    return existing.name;
+  }
+  const now = Date.now();
+  // Only auto-created tags may be undeletable: never adopt a user tag that
+  // already owns the canonical name. Pick the first free integration-owned
+  // name instead (two rows with one normalizedName would break every
+  // unique() lookup on by_workspace_name).
+  let name: string = GOOGLE_TAG.name;
+  for (let suffix = 0; ; suffix += 1) {
+    if (suffix > 0) name = `${GOOGLE_TAG.name} (integration${suffix > 1 ? ` ${suffix}` : ""})`;
+    const taken = await ctx.db
+      .query("lifeTags")
+      .withIndex("by_workspace_name", (q) =>
+        q.eq("workspaceId", workspaceId).eq("normalizedName", name.toLocaleLowerCase()),
+      )
+      .unique();
+    if (taken === null) break;
+  }
+  await ctx.db.insert("lifeTags", {
+    workspaceId,
+    name,
+    normalizedName: name.toLocaleLowerCase(),
+    color: GOOGLE_TAG.color,
+    hidden: false,
+    systemKey: GOOGLE_TAG.systemKey,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return name;
+}
+
 export const upsertGoogleEvents = internalMutation({
   args: {
     workspaceId: v.optional(v.id("workspaces")),
@@ -566,6 +623,7 @@ export const upsertGoogleEvents = internalMutation({
     const access = args.system
       ? { workspaceId: args.workspaceId! }
       : await requireWorkspace(ctx, args.workspaceId);
+    const tag = await ensureGoogleTag(ctx, access.workspaceId);
     let created = 0;
     let updated = 0;
     for (const event of args.events) {
@@ -592,6 +650,7 @@ export const upsertGoogleEvents = internalMutation({
         provider: "google",
         providerEventId: event.providerEventId,
         calendarId: event.calendarId,
+        tag,
         sourceHash: event.sourceHash,
         updatedAt: now,
       };
@@ -608,6 +667,33 @@ export const upsertGoogleEvents = internalMutation({
       }
     }
     return { created, updated };
+  },
+});
+
+// Idempotent repair: Google rows outside the rolling sync window are never
+// re-upserted, so enforce the canonical tag here (fills gaps and fixes stale
+// or case-variant values that exact-name matching would orphan).
+export const backfillGoogleEventTags = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    let tagged = 0;
+    const workspaces = await ctx.db.query("workspaces").collect();
+    for (const workspace of workspaces) {
+      const events = await ctx.db
+        .query("calendarEvents")
+        .withIndex("by_workspace_provider_calendar_event", (q) =>
+          q.eq("workspaceId", workspace._id).eq("provider", "google"),
+        )
+        .collect();
+      if (events.length === 0) continue;
+      const tag = await ensureGoogleTag(ctx, workspace._id);
+      for (const event of events) {
+        if (event.tag === tag) continue;
+        await ctx.db.patch(event._id, { tag, updatedAt: Date.now() });
+        tagged += 1;
+      }
+    }
+    return { tagged };
   },
 });
 
