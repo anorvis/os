@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Hono } from "hono";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import {
   hashMaintenanceSessionId,
   recordMaintenanceReview,
 } from "../src/capability/maintenance";
+import { maintenanceRoutes } from "../src/capability/maintenance/route";
 import { createApp } from "../src/platform/gateway/app";
 
 test("maintenance store is private and atomic, with idempotent lifecycle updates", () => {
@@ -25,6 +27,71 @@ test("maintenance store is private and atomic, with idempotent lifecycle updates
   expect(statSync(path).mode & 0o777).toBe(0o600);
   const text = readFileSync(path, "utf8");
   expect(text).not.toContain("/private/project");
+});
+
+test("overview paginates tickets with a bounded total and optional status filter", () => {
+  const root = mkdtempSync(join(tmpdir(), "anorvis-maintenance-pagination-"));
+  let tick = 0;
+  const store = createMaintenanceStore({ root, now: () => new Date(Date.UTC(2026, 6, 14, 0, 0, 0, tick++)) });
+  const first = store.createTicket({ task: "First task" });
+  const second = store.createTicket({ task: "Second task" });
+  store.updateTicket(first.id, { status: "running" });
+  store.updateTicket(second.id, { status: "fixed" });
+  const sessions = join(root, "sessions");
+  mkdirSync(sessions, { recursive: true });
+  for (let index = 0; index < 105; index += 1) {
+    writeFileSync(join(sessions, `session-${index}.jsonl`), JSON.stringify({
+      type: "session",
+      id: `session-${index}`,
+      timestamp: new Date(Date.UTC(2026, 6, 14, 0, 0, index)).toISOString(),
+      provider: "openai",
+      model: `model-${index}`,
+    }));
+  }
+
+  const page = getMaintenanceOverview({ root, sessionRoots: { pi: sessions }, limit: 1, offset: 1 });
+  expect(page.total).toBe(2);
+  expect(page.tickets).toHaveLength(1);
+  expect(page.tickets[0]?.status).toBe("running");
+
+  const running = getMaintenanceOverview({ root, sessionRoots: { pi: sessions }, ticketStatuses: ["running"], limit: 20, offset: 0 });
+  expect(running.total).toBe(1);
+  expect(running.tickets.map((ticket) => ticket.status)).toEqual(["running"]);
+  const sessionPage = getMaintenanceOverview({ root, sessionRoots: { pi: sessions }, sessionLimit: 2, sessionOffset: 2 });
+  expect(sessionPage.usageTotal).toBe(105);
+  expect(sessionPage.usage.recent).toHaveLength(2);
+  const capped = getMaintenanceOverview({ root, sessionRoots: { pi: sessions }, sessionLimit: 999, sessionOffset: 0 });
+  expect(capped.usage.recent).toHaveLength(100);
+});
+
+test("overview route applies bounded pagination and status filtering", async () => {
+  const root = mkdtempSync(join(tmpdir(), "anorvis-maintenance-route-pagination-"));
+  const store = createMaintenanceStore({ root, now: () => new Date("2026-07-14T00:00:00.000Z") });
+  const ticket = store.createTicket({ task: "Route pagination" });
+  store.updateTicket(ticket.id, { status: "running" });
+  const sessions = join(root, "sessions");
+  mkdirSync(sessions, { recursive: true });
+  for (let index = 0; index < 3; index += 1) {
+    writeFileSync(join(sessions, `route-session-${index}.jsonl`), JSON.stringify({
+      type: "session",
+      id: `route-session-${index}`,
+      timestamp: new Date(Date.UTC(2026, 6, 14, 0, 0, index)).toISOString(),
+      provider: "openai",
+      model: `route-model-${index}`,
+    }));
+  }
+  const app = new Hono();
+  maintenanceRoutes({ root, sessionRoots: { pi: sessions } })(app);
+  const response = await app.request("/v1/maintenance/overview?limit=999&offset=0&status=running&sessionLimit=999&sessionOffset=1");
+  expect(response.status).toBe(200);
+  const body = await response.json() as {
+    total: number;
+    usageTotal: number;
+    tickets: Array<{ status: string }>;
+    usage: { recent: unknown[] };
+  };
+  expect(body).toMatchObject({ total: 1, usageTotal: 3, tickets: [{ status: "running" }] });
+  expect(body.usage.recent).toHaveLength(2);
 });
 
 test("usage aggregation tolerates malformed JSONL and matches hashed reviews", () => {
