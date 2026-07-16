@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, query } from "../_generated/server";
+import type { MutationCtx } from "../_generated/server";
 import { requireWorkspace, type WorkspaceAccess } from "../platform/auth/access";
 
 const eventKind = v.union(
@@ -151,6 +152,58 @@ function visibleEvent(event: ContextEvent, info: ScopeInfo, access: Access): boo
   return info.kind === "workspace" || event.source.channelId === info.channelId;
 }
 const CLAIM_SCAN_PAGE_SIZE = 200;
+
+const MAX_MONITOR_PLAN_SUMMARIES = 32;
+const MAX_MONITOR_PLAN_WIKI_TASKS = 16;
+const MAX_MONITOR_PLAN_NOTIFICATIONS = 16;
+const MAX_MONITOR_PLAN_CONVERSATION_ID = 240;
+const MAX_MONITOR_PLAN_SUMMARY = 2_000;
+const MAX_MONITOR_PLAN_WIKI_TASK = 800;
+const MAX_MONITOR_PLAN_NOTIFICATION_TEXT = 1_000;
+const MAX_MONITOR_PLAN_NOTIFICATION_REASON = 600;
+const MAX_MONITOR_PLAN_NOTES = 8_000;
+
+type MonitorPlanResultInput = {
+  summaries: Array<{
+    conversationId: string;
+    visibility: "private" | "shared";
+    channelId?: string;
+    summary: string;
+  }>;
+  wikiTasks: Array<{ task: string }>;
+  notifications: Array<{ text: string; reason: string }>;
+  notes: string;
+};
+
+function boundedMonitorPlanResult(value: MonitorPlanResultInput): MonitorPlanResultInput {
+  const summaries = value.summaries.slice(0, MAX_MONITOR_PLAN_SUMMARIES).flatMap((item) => {
+    const conversationId = item.conversationId.trim().slice(0, MAX_MONITOR_PLAN_CONVERSATION_ID);
+    const summary = item.summary.trim().slice(0, MAX_MONITOR_PLAN_SUMMARY);
+    if (!conversationId || !summary) return [];
+    const channelId = item.channelId?.trim().slice(0, MAX_MONITOR_PLAN_CONVERSATION_ID);
+    return [{
+      conversationId,
+      visibility: item.visibility,
+      ...(channelId ? { channelId } : {}),
+      summary,
+    }];
+  });
+  const wikiTasks = value.wikiTasks.slice(0, MAX_MONITOR_PLAN_WIKI_TASKS).flatMap((item) => {
+    const task = item.task.trim().slice(0, MAX_MONITOR_PLAN_WIKI_TASK);
+    return task ? [{ task }] : [];
+  });
+  const notifications = value.notifications.slice(0, MAX_MONITOR_PLAN_NOTIFICATIONS).flatMap((item) => {
+    const text = item.text.trim().slice(0, MAX_MONITOR_PLAN_NOTIFICATION_TEXT);
+    const reason = item.reason.trim().slice(0, MAX_MONITOR_PLAN_NOTIFICATION_REASON);
+    return text && reason ? [{ text, reason }] : [];
+  });
+  return {
+    summaries,
+    wikiTasks,
+    notifications,
+    notes: value.notes.trim().slice(0, MAX_MONITOR_PLAN_NOTES),
+  };
+}
 
 type ContextSurface = ContextEvent["source"]["surface"];
 type ContextKind = ContextEvent["kind"];
@@ -603,6 +656,80 @@ export const claim = mutation({
   },
 });
 
+async function cleanupMonitorPlanBatch(
+  ctx: MutationCtx,
+  workspaceId: Id<"workspaces">,
+  ownerId: Id<"users">,
+  consumer: string,
+  batchId: string,
+): Promise<void> {
+  const claims = await ctx.db
+    .query("contextEventClaims")
+    .withIndex("by_workspace_consumer_batch", (q) =>
+      q.eq("workspaceId", workspaceId).eq("consumer", consumer).eq("batchId", batchId),
+    )
+    .take(CLAIM_SCAN_PAGE_SIZE);
+  if (claims.length === 0 || claims.some((claim) => claim.status !== "acked")) return;
+  const plans = await ctx.db
+    .query("contextMonitorPlans")
+    .withIndex("by_workspace_owner_batch", (q) =>
+      q.eq("workspaceId", workspaceId).eq("ownerId", ownerId).eq("consumer", consumer).eq("batchId", batchId),
+    )
+    .take(CLAIM_SCAN_PAGE_SIZE);
+  for (const plan of plans) await ctx.db.delete(plan._id);
+}
+
+/** A plan is disposable only after every claim in its batch is acknowledged. */
+
+const monitorPlanResult = v.object({
+  summaries: v.array(v.object({
+    conversationId: v.string(),
+    visibility: v.union(v.literal("private"), v.literal("shared")),
+    channelId: v.optional(v.string()),
+    summary: v.string(),
+  })),
+  wikiTasks: v.array(v.object({ task: v.string() })),
+  notifications: v.array(v.object({ text: v.string(), reason: v.string() })),
+  notes: v.string(),
+});
+
+export const getOrCreateMonitorPlan = mutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    consumer: v.string(),
+    batchId: v.string(),
+    planKey: v.string(),
+    result: v.optional(monitorPlanResult),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const consumer = nonEmpty(args.consumer, "consumer");
+    const batchId = nonEmpty(args.batchId, "batchId");
+    const planKey = nonEmpty(args.planKey, "planKey");
+    const existing = await ctx.db
+      .query("contextMonitorPlans")
+      .withIndex("by_workspace_owner_plan", (q) =>
+        q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("consumer", consumer).eq("planKey", planKey),
+      )
+      .unique();
+    if (existing !== null) {
+      return { planKey: existing.planKey, batchId: existing.batchId, result: existing.result };
+    }
+    if (args.result === undefined) return { planKey, batchId, result: null };
+    const result = boundedMonitorPlanResult(args.result);
+    await ctx.db.insert("contextMonitorPlans", {
+      workspaceId: access.workspaceId,
+      ownerId: access.userId,
+      consumer,
+      batchId,
+      planKey,
+      result,
+      createdAt: Date.now(),
+    });
+    return { planKey, batchId, result };
+  },
+});
+
 export const ack = mutation({
   args: {
     workspaceId: v.optional(v.id("workspaces")),
@@ -617,6 +744,7 @@ export const ack = mutation({
     if (args.eventIds.length !== 1) invalid("ack requires exactly one eventId");
     let acknowledged = 0;
     const now = Date.now();
+    let batchId: string | undefined;
     for (const eventId of args.eventIds) {
       const event = await ctx.db
         .query("contextEvents")
@@ -635,6 +763,7 @@ export const ack = mutation({
       if (claim.claimToken !== claimToken) {
         throw new ConvexError({ code: "CONFLICT", message: "Context claim token is invalid" });
       }
+      batchId ??= claim.batchId;
       if (claim.status === "claimed" && claim.leaseUntil <= now) {
         throw new ConvexError({ code: "CONFLICT", message: "Context claim token is expired" });
       }
@@ -642,6 +771,9 @@ export const ack = mutation({
         await ctx.db.patch(claim._id, { status: "acked", ackedAt: now, leaseUntil: now });
         acknowledged += 1;
       }
+    }
+    if (batchId !== undefined) {
+      await cleanupMonitorPlanBatch(ctx, access.workspaceId, access.userId, consumer, batchId);
     }
     const consumerRows = await ctx.db
       .query("contextConsumers")
@@ -652,6 +784,7 @@ export const ack = mutation({
     if (consumerRow === undefined) {
       await ctx.db.insert("contextConsumers", { workspaceId: access.workspaceId, consumer, cursor: 0, updatedAt: now });
     }
+
     return { acknowledged, cursor };
   },
 });

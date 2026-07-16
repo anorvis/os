@@ -14,6 +14,8 @@ import type {
   ContextCompleteMonitorWikiEffectRequest,
   ContextCompleteOutboundRequest,
   ContextEventRecord,
+  ContextMonitorPlan,
+  ContextMonitorPlanRequest,
   ContextMonitorWikiJob,
   ContextMonitorEffectRequest,
   ContextMonitorEffectResult,
@@ -46,6 +48,7 @@ export type ContextRuntimeClient = ContextCapabilityClient & {
     leaseUntil: number;
   }>;
   claimMonitorWikiEffects(input: ContextClaimMonitorWikiEffectsRequest): Promise<readonly ContextMonitorWikiJob[]>;
+  getOrCreateMonitorPlan?(input: ContextMonitorPlanRequest): Promise<ContextMonitorPlan>;
   completeMonitorWikiEffect(input: ContextCompleteMonitorWikiEffectRequest): Promise<ContextMonitorEffectResult>;
   commitMonitorEffect(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
 };
@@ -168,12 +171,45 @@ export class ContextMonitorRuntime {
           .filter(Boolean)
           .join("\n")
           .slice(-8_000);
-        const result = await runMonitorAgent(
-          { events, priorNotes, signal: undefined },
-          this.options.monitorAgent
-            ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
-            : { now: this.options.now() },
-        );
+        const planApi = this.options.contextClient.getOrCreateMonitorPlan;
+        let result: MonitorResult;
+        if (typeof planApi === "function" && partition.batchId !== undefined) {
+          const planKey = deterministicId(
+            "monitor-plan",
+            `${this.options.consumer}:${partition.batchId}:${partition.key}`,
+          );
+          const existing = await planApi.call(this.options.contextClient, {
+            ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+            consumer: this.options.consumer,
+            batchId: partition.batchId,
+            planKey,
+          });
+          if (existing.result !== null) {
+            result = existing.result;
+          } else {
+            const generated = await runMonitorAgent(
+              { events, priorNotes, signal: undefined },
+              this.options.monitorAgent
+                ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+                : { now: this.options.now() },
+            );
+            const stored = await planApi.call(this.options.contextClient, {
+              ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+              consumer: this.options.consumer,
+              batchId: partition.batchId,
+              planKey,
+              result: generated,
+            });
+            result = stored.result ?? generated;
+          }
+        } else {
+          result = await runMonitorAgent(
+            { events, priorNotes, signal: undefined },
+            this.options.monitorAgent
+              ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+              : { now: this.options.now() },
+          );
+        }
         if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
         heartbeat.check();
         await this.persistResult(result, partition);
@@ -329,36 +365,36 @@ export class ContextMonitorRuntime {
     const claimJobs = this.options.contextClient.claimMonitorWikiEffects;
     const completeJob = this.options.contextClient.completeMonitorWikiEffect;
     if (typeof claimJobs !== "function" || typeof completeJob !== "function") return;
-    const jobs = await claimJobs.call(this.options.contextClient, {
-      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-      consumer: `${this.options.consumer}:wiki`,
-      limit: this.options.batchSize,
-      leaseMs: this.options.leaseMs,
-    });
-    for (const job of jobs) {
+    // Claim one job per iteration so an agent failure never strands other
+    // already-claimed jobs as running; only ledger mutations may throw.
+    for (let index = 0; index < this.options.batchSize; index += 1) {
+      const jobs = await claimJobs.call(this.options.contextClient, {
+        ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+        consumer: `${this.options.consumer}:wiki`,
+        limit: 1,
+        leaseMs: this.options.leaseMs,
+      });
+      const job = jobs[0];
+      if (!job) return;
+      let success = true;
+      let payload: string;
       try {
         const result = this.options.wikiAgent
           ? await this.options.wikiAgent(job.wikiTask)
           : await runWikiAgent({ task: job.wikiTask });
-        await completeJob.call(this.options.contextClient, {
-          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-          consumer: `${this.options.consumer}:wiki`,
-          effectKey: job.effectKey,
-          jobClaimToken: job.jobClaimToken,
-          success: true,
-          result: JSON.stringify(result).slice(-2_000),
-        });
+        payload = JSON.stringify(result).slice(-2_000);
       } catch (error) {
-        await completeJob.call(this.options.contextClient, {
-          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-          consumer: `${this.options.consumer}:wiki`,
-          effectKey: job.effectKey,
-          jobClaimToken: job.jobClaimToken,
-          success: false,
-          error: error instanceof Error ? error.message.slice(-2_000) : String(error).slice(-2_000),
-        });
-        throw error;
+        success = false;
+        payload = error instanceof Error ? error.message.slice(-2_000) : String(error).slice(-2_000);
       }
+      await completeJob.call(this.options.contextClient, {
+        ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+        consumer: `${this.options.consumer}:wiki`,
+        effectKey: job.effectKey,
+        jobClaimToken: job.jobClaimToken,
+        success,
+        ...(success ? { result: payload } : { error: payload }),
+      });
     }
   }
 

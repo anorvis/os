@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
-import type { ContextAckRequest, ContextCapabilityClient, ContextClaimRequest, ContextCompileResult, ContextClaimedEvent, ContextEventRecord, ContextOutboundRecord } from "../../src/capability/context/client";
+import type { ContextAckRequest, ContextCapabilityClient, ContextClaimRequest, ContextCompileResult, ContextClaimedEvent, ContextEventRecord, ContextMonitorEffectRequest, ContextMonitorEffectResult, ContextMonitorPlan, ContextOutboundRecord } from "../../src/capability/context/client";
 import { ContextMonitorRuntime, ContextOutboundRuntime, DiscordContextRuntime } from "../../src/capability/context/runtime";
 import type { ChannelAdapter, ChannelReceiver, ChannelSendResult, InboundChannelMessage } from "../../src/platform/channel/channel";
 
@@ -201,6 +201,126 @@ describe("context live runtimes", () => {
     await outbound.drain();
     expect(adapter.sent).toHaveLength(1);
     expect(log.at(-1)?.startsWith("complete:")).toBe(true);
+  });
+
+  test("Monitor reuses a stored plan after a partial effect commit", async () => {
+    let claimCount = 0;
+    let modelRuns = 0;
+    let failSecondNotification = true;
+    const effects = new Map<string, string>();
+    let storedPlan: ContextMonitorPlan | undefined;
+    const event: ContextClaimedEvent = {
+      event: {
+        id: "plan-event",
+        kind: "conversation_turn",
+        occurredAt: 1,
+        source: {
+          surface: "pi",
+          conversationId: "plan-conversation",
+          visibility: "private",
+          principalId: "owner",
+          workspaceId: "workspace",
+        },
+        content: { text: "plan input" },
+      },
+      claimToken: "claim-token",
+      batchId: "batch-1",
+      attempts: 1,
+      leaseUntil: Date.now() + 60_000,
+    };
+    const firstResult = {
+      summaries: [{
+        conversationId: "plan-conversation",
+        visibility: "private" as const,
+        summary: "durable plan summary",
+      }],
+      wikiTasks: [{ task: "curate plan task" }],
+      notifications: [
+        { text: "first notification", reason: "first reason" },
+        { text: "second notification", reason: "second reason" },
+      ],
+      notes: "",
+    };
+    const reorderedResult = {
+      ...firstResult,
+      notifications: [...firstResult.notifications].reverse(),
+      wikiTasks: [{ task: "different retry task" }],
+    };
+    const client: ContextCapabilityClient & {
+      getOrCreateMonitorPlan(input: {
+        workspaceId?: string;
+        consumer: string;
+        batchId: string;
+        planKey: string;
+        result?: typeof firstResult;
+      }): Promise<ContextMonitorPlan>;
+      commitMonitorEffect(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
+    } = {
+      append: () => Promise.resolve({}),
+      compile: () => Promise.resolve({
+        scope: { kind: "owner", ownerId: "owner", workspaceId: "workspace" },
+        summaries: [],
+        events: [],
+        wikiPages: [],
+      } satisfies ContextCompileResult),
+      claim: () => {
+        claimCount += 1;
+        return Promise.resolve(claimCount <= 2 ? [event] : []);
+      },
+      ack: () => Promise.resolve({ acknowledged: 1, cursor: 1 }),
+      enqueueOutbound: () => Promise.resolve({}),
+      getOrCreateMonitorPlan: (input) => {
+        if (storedPlan) return Promise.resolve(storedPlan);
+        if (input.result === undefined) {
+          return Promise.resolve({
+            planKey: input.planKey,
+            batchId: input.batchId,
+            result: null,
+          });
+        }
+        storedPlan = { planKey: input.planKey, batchId: input.batchId, result: input.result };
+        return Promise.resolve(storedPlan);
+      },
+      commitMonitorEffect: (input) => {
+        const payload = JSON.stringify({
+          kind: input.kind,
+          summary: input.summary,
+          wikiTask: input.wikiTask,
+          notification: input.notification,
+        });
+        const prior = effects.get(input.effectKey);
+        if (prior !== undefined) {
+          if (prior !== payload) throw new Error(`effect key collision: ${input.effectKey}`);
+          return Promise.resolve({ effectKey: input.effectKey, status: "replayed" });
+        }
+        if (input.notification?.text === "second notification" && failSecondNotification) {
+          failSecondNotification = false;
+          throw new Error("partial commit");
+        }
+        effects.set(input.effectKey, payload);
+        return Promise.resolve({ effectKey: input.effectKey, status: "completed" });
+      },
+      claimMonitorWikiEffects: () => Promise.resolve([]),
+      completeMonitorWikiEffect: () => Promise.resolve({ effectKey: "unused", status: "completed" }),
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      ownerDestinations: [{ visibility: "private", surface: "discord", channelId: "plan-dm" }],
+      workspaceId: "workspace",
+      monitorAgent: () => {
+        modelRuns += 1;
+        return Promise.resolve(modelRuns === 1 ? firstResult : reorderedResult);
+      },
+    });
+
+    await monitor.drain();
+    expect(effects).toHaveLength(3);
+    await monitor.drain();
+
+    expect(modelRuns).toBe(1);
+    expect(storedPlan?.result).toEqual(firstResult);
+    expect(effects).toHaveLength(4);
+    expect(new Set(effects.values()).size).toBe(4);
   });
 
   test("Outbound adapter failures are completed as retryable", async () => {
@@ -1119,5 +1239,50 @@ describe("context live runtimes", () => {
     await monitor.start();
     await monitor.stop();
     expect(runs).toBe(0);
+  });
+
+  test("Monitor continues past a failing Wiki job and startup stays live", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    client.claim = () => Promise.resolve([]);
+    const pending = [
+      { effectKey: "wiki-fails", wikiTask: "first task", jobClaimToken: "token-1", leaseUntil: Date.now() + 300_000 },
+      { effectKey: "wiki-succeeds", wikiTask: "second task", jobClaimToken: "token-2", leaseUntil: Date.now() + 300_000 },
+    ];
+    const claimLimits: number[] = [];
+    client.claimMonitorWikiEffects = (input) => {
+      claimLimits.push(input.limit ?? 0);
+      const job = pending.shift();
+      return Promise.resolve(job ? [job] : []);
+    };
+    const completions: Array<{ success: boolean; effectKey: string; error?: string }> = [];
+    client.completeMonitorWikiEffect = (input) => {
+      completions.push({
+        success: input.success,
+        effectKey: input.effectKey,
+        ...(input.error ? { error: input.error } : {}),
+      });
+      return Promise.resolve({
+        effectKey: input.effectKey,
+        status: input.success ? ("completed" as const) : ("needs_reconciliation" as const),
+      });
+    };
+    const executed: string[] = [];
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      wikiAgent: (task: string) => {
+        executed.push(task);
+        if (task === "first task") return Promise.reject(new Error("wiki agent crashed"));
+        return Promise.resolve({ ok: true });
+      },
+    });
+    await monitor.start();
+    await monitor.stop();
+    expect(claimLimits.every((limit) => limit === 1)).toBe(true);
+    expect(executed).toEqual(["first task", "second task"]);
+    expect(completions).toEqual([
+      { success: false, effectKey: "wiki-fails", error: "wiki agent crashed" },
+      { success: true, effectKey: "wiki-succeeds" },
+    ]);
   });
 });
