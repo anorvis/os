@@ -3,15 +3,17 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { publishConvexDeployment } from "../platform/convex/registry";
 import { ensureLocalTrust, type DeploymentEnv } from "../platform/convex/secrets";
+import { supportedConvexNodeEnv } from "./node-runtime";
 
 export type DevSpawn = (
   command: string,
   args: readonly string[],
-  options: { stdio: "inherit" },
+  options: { stdio: "inherit"; env?: NodeJS.ProcessEnv },
 ) => ChildProcess;
 
 export type DevSupervisorOptions = {
   spawn?: DevSpawn;
+  convexEnv?: NodeJS.ProcessEnv;
   convexArgs?: readonly string[];
   gatewayArgs?: readonly string[];
   deploymentEnv?: DeploymentEnv;
@@ -31,7 +33,10 @@ export type DevSupervisor = {
 /** Start both local runtimes; a peer failure tears down the other child. */
 export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSupervisor {
   const spawnChild = options.spawn ?? ((command, args, spawnOptions) => spawn(command, [...args], spawnOptions));
-  const convex = spawnChild("bunx", ["convex", "dev", ...(options.convexArgs ?? Bun.argv.slice(2))], { stdio: "inherit" });
+  // Convex deploys "use node" actions only under Node 18/20/22/24; resolve a
+  // supported runtime up front so integrations never silently fail to deploy.
+  const convexEnv = options.convexEnv ?? supportedConvexNodeEnv();
+  const convex = spawnChild("bunx", ["convex", "dev", ...(options.convexArgs ?? Bun.argv.slice(2))], { stdio: "inherit", env: convexEnv });
   const children: ChildProcess[] = [convex];
   const exitedChildren = new Set<ChildProcess>();
   const exit = options.exit ?? ((code: number) => process.exit(code));
@@ -92,13 +97,13 @@ export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSuper
   const trust = options.ensureTrust ?? ensureLocalTrust;
   const deploymentEnv = options.deploymentEnv ?? {
     get(name: string) {
-      const result = spawnSync("bunx", ["convex", "env", "get", name], { encoding: "utf8" });
+      const result = spawnSync("bunx", ["convex", "env", "get", name], { encoding: "utf8", env: convexEnv });
       if (result.status !== 0) return null;
       const value = result.stdout.trim();
       return value || null;
     },
     set(name: string, value: string) {
-      const result = spawnSync("bunx", ["convex", "env", "set", name, value], { encoding: "utf8" });
+      const result = spawnSync("bunx", ["convex", "env", "set", name, value], { encoding: "utf8", env: convexEnv });
       return result.status === 0;
     },
   } satisfies DeploymentEnv;

@@ -24,16 +24,20 @@ describe("dev supervisor", () => {
   test("starts Convex and gateway and tears down the peer on failure", () => {
     const children: FakeChild[] = [];
     const commands: string[][] = [];
-    const spawn: DevSpawn = (command: string, args: readonly string[]) => {
+    const environments: Array<NodeJS.ProcessEnv | undefined> = [];
+    const spawn: DevSpawn = (command: string, args: readonly string[], spawnOptions: { env?: NodeJS.ProcessEnv }) => {
       commands.push([command, ...args]);
+      environments.push(spawnOptions.env);
       const child = new FakeChild();
       children.push(child);
       return child as unknown as ChildProcess;
     };
+    const convexEnv = { PATH: "/supported-node/bin:/usr/bin" };
     let exitCode: number | undefined;
     const clearCalls: unknown[] = [];
     const supervisor = startDevSupervisor({
       spawn,
+      convexEnv,
       publish: () => ({ url: "http://127.0.0.1:3210" }),
       ensureTrust: () => true,
       setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
@@ -41,6 +45,7 @@ describe("dev supervisor", () => {
       exit: (code) => { exitCode = code; },
     });
     expect(commands[0]).toEqual(["bunx", "convex", "dev"]);
+    expect(environments[0]).toBe(convexEnv);
     expect(commands[1]).toEqual(["bun", "src/platform/gateway/server.ts"]);
     children[0]?.emit("exit", 2, null);
     expect(children[1]?.kills).toContain("SIGTERM");
@@ -63,6 +68,7 @@ describe("dev supervisor", () => {
     };
     const supervisor = startDevSupervisor({
       spawn,
+      convexEnv: { PATH: "/supported-node/bin" },
       publish: () => registered ? { url: "http://127.0.0.1:3210" } : null,
       ensureTrust: () => {
         expect(registered).toBe(true);

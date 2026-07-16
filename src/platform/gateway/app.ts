@@ -29,6 +29,7 @@ export type CreateServerOptions = {
   contextClient?: ContextCapabilityClient;
   runtime?: ContextGatewayRuntime;
   startRuntime?: boolean;
+  runtimeRetryDelayMs?: number;
 };
 export type CreateAppOptions = {
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
@@ -105,8 +106,7 @@ export function createApp(options: CreateAppOptions = {}): App {
   const start = async (): Promise<void> => {
     if (lifecycle === "ready") return;
     if (lifecycle === "starting" && startPromise) return startPromise;
-    if (lifecycle === "failed") throw startupError;
-    if (lifecycle === "stopped") {
+    if (lifecycle === "failed" || lifecycle === "stopped") {
       lifecycle = "idle";
       startupError = undefined;
       startPromise = undefined;
@@ -171,17 +171,40 @@ export function createServer(options: CreateServerOptions = {}) {
     idleTimeout: 120,
     fetch: (request) => app.fetch(request),
   });
+  // Convex often finishes booting after the gateway binds; keep the HTTP
+  // surface alive and converge the context runtime with bounded backoff
+  // instead of tearing the whole process down on a transient start failure.
+  let stopping = false;
+  let wake: (() => void) | undefined;
   const ready = (async () => {
     if (options.startRuntime === false) return;
-    try {
-      await app.start();
-    } catch (error) {
-      await server.stop();
-      throw error;
+    let delayMs = options.runtimeRetryDelayMs ?? 5_000;
+    while (!stopping) {
+      try {
+        await app.start();
+        return;
+      } catch (error) {
+        if (stopping) return;
+        console.error(
+          `anorvis: context runtime start failed (retrying in ${Math.round(delayMs / 1000)}s): ${error instanceof Error ? error.message : String(error)}`,
+        );
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delayMs);
+          wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        wake = undefined;
+        delayMs = Math.min(delayMs * 2, 60_000);
+      }
     }
   })();
 
   const stop = async () => {
+    stopping = true;
+    wake?.();
+    await ready;
     await app.stop();
     await server.stop();
   };
