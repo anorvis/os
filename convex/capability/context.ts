@@ -486,7 +486,9 @@ export const claim = mutation({
     const limit = Math.min(Math.max(Math.floor(args.limit ?? 50), 1), 200);
     const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 30_000), 1_000), 86_400_000);
     const now = Date.now();
-    const batchId = `${consumer}:${now}:${crypto.randomUUID()}`;
+    // Convex mutations must be deterministic: derive the fresh batch identity
+    // from the first newly claimed row's unique _id instead of randomness.
+    let freshBatchId: string | undefined;
     const consumerScope: ConsumerScope = {
       kind: info.kind,
       scopeId: info.scopeId,
@@ -541,7 +543,7 @@ export const claim = mutation({
       }
       const attempts = (prior?.attempts ?? 0) + 1;
       const claimToken = `${consumer}:${now}:${event.id}`;
-      const eventBatchId = prior?.batchId ?? batchId;
+      const eventBatchId = prior?.batchId ?? (freshBatchId ??= `${consumer}:batch:${event._id}`);
       const leaseUntil = now + leaseMs;
       if (prior === null) {
         await ctx.db.insert("contextEventClaims", {
