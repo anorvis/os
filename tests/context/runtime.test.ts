@@ -1120,4 +1120,49 @@ describe("context live runtimes", () => {
     await monitor.stop();
     expect(runs).toBe(0);
   });
+
+  test("Monitor continues past a failing Wiki job and startup stays live", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    client.claim = () => Promise.resolve([]);
+    const pending = [
+      { effectKey: "wiki-fails", wikiTask: "first task", jobClaimToken: "token-1", leaseUntil: Date.now() + 300_000 },
+      { effectKey: "wiki-succeeds", wikiTask: "second task", jobClaimToken: "token-2", leaseUntil: Date.now() + 300_000 },
+    ];
+    const claimLimits: number[] = [];
+    client.claimMonitorWikiEffects = (input) => {
+      claimLimits.push(input.limit ?? 0);
+      const job = pending.shift();
+      return Promise.resolve(job ? [job] : []);
+    };
+    const completions: Array<{ success: boolean; effectKey: string; error?: string }> = [];
+    client.completeMonitorWikiEffect = (input) => {
+      completions.push({
+        success: input.success,
+        effectKey: input.effectKey,
+        ...(input.error ? { error: input.error } : {}),
+      });
+      return Promise.resolve({
+        effectKey: input.effectKey,
+        status: input.success ? ("completed" as const) : ("needs_reconciliation" as const),
+      });
+    };
+    const executed: string[] = [];
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      wikiAgent: (task: string) => {
+        executed.push(task);
+        if (task === "first task") return Promise.reject(new Error("wiki agent crashed"));
+        return Promise.resolve({ ok: true });
+      },
+    });
+    await monitor.start();
+    await monitor.stop();
+    expect(claimLimits.every((limit) => limit === 1)).toBe(true);
+    expect(executed).toEqual(["first task", "second task"]);
+    expect(completions).toEqual([
+      { success: false, effectKey: "wiki-fails", error: "wiki agent crashed" },
+      { success: true, effectKey: "wiki-succeeds" },
+    ]);
+  });
 });
