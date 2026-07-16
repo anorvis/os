@@ -68,6 +68,12 @@ const config = {
   bindings: [],
   requireMention: true,
 };
+let spoolCounter = 0;
+function testSpoolPath(): string {
+  const path = join(tmpdir(), `anorvis-discord-test-${process.pid}-${spoolCounter += 1}.json`);
+  rmSync(path, { force: true });
+  return path;
+}
 
 function message(overrides: Partial<DiscordMessageLike> = {}): DiscordMessageLike {
   return {
@@ -117,7 +123,7 @@ describe("Discord channel adapter", () => {
   test("ignores bots/self and gates guild messages on mention while accepting DMs", async () => {
     const client = new FakeClient();
     const received: InboundChannelMessage[] = [];
-    const adapter = new DiscordChannelAdapter(config, { client });
+    const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
     await adapter.start((candidate) => {
       received.push(candidate);
       return Promise.resolve();
@@ -139,7 +145,7 @@ describe("Discord channel adapter", () => {
     try {
       const client = new FakeClient();
       let calls = 0;
-      const adapter = new DiscordChannelAdapter(config, { client });
+      const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
       await adapter.start(() => Promise.resolve().then(() => {
         calls += 1;
         if (calls === 1) throw new Error("append unavailable");
@@ -209,7 +215,7 @@ describe("Discord channel adapter", () => {
     vi.useFakeTimers();
     try {
       const client = new FakeClient();
-      const adapter = new DiscordChannelAdapter(config, { client });
+      const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
       let calls = 0;
       let active = 0;
       let maximumActive = 0;
@@ -312,7 +318,7 @@ describe("Discord channel adapter", () => {
   test("supports owner DM full scope but guild messages only channel scope", async () => {
     const client = new FakeClient();
     const received: InboundChannelMessage[] = [];
-    const adapter = new DiscordChannelAdapter(config, { client });
+    const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
     await adapter.start((candidate) => {
       received.push(candidate);
       return Promise.resolve();
@@ -376,7 +382,7 @@ describe("Discord channel adapter", () => {
 
   test("chunks sends at 2,000 characters and preserves thread reply", async () => {
     const client = new FakeClient();
-    const adapter = new DiscordChannelAdapter(config, { client });
+    const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
     await adapter.start(async () => {});
     const outbound: OutboundChannelMessage = {
       id: "out-1",
@@ -406,7 +412,7 @@ describe("Discord channel adapter", () => {
 
   test("uses stable length-safe nonces with enforcement across retries", async () => {
     const client = new FakeClient();
-    const adapter = new DiscordChannelAdapter(config, { client });
+    const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
     await adapter.start(async () => {});
     const outbound: OutboundChannelMessage = {
       id: "outbound-row-with-a-stable-id-that-is-longer-than-discord-allows",
@@ -439,7 +445,7 @@ describe("Discord channel adapter", () => {
 
   test("classifies transient send failures as retryable and lifecycle is reconnect-safe", async () => {
     const client = new FakeClient();
-    const adapter = new DiscordChannelAdapter(config, { client });
+    const adapter = new DiscordChannelAdapter(config, { client, spoolPath: testSpoolPath() });
     await adapter.start(async () => {});
     client.sendError = Object.assign(new Error("rate limited"), { status: 429 });
     expect(await adapter.send({ visibility: "private", channelId: "dm-1" }, {

@@ -910,6 +910,42 @@ describe("context live runtimes", () => {
     expect(acknowledgments).toEqual(["first-event", "second-event"]);
   });
 
+  test("Monitor isolates mixed durable batches within one scope", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const event = (id: string, batchId: string): ContextClaimedEvent => ({
+      event: {
+        id,
+        kind: "conversation_turn",
+        occurredAt: 1,
+        source: { surface: "pi", conversationId: "same-scope", visibility: "private", principalId: "owner" },
+        content: { text: id },
+      },
+      batchId,
+      claimToken: `token-${id}`,
+      attempts: 1,
+      leaseUntil: Date.now() + 60_000,
+    });
+    client.claim = () => Promise.resolve([event("reclaimed-event", "old-batch"), event("new-event", "new-batch")]);
+    client.renewClaim = (input) => Promise.resolve({ claims: input.claims, leaseUntil: Date.now() + 300_000 });
+    const invocations: string[][] = [];
+    const effectKeys: string[] = [];
+    client.commitMonitorEffect = (input) => {
+      effectKeys.push(input.effectKey);
+      return Promise.resolve({ effectKey: input.effectKey, status: "completed" as const });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      monitorAgent: (input) => {
+        invocations.push(input.events.map((claimedEvent) => claimedEvent.id));
+        return Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: input.events[0]?.id ?? "" });
+      },
+    });
+    await monitor.drain();
+    expect(invocations).toEqual([["reclaimed-event"], ["new-event"]]);
+    expect(new Set(effectKeys).size).toBe(2);
+  });
+
   test("Monitor renews all outstanding claims while a scope partition is slow", async () => {
     vi.useFakeTimers();
     try {

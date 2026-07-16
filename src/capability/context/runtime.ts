@@ -77,6 +77,7 @@ type MonitorPartition = {
   visibility: "private" | "shared";
   workspaceId?: string;
   scope: ContextScopeRequest;
+  batchId?: string;
   claimed: readonly ContextClaimedEvent[];
   priorSummaries: ContextCompileResult["summaries"];
 };
@@ -275,7 +276,8 @@ export class ContextMonitorRuntime {
         : scope.kind === "channel"
           ? (scope.channelId ?? "")
           : "";
-      const key = `${visibility}:${scope.kind}:${workspaceId ?? ""}:${scopeId}`;
+      const batchId = entry.batchId;
+      const key = `${visibility}:${scope.kind}:${workspaceId ?? ""}:${scopeId}:${batchId ?? ""}`;
       const prior = partitions.get(key);
       if (prior) {
         (prior.claimed as ContextClaimedEvent[]).push(entry);
@@ -284,6 +286,7 @@ export class ContextMonitorRuntime {
       partitions.set(key, {
         key,
         visibility,
+        ...(batchId ? { batchId } : {}),
         ...(workspaceId ? { workspaceId } : {}),
         scope,
         claimed: [entry],
@@ -361,7 +364,7 @@ export class ContextMonitorRuntime {
 
   private async persistResult(result: MonitorResult, partition: MonitorPartition): Promise<void> {
     const events = partition.claimed.map((entry) => entry.event);
-    const batchId = partition.claimed[0]?.batchId ?? events[0]?.id ?? "empty";
+    const batchId = partition.batchId ?? partition.claimed[0]?.batchId ?? events[0]?.id ?? "empty";
     const values = partition.priorSummaries
       .map((summary) => summary.summary.trim())
       .filter(Boolean);
