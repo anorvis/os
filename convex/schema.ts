@@ -736,6 +736,12 @@ const schema = defineSchema({
   })
     .index("by_workspace_path", ["workspaceId", "path"])
     .index("by_workspace_status_updated", ["workspaceId", "status", "updatedAt"])
+    .index("by_workspace_status_visibility_updated", [
+      "workspaceId",
+      "status",
+      "visibility",
+      "updatedAt",
+    ])
     .index("by_workspace_updated", ["workspaceId", "updatedAt"]),
 
   wikiPageAliases: defineTable({
@@ -912,8 +918,40 @@ const schema = defineSchema({
     createdAt: v.number(),
   })
     .index("by_event_id", ["id"])
-    .index("by_workspace_occurred", ["workspaceId", "occurredAt"]),
-
+    .index("by_workspace_occurred", ["workspaceId", "occurredAt"])
+    .index("by_workspace_created", ["workspaceId", "createdAt"])
+    .index("by_workspace_surface_created", [
+      "workspaceId",
+      "source.surface",
+      "createdAt",
+    ])
+    .index("by_workspace_kind_created", [
+      "workspaceId",
+      "kind",
+      "createdAt",
+    ])
+    .index("by_workspace_surface_kind_created", [
+      "workspaceId",
+      "source.surface",
+      "kind",
+      "createdAt",
+    ])
+    .index("by_workspace_visibility_occurred", [
+      "workspaceId",
+      "source.visibility",
+      "occurredAt",
+    ])
+    .index("by_workspace_owner_occurred", [
+      "workspaceId",
+      "ownerId",
+      "occurredAt",
+    ])
+    .index("by_workspace_visibility_channel_occurred", [
+      "workspaceId",
+      "source.visibility",
+      "source.channelId",
+      "occurredAt",
+    ]),
   contextSummaries: defineTable({
     workspaceId: v.id("workspaces"),
     ownerId: v.id("users"),
@@ -934,15 +972,68 @@ const schema = defineSchema({
       "workspaceId",
       "visibility",
       "updatedAt",
+    ])
+    .index("by_workspace_owner_updated", [
+      "workspaceId",
+      "ownerId",
+      "updatedAt",
+    ])
+    .index("by_workspace_visibility_channel_updated", [
+      "workspaceId",
+      "visibility",
+      "channelId",
+      "updatedAt",
     ]),
 
   contextConsumers: defineTable({
     workspaceId: v.id("workspaces"),
     consumer: v.string(),
+    surface: v.optional(contextSurface),
+    kind: v.optional(contextEventKind),
+    // `cursor` is retained for rows written by the original occurredAt-based
+    // scanner. New scans persist their creation-order position separately.
     cursor: v.number(),
+    cursorCreatedAt: v.optional(v.number()),
+    cursorEventId: v.optional(v.id("contextEvents")),
+    scopeKind: v.optional(
+      v.union(
+        v.literal("owner"),
+        v.literal("workspace"),
+        v.literal("channel"),
+      ),
+    ),
+    scopeId: v.optional(v.string()),
     updatedAt: v.number(),
-  }).index("by_workspace_consumer", ["workspaceId", "consumer"]),
-
+  })
+    .index("by_workspace_consumer", ["workspaceId", "consumer"])
+    .index("by_workspace_consumer_scope", [
+      "workspaceId",
+      "consumer",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_surface_scope", [
+      "workspaceId",
+      "consumer",
+      "surface",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_kind_scope", [
+      "workspaceId",
+      "consumer",
+      "kind",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_surface_kind_scope", [
+      "workspaceId",
+      "consumer",
+      "surface",
+      "kind",
+      "scopeKind",
+      "scopeId",
+    ]),
   contextEventClaims: defineTable({
     workspaceId: v.id("workspaces"),
     eventId: v.id("contextEvents"),

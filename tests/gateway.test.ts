@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp, type App, type CreateAppOptions } from "../src/platform/gateway/app";
+import { createApp, createServer, type App, type CreateAppOptions } from "../src/platform/gateway/app";
 import type { ContextGatewayRuntime } from "../src/capability/context/gateway-runtime";
 
 type GatewayFixture = {
@@ -132,6 +132,107 @@ describe("minimal Anorvis OS gateway", () => {
         },
       },
     );
+  });
+
+  test("blocks cross-origin browser requests without a token but allows originless CLI POSTs", async () => {
+    let wikiAgentCalls = 0;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        const malicious = await app.request("/v1/llm-wiki/wiki", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "https://evil.example",
+          },
+          body: JSON.stringify({ task: "must not execute" }),
+        });
+        expect(malicious.status).toBe(403);
+        expect(await malicious.json()).toEqual({ error: "origin not allowed" });
+        expect(wikiAgentCalls).toBe(0);
+
+        const cli = await app.request("/v1/llm-wiki/wiki", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task: "run from CLI" }),
+        });
+        expect(cli.status).toBe(200);
+        expect(wikiAgentCalls).toBe(1);
+      },
+      {
+        wikiAgent: ({ task }) => {
+          wikiAgentCalls += 1;
+          return Promise.resolve({
+            task,
+            answer: "handled",
+            confidence: "high",
+            sources: [],
+            changed: [],
+            readNext: [],
+            contradictions: [],
+            gaps: [],
+            warnings: [],
+          });
+        },
+      },
+    );
+  });
+
+  test("rejects tokenless handshakes on non-loopback binds", async () => {
+    await withIsolatedGateway(
+      async ({ app, home }) => {
+        const handshake = await app.request("/v1/auth/handshake", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:3000",
+          },
+          body: JSON.stringify({ token: "lan-takeover-token" }),
+        });
+        expect(handshake.status).toBe(503);
+        expect(await handshake.json()).toEqual({
+          error: "auth_token_required",
+        });
+        expect(() =>
+          readFileSync(join(home, ".anorvis", "os", "api-token"), "utf8"),
+        ).toThrow();
+      },
+      {
+        config: {
+          baseUrl: "http://192.0.2.10:8787",
+          bindHost: "192.0.2.10",
+          port: 8787,
+          dataRoot: tmpdir(),
+          tailnetName: null,
+        },
+      },
+    );
+  });
+
+  test("requires a token when createServer overrides its bind host", async () => {
+    await withIsolatedGateway(async () => {
+      const server = createServer({
+        hostname: "0.0.0.0",
+        port: 0,
+        startRuntime: false,
+      });
+      try {
+        await server.ready;
+        const handshake = await server.app.request("/v1/auth/handshake", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:3000",
+          },
+          body: JSON.stringify({ token: "override-takeover-token" }),
+        });
+        expect(handshake.status).toBe(503);
+        expect(await handshake.json()).toEqual({
+          error: "auth_token_required",
+        });
+      } finally {
+        await server.stop();
+      }
+    });
   });
 
   test("handshakes a browser-local token before protected requests", async () => {

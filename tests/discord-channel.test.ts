@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import {
   DiscordChannelAdapter,
   type DiscordClientLike,
@@ -130,6 +130,29 @@ describe("Discord channel adapter", () => {
     expect(received).toHaveLength(2);
     expect(received.map((candidate) => candidate.text)).toEqual(["<@bot-1> hello", "private hello"]);
     await adapter.stop();
+  });
+  test("retries a transient receiver failure so initial durable append is not swallowed", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      let calls = 0;
+      const adapter = new DiscordChannelAdapter(config, { client });
+      await adapter.start(() => Promise.resolve().then(() => {
+        calls += 1;
+        if (calls === 1) throw new Error("append unavailable");
+      }));
+      client.emit("messageCreate", message({ guildId: null }));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      vi.advanceTimersByTime(25);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(2);
+      await adapter.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("supports owner DM full scope but guild messages only channel scope", async () => {
@@ -274,7 +297,7 @@ describe("Discord channel adapter", () => {
     expect(await adapter.send({ visibility: "private", channelId: "dm-1" }, {
       id: "out-1",
       text: "hello",
-    })).toEqual({ ok: false, error: "Discord adapter is not started", retryable: false });
+    })).toEqual({ ok: false, error: "Discord adapter is not started", retryable: true });
     await adapter.start(async () => {});
     expect(client.loginCalls).toBe(2);
     await adapter.stop();

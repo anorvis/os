@@ -81,7 +81,7 @@ export function createApp(options: CreateAppOptions = {}): App {
     }
     return json({ ok: true });
   });
-  app.post("/v1/auth/handshake", (c) => authHandshake(c.req.raw));
+  app.post("/v1/auth/handshake", (c) => authHandshake(c.req.raw, config));
   app.use("*", async (c, next) => {
     const unauthorized = authorize(c.req.raw, new URL(c.req.url), config);
     if (unauthorized) return unauthorized;
@@ -152,7 +152,7 @@ export function createServer(options: CreateServerOptions = {}) {
   const hostname = options.hostname ?? config.bindHost;
   const contextClient = options.contextClient ?? (hasConvexConfiguration() ? createContextClient() : undefined);
   const runtime = options.runtime ?? createConfiguredRuntime(contextClient);
-  const app = createApp({ config, contextClient, runtime });
+  const app = createApp({ config: { ...config, bindHost: hostname }, contextClient, runtime });
   const server = Bun.serve({
     port,
     hostname,
@@ -239,11 +239,12 @@ function discordBindings(config: DiscordConfig): ChannelBinding[] {
   return configured;
 }
 
-async function authHandshake(request: Request): Promise<Response> {
-  if (!isAllowedHandshakeOrigin(request))
+async function authHandshake(request: Request, config: LocalAuthorityConfig): Promise<Response> {
+  if (!isAllowedLocalOrigin(request))
     return json({ error: "origin not allowed" }, 403);
-  if (process.env.ANORVIS_OS_API_TOKEN || readToken())
-    return json({ error: "token already configured" }, 409);
+  const expected = process.env.ANORVIS_OS_API_TOKEN || readToken();
+  if (expected) return json({ error: "token already configured" }, 409);
+  if (requiresConfiguredToken(config)) return json({ error: "auth_token_required" }, 503);
   const parsed = await parseJsonRequest(request);
   if (!parsed.ok) return json({ error: parsed.error }, 400);
   if (
@@ -270,9 +271,8 @@ export function requiresConfiguredToken(config: LocalAuthorityConfig): boolean {
 function authorize(request: Request, url: URL, config: LocalAuthorityConfig): Response | undefined {
   const expected = process.env.ANORVIS_OS_API_TOKEN || readToken();
   if (!expected) {
-    return requiresConfiguredToken(config)
-      ? json({ error: "auth_token_required" }, 503)
-      : undefined;
+    if (requiresConfiguredToken(config)) return json({ error: "auth_token_required" }, 503);
+    return isAllowedLocalOrigin(request) ? undefined : json({ error: "origin not allowed" }, 403);
   }
   const actual =
     request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
@@ -282,14 +282,14 @@ function authorize(request: Request, url: URL, config: LocalAuthorityConfig): Re
     ? undefined
     : new Response("Unauthorized", { status: 401, headers: corsHeaders() });
 }
-
+ 
 function tokenPath(): string {
   return (
     process.env.ANORVIS_OS_API_TOKEN_PATH?.trim() ||
     join(getHomeDir(), ".anorvis", "os", "api-token")
   );
 }
-
+ 
 function readToken(): string {
   try {
     return readFileSync(tokenPath(), "utf8").trim();
@@ -297,8 +297,8 @@ function readToken(): string {
     return "";
   }
 }
-
-function isAllowedHandshakeOrigin(request: Request): boolean {
+ 
+function isAllowedLocalOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");
   if (!origin) return true;
   const allowed = new Set([

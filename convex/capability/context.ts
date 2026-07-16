@@ -118,6 +118,190 @@ function visibleEvent(event: ContextEvent, info: ScopeInfo, access: Access): boo
   if (!shareSafe(event)) return false;
   return info.kind === "workspace" || event.source.channelId === info.channelId;
 }
+const CLAIM_SCAN_PAGE_SIZE = 200;
+
+type ContextSurface = ContextEvent["source"]["surface"];
+type ContextKind = ContextEvent["kind"];
+type ConsumerScope = Pick<ScopeInfo, "kind" | "scopeId"> & {
+  surface?: ContextSurface;
+  eventKind?: ContextKind;
+};
+type ContextConsumer = Doc<"contextConsumers">;
+
+async function consumerForScope(
+  ctx: Parameters<typeof requireWorkspace>[0],
+  workspaceId: Id<"workspaces">,
+  consumer: string,
+  scopeInfo: ConsumerScope,
+): Promise<ContextConsumer | null> {
+  let scoped: ContextConsumer | null | undefined;
+  if (scopeInfo.surface !== undefined && scopeInfo.eventKind !== undefined) {
+    scoped = await ctx.db
+      .query("contextConsumers")
+      .withIndex("by_workspace_consumer_surface_kind_scope", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("consumer", consumer)
+          .eq("surface", scopeInfo.surface)
+          .eq("kind", scopeInfo.eventKind)
+          .eq("scopeKind", scopeInfo.kind)
+          .eq("scopeId", scopeInfo.scopeId),
+      )
+      .unique();
+  } else if (scopeInfo.surface !== undefined) {
+    scoped = await ctx.db
+      .query("contextConsumers")
+      .withIndex("by_workspace_consumer_surface_scope", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("consumer", consumer)
+          .eq("surface", scopeInfo.surface)
+          .eq("scopeKind", scopeInfo.kind)
+          .eq("scopeId", scopeInfo.scopeId),
+      )
+      .unique();
+  } else if (scopeInfo.eventKind !== undefined) {
+    scoped = await ctx.db
+      .query("contextConsumers")
+      .withIndex("by_workspace_consumer_kind_scope", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("consumer", consumer)
+          .eq("kind", scopeInfo.eventKind)
+          .eq("scopeKind", scopeInfo.kind)
+          .eq("scopeId", scopeInfo.scopeId),
+      )
+      .unique();
+  } else {
+    scoped = (await ctx.db
+      .query("contextConsumers")
+      .withIndex("by_workspace_consumer", (q) =>
+        q.eq("workspaceId", workspaceId).eq("consumer", consumer),
+      )
+      .take(CLAIM_SCAN_PAGE_SIZE)).find((row) =>
+        row.surface === undefined &&
+        row.kind === undefined &&
+        row.scopeKind === scopeInfo.kind &&
+        row.scopeId === scopeInfo.scopeId);
+  }
+  if (scoped !== undefined && scoped !== null) return scoped;
+
+  // A legacy row has no scope or filter fields. Adopt it only for the
+  // unfiltered monitor cursor; filtered cursors must remain independent.
+  if (scopeInfo.surface !== undefined || scopeInfo.eventKind !== undefined) return null;
+  return (await ctx.db
+    .query("contextConsumers")
+    .withIndex("by_workspace_consumer", (q) =>
+      q.eq("workspaceId", workspaceId).eq("consumer", consumer),
+    )
+    .take(CLAIM_SCAN_PAGE_SIZE)).find((row) =>
+      row.surface === undefined &&
+      row.kind === undefined &&
+      row.scopeKind === undefined &&
+      row.scopeId === undefined) ?? null;
+}
+type CreationBound = { op: "gt" | "eq"; value: number } | undefined;
+
+function claimEventQuery(
+  ctx: Parameters<typeof requireWorkspace>[0],
+  workspaceId: Id<"workspaces">,
+  surfaceFilter: ContextSurface | undefined,
+  kindFilter: ContextKind | undefined,
+  bound: CreationBound,
+) {
+  if (surfaceFilter !== undefined && kindFilter !== undefined) {
+    return ctx.db
+      .query("contextEvents")
+      .withIndex("by_workspace_surface_kind_created", (q) => {
+        const indexed = q
+          .eq("workspaceId", workspaceId)
+          .eq("source.surface", surfaceFilter)
+          .eq("kind", kindFilter);
+        return bound === undefined
+          ? indexed
+          : bound.op === "gt"
+            ? indexed.gt("createdAt", bound.value)
+            : indexed.eq("createdAt", bound.value);
+      });
+  }
+  if (surfaceFilter !== undefined) {
+    return ctx.db
+      .query("contextEvents")
+      .withIndex("by_workspace_surface_created", (q) => {
+        const indexed = q.eq("workspaceId", workspaceId).eq("source.surface", surfaceFilter);
+        return bound === undefined
+          ? indexed
+          : bound.op === "gt"
+            ? indexed.gt("createdAt", bound.value)
+            : indexed.eq("createdAt", bound.value);
+      });
+  }
+  if (kindFilter !== undefined) {
+    return ctx.db
+      .query("contextEvents")
+      .withIndex("by_workspace_kind_created", (q) => {
+        const indexed = q.eq("workspaceId", workspaceId).eq("kind", kindFilter);
+        return bound === undefined
+          ? indexed
+          : bound.op === "gt"
+            ? indexed.gt("createdAt", bound.value)
+            : indexed.eq("createdAt", bound.value);
+      });
+  }
+  return ctx.db
+    .query("contextEvents")
+    .withIndex("by_workspace_created", (q) => {
+      const indexed = q.eq("workspaceId", workspaceId);
+      return bound === undefined
+        ? indexed
+        : bound.op === "gt"
+          ? indexed.gt("createdAt", bound.value)
+          : indexed.eq("createdAt", bound.value);
+    });
+}
+
+
+async function claimScanEvents(
+  ctx: Parameters<typeof requireWorkspace>[0],
+  workspaceId: Id<"workspaces">,
+  surfaceFilter: ContextSurface | undefined,
+  kindFilter: ContextKind | undefined,
+  cursorCreatedAt: number | undefined,
+  cursorEventId: Id<"contextEvents"> | undefined,
+): Promise<ContextEvent[]> {
+  if (cursorCreatedAt === undefined) {
+    return (await claimEventQuery(ctx, workspaceId, surfaceFilter, kindFilter, undefined)
+      .order("asc")
+      .take(CLAIM_SCAN_PAGE_SIZE));
+  }
+
+  const later = await claimEventQuery(
+    ctx,
+    workspaceId,
+    surfaceFilter,
+    kindFilter,
+    { op: "gt", value: cursorCreatedAt },
+  )
+    .order("asc")
+    .take(CLAIM_SCAN_PAGE_SIZE);
+  const sameQuery = claimEventQuery(
+    ctx,
+    workspaceId,
+    surfaceFilter,
+    kindFilter,
+    { op: "eq", value: cursorCreatedAt },
+  ).order("asc");
+  const same = cursorEventId === undefined
+    ? await sameQuery.take(CLAIM_SCAN_PAGE_SIZE)
+    : await sameQuery
+      .filter((q) => q.gt(q.field("_id"), cursorEventId))
+      .take(CLAIM_SCAN_PAGE_SIZE);
+  return [...same, ...later]
+    .sort((left, right) =>
+      left.createdAt - right.createdAt || (left._id < right._id ? -1 : left._id > right._id ? 1 : 0),
+    )
+    .slice(0, CLAIM_SCAN_PAGE_SIZE);
+}
 
 async function workspaceEvents(
   ctx: Parameters<typeof requireWorkspace>[0],
@@ -127,27 +311,56 @@ async function workspaceEvents(
   since: number | undefined,
   limit: number,
 ): Promise<ContextEvent[]> {
-  const scopeQuery = ctx.db
-    .query("contextEvents")
-    .withIndex("by_workspace_occurred", (q) => q.eq("workspaceId", workspaceId))
-    .order("desc");
-  const events = await scopeQuery
-    .filter((q) => {
-      const shared = q.eq(q.field("source.visibility"), "shared");
-      const owner = q.eq(q.field("ownerId"), access.userId);
-      const scoped = info.kind === "owner"
-        ? q.or(shared, owner)
-        : info.kind === "workspace"
-          ? shared
-          : q.and(shared, q.eq(q.field("source.channelId"), info.channelId));
-      return since === undefined
-        ? scoped
-        : q.and(scoped, q.gt(q.field("occurredAt"), since));
-    })
-    // Dynamic share-safety checks still run below. Keep the database read
-    // bounded while allowing a small amount of filtering headroom.
-    .take(Math.min(Math.max(limit * 20, limit), 1_000));
-  return events
+  const scanLimit = Math.min(Math.max(limit * 20, limit), 1_000);
+  let events: ContextEvent[];
+  if (info.kind === "owner") {
+    const [owned, shared] = await Promise.all([
+      ctx.db
+        .query("contextEvents")
+        .withIndex("by_workspace_owner_occurred", (q) => {
+          const indexed = q.eq("workspaceId", workspaceId).eq("ownerId", access.userId);
+          return since === undefined ? indexed : indexed.gt("occurredAt", since);
+        })
+        .order("desc")
+        .take(scanLimit),
+      ctx.db
+        .query("contextEvents")
+        .withIndex("by_workspace_visibility_occurred", (q) => {
+          const indexed = q.eq("workspaceId", workspaceId).eq("source.visibility", "shared");
+          return since === undefined ? indexed : indexed.gt("occurredAt", since);
+        })
+        .order("desc")
+        .take(scanLimit),
+    ]);
+    events = [...owned, ...shared];
+  } else if (info.kind === "workspace") {
+    events = await ctx.db
+      .query("contextEvents")
+      .withIndex("by_workspace_visibility_occurred", (q) => {
+        const indexed = q.eq("workspaceId", workspaceId).eq("source.visibility", "shared");
+        return since === undefined ? indexed : indexed.gt("occurredAt", since);
+      })
+      .order("desc")
+      .take(scanLimit);
+  } else {
+    events = await ctx.db
+      .query("contextEvents")
+      .withIndex("by_workspace_visibility_channel_occurred", (q) => {
+        const indexed = q
+          .eq("workspaceId", workspaceId)
+          .eq("source.visibility", "shared")
+          .eq("source.channelId", info.channelId);
+        return since === undefined ? indexed : indexed.gt("occurredAt", since);
+      })
+      .order("desc")
+      .take(scanLimit);
+  }
+  const unique = new Map<string, ContextEvent>();
+  for (const event of events) unique.set(String(event._id), event);
+  return [...unique.values()]
+    .sort((left, right) =>
+      right.occurredAt - left.occurredAt || (right._id < left._id ? -1 : right._id > left._id ? 1 : 0),
+    )
     .filter((event) => visibleEvent(event, info, access))
     .slice(0, limit);
 }
@@ -159,12 +372,50 @@ async function summariesForScope(
   access: Access,
   limit: number,
 ): Promise<Doc<"contextSummaries">[]> {
-  const summaries = await ctx.db
-    .query("contextSummaries")
-    .withIndex("by_workspace_updated", (q) => q.eq("workspaceId", workspaceId))
-    .order("desc")
-    .collect();
-  return summaries
+  const scanLimit = Math.min(Math.max(limit * 20, limit), 1_000);
+  let summaries: Doc<"contextSummaries">[];
+  if (info.kind === "owner") {
+    const [owned, shared] = await Promise.all([
+      ctx.db
+        .query("contextSummaries")
+        .withIndex("by_workspace_owner_updated", (q) =>
+          q.eq("workspaceId", workspaceId).eq("ownerId", access.userId),
+        )
+        .order("desc")
+        .take(scanLimit),
+      ctx.db
+        .query("contextSummaries")
+        .withIndex("by_workspace_visibility_updated", (q) =>
+          q.eq("workspaceId", workspaceId).eq("visibility", "shared"),
+        )
+        .order("desc")
+        .take(scanLimit),
+    ]);
+    summaries = [...owned, ...shared];
+  } else if (info.kind === "workspace") {
+    summaries = await ctx.db
+      .query("contextSummaries")
+      .withIndex("by_workspace_visibility_updated", (q) =>
+        q.eq("workspaceId", workspaceId).eq("visibility", "shared"),
+      )
+      .order("desc")
+      .take(scanLimit);
+  } else {
+    summaries = await ctx.db
+      .query("contextSummaries")
+      .withIndex("by_workspace_visibility_channel_updated", (q) =>
+        q
+          .eq("workspaceId", workspaceId)
+          .eq("visibility", "shared")
+          .eq("channelId", info.channelId),
+      )
+      .order("desc")
+      .take(scanLimit);
+  }
+  const unique = new Map<string, Doc<"contextSummaries">>();
+  for (const summary of summaries) unique.set(String(summary._id), summary);
+  return [...unique.values()]
+    .sort((left, right) => right.updatedAt - left.updatedAt)
     .filter((summary) => {
       if (info.kind === "owner") {
         return (summary.visibility === "private" && summary.ownerId === access.userId) || summary.visibility === "shared";
@@ -236,6 +487,8 @@ export const claim = mutation({
     workspaceId: v.optional(v.id("workspaces")),
     scope: v.optional(scope),
     consumer: v.string(),
+    surface: v.optional(surface),
+    kind: v.optional(eventKind),
     since: v.optional(v.number()),
     limit: v.optional(v.number()),
     leaseMs: v.optional(v.number()),
@@ -248,17 +501,59 @@ export const claim = mutation({
       : { kind: "owner" as const, scopeId: String(access.userId), ownerId: String(access.userId) };
     const limit = Math.min(Math.max(Math.floor(args.limit ?? 50), 1), 200);
     const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 30_000), 1_000), 86_400_000);
-    const candidates = (await workspaceEvents(ctx, access.workspaceId, info, access, args.since, Math.min(limit * 10, 500))).reverse();
     const now = Date.now();
+    const consumerScope: ConsumerScope = {
+      kind: info.kind,
+      scopeId: info.scopeId,
+      surface: args.surface,
+      eventKind: args.kind,
+    };
+    const consumerRow = await consumerForScope(ctx, access.workspaceId, consumer, consumerScope);
+    if (
+      consumerRow !== null &&
+      consumerRow.surface === undefined &&
+      consumerRow.kind === undefined &&
+      consumerRow.scopeKind === undefined &&
+      consumerRow.scopeId === undefined
+    ) {
+      await ctx.db.patch(consumerRow._id, {
+        scopeKind: info.kind,
+        scopeId: info.scopeId,
+      });
+    }
+    const page = await claimScanEvents(
+      ctx,
+      access.workspaceId,
+      args.surface,
+      args.kind,
+      consumerRow?.cursorCreatedAt,
+      consumerRow?.cursorEventId,
+    );
     const claimed: Array<{ event: ContextEvent; claimToken: string; attempts: number; leaseUntil: number }> = [];
-    for (const event of candidates) {
+    let blocked = false;
+    let safeCursor: ContextEvent | undefined;
+    for (const event of page) {
       if (claimed.length >= limit) break;
+      if (args.since !== undefined && event.occurredAt <= args.since) {
+        if (!blocked) safeCursor = event;
+        continue;
+      }
+      if (!visibleEvent(event, info, access)) {
+        if (!blocked) safeCursor = event;
+        continue;
+      }
       const prior = await ctx.db
         .query("contextEventClaims")
         .withIndex("by_event_consumer", (q) => q.eq("eventId", event._id).eq("consumer", consumer))
         .unique();
-      if (prior?.status === "acked") continue;
-      if (prior !== null && prior.leaseUntil > now) continue;
+      if (prior?.status === "acked") {
+        if (!blocked) safeCursor = event;
+        continue;
+      }
+      if (prior !== null && prior.leaseUntil > now) {
+        blocked = true;
+        continue;
+      }
       const attempts = (prior?.attempts ?? 0) + 1;
       const claimToken = `${consumer}:${now}:${event.id}`;
       const leaseUntil = now + leaseMs;
@@ -274,16 +569,40 @@ export const claim = mutation({
           claimedAt: now,
         });
       } else {
-        await ctx.db.patch(prior._id, { status: "claimed", claimToken, leaseUntil, attempts, claimedAt: now, ackedAt: undefined });
+        await ctx.db.patch(prior._id, {
+          status: "claimed",
+          claimToken,
+          leaseUntil,
+          attempts,
+          claimedAt: now,
+          ackedAt: undefined,
+        });
       }
       claimed.push({ event, claimToken, attempts, leaseUntil });
+      blocked = true;
     }
-    const cursor = await ctx.db
-      .query("contextConsumers")
-      .withIndex("by_workspace_consumer", (q) => q.eq("workspaceId", access.workspaceId).eq("consumer", consumer))
-      .unique();
-    if (cursor === null) {
-      await ctx.db.insert("contextConsumers", { workspaceId: access.workspaceId, consumer, cursor: 0, updatedAt: now });
+
+    if (!blocked && page.length > 0) safeCursor = page[page.length - 1];
+    if (consumerRow === null) {
+      await ctx.db.insert("contextConsumers", {
+        workspaceId: access.workspaceId,
+        consumer,
+        surface: args.surface,
+        kind: args.kind,
+        cursor: safeCursor?.createdAt ?? 0,
+        cursorCreatedAt: safeCursor?.createdAt,
+        cursorEventId: safeCursor?._id,
+        scopeKind: info.kind,
+        scopeId: info.scopeId,
+        updatedAt: now,
+      });
+    } else if (safeCursor !== undefined) {
+      await ctx.db.patch(consumerRow._id, {
+        cursor: safeCursor.createdAt,
+        cursorCreatedAt: safeCursor.createdAt,
+        cursorEventId: safeCursor._id,
+        updatedAt: now,
+      });
     }
     return claimed;
   },
@@ -300,8 +619,8 @@ export const ack = mutation({
     const access = await requireWorkspace(ctx, args.workspaceId);
     const consumer = nonEmpty(args.consumer, "consumer");
     const claimToken = nonEmpty(args.claimToken, "claimToken");
+    if (args.eventIds.length !== 1) invalid("ack requires exactly one eventId");
     let acknowledged = 0;
-    let cursor = 0;
     const now = Date.now();
     for (const eventId of args.eventIds) {
       const event = await ctx.db
@@ -328,16 +647,15 @@ export const ack = mutation({
         await ctx.db.patch(claim._id, { status: "acked", ackedAt: now, leaseUntil: now });
         acknowledged += 1;
       }
-      cursor = Math.max(cursor, event.occurredAt);
     }
-    const consumerRow = await ctx.db
+    const consumerRows = await ctx.db
       .query("contextConsumers")
       .withIndex("by_workspace_consumer", (q) => q.eq("workspaceId", access.workspaceId).eq("consumer", consumer))
-      .unique();
-    if (consumerRow === null) {
-      await ctx.db.insert("contextConsumers", { workspaceId: access.workspaceId, consumer, cursor, updatedAt: now });
-    } else if (cursor > consumerRow.cursor) {
-      await ctx.db.patch(consumerRow._id, { cursor, updatedAt: now });
+      .take(CLAIM_SCAN_PAGE_SIZE);
+    const consumerRow = consumerRows[0];
+    const cursor = consumerRow?.cursor ?? 0;
+    if (consumerRow === undefined) {
+      await ctx.db.insert("contextConsumers", { workspaceId: access.workspaceId, consumer, cursor: 0, updatedAt: now });
     }
     return { acknowledged, cursor };
   },
@@ -410,15 +728,26 @@ export const compile = query({
         wikiPages.push({ pageId: page._id, path: page.path, title: page.title });
       }
     } else {
-      const pages = await ctx.db
-        .query("wikiPages")
-        .withIndex("by_workspace_updated", (q) => q.eq("workspaceId", access.workspaceId))
-        .order("desc")
-        .collect();
+      const pages = info.kind === "owner"
+        ? await ctx.db
+          .query("wikiPages")
+          .withIndex("by_workspace_status_updated", (q) =>
+            q.eq("workspaceId", access.workspaceId).eq("status", "active"),
+          )
+          .order("desc")
+          .take(limit)
+        : await ctx.db
+          .query("wikiPages")
+          .withIndex("by_workspace_status_visibility_updated", (q) =>
+            q
+              .eq("workspaceId", access.workspaceId)
+              .eq("status", "active")
+              .eq("visibility", "shared"),
+          )
+          .order("desc")
+          .take(limit);
       for (const page of pages) {
-        if (page.status !== "active" || (info.kind !== "owner" && page.visibility !== "shared")) continue;
         wikiPages.push({ pageId: page._id, path: page.path, title: page.title });
-        if (wikiPages.length >= limit) break;
       }
     }
     return { scope: info, summaries, events, wikiPages };

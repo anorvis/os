@@ -16,6 +16,8 @@ import type {
 
 const MAX_DISCORD_MESSAGE_LENGTH = 2_000;
 const MAX_DISCORD_NONCE_LENGTH = 25;
+const RECEIVER_RETRY_ATTEMPTS = 3;
+const RECEIVER_RETRY_DELAY_MS = 25;
 const RETRYABLE_ERROR_CODES: Record<string, true> = {
   ECONNRESET: true,
   ECONNREFUSED: true,
@@ -230,7 +232,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   ): Promise<ChannelSendResult> {
     const client = this.client;
     if (!client || !this.started) {
-      return { ok: false, error: "Discord adapter is not started", retryable: false };
+      return { ok: false, error: "Discord adapter is not started", retryable: true };
     }
     const targetId = destination.threadId ?? destination.channelId;
     if (!targetId) {
@@ -289,7 +291,8 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   }
 
   private async handleMessage(message: DiscordMessageLike): Promise<void> {
-    if (!this.started || !this.receiver || !message.author) return;
+    const receiver = this.receiver;
+    if (!this.started || !receiver || !message.author) return;
     if (message.author.bot || message.author.system) return;
     if (message.author.id === this.accountId || message.author.id === this.client?.user?.id) return;
 
@@ -298,11 +301,17 @@ export class DiscordChannelAdapter implements ChannelAdapter {
 
     const candidate = normalizeDiscordMessage(message, this.accountId);
     if (!candidate) return;
-
-    try {
-      await this.receiver(candidate);
-    } catch {
-      // A receiver failure must not terminate the Discord event listener.
+    for (let attempt = 0; attempt < RECEIVER_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        await receiver(candidate);
+        return;
+      } catch {
+        if (attempt + 1 < RECEIVER_RETRY_ATTEMPTS) {
+          const { promise, resolve } = Promise.withResolvers<void>();
+          setTimeout(resolve, RECEIVER_RETRY_DELAY_MS * (attempt + 1));
+          await promise;
+        }
+      }
     }
   }
 

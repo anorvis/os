@@ -15,7 +15,7 @@ describe("OS status and auth", () => {
     });
   });
 
-  test("non-loopback without token rejects protected routes but leaves public routes reachable", async () => {
+  test("non-loopback without token leaves only health reachable", async () => {
     await withEnv({ host: "0.0.0.0" }, async () => {
       const app = createApp();
       const status = await app.request("/v1/os/status");
@@ -31,7 +31,8 @@ describe("OS status and auth", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ token: "1234567890123456" }),
       });
-      expect(handshake.status).toBe(201);
+      expect(handshake.status).toBe(503);
+      expect(await handshake.json()).toEqual({ error: "auth_token_required" });
     });
   });
 

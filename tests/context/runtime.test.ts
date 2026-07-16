@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ContextCapabilityClient, ContextCompileResult, ContextClaimedEvent, ContextOutboundRecord } from "../../src/capability/context/client";
+import type { ContextAckRequest, ContextCapabilityClient, ContextClaimRequest, ContextCompileResult, ContextClaimedEvent, ContextOutboundRecord } from "../../src/capability/context/client";
 import { ContextMonitorRuntime, ContextOutboundRuntime, DiscordContextRuntime } from "../../src/capability/context/runtime";
 import type { ChannelAdapter, ChannelReceiver, ChannelSendResult, InboundChannelMessage } from "../../src/platform/channel/channel";
 
@@ -111,7 +111,10 @@ describe("context live runtimes", () => {
     });
     expect(client.compileScopes).toEqual([{ kind: "owner", ownerId: "owner", workspaceId: "workspace" }]);
     expect(appendedInputs[0]).toMatchObject({ workspaceId: "workspace", source: { workspaceId: "workspace" } });
-    expect(adapter.sent[0]?.destination).toEqual({ visibility: "private", channelId: "dm", threadId: "thread" });
+    expect(client.outbound[0]?.destination).toEqual({ surface: "discord", channelId: "dm", threadId: "thread" });
+    const outbound = new ContextOutboundRuntime({ contextClient: client as never, adapters: [adapter] });
+    await outbound.drain();
+    expect(adapter.sent[0]?.destination).toEqual({ visibility: "private", workspaceId: "workspace", channelId: "dm", threadId: "thread" });
     expect(log.filter((entry) => entry.startsWith("append:")).length).toBe(2);
     await runtime.stop();
   });
@@ -233,6 +236,185 @@ describe("context live runtimes", () => {
     ]);
   });
 
+  test("Monitor forwards a lease longer than the legacy 30 second default", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    let leaseMs = 0;
+    client.claim = (input) => {
+      leaseMs = input.leaseMs ?? 0;
+      return Promise.resolve([]);
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      leaseMs: 60_000,
+      monitorAgent: () => Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: "" }),
+    });
+    await monitor.drain();
+    expect(leaseMs).toBe(60_000);
+  });
+
+  test("Monitor and outbound runtimes can restart after stop", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    let monitorClaims = 0;
+    let outboundClaims = 0;
+    client.claim = () => {
+      monitorClaims += 1;
+      return Promise.resolve([]);
+    };
+    client.claimOutbound = () => {
+      outboundClaims += 1;
+      return Promise.resolve([]);
+    };
+    const monitor = new ContextMonitorRuntime({ contextClient: client as never });
+    await monitor.start();
+    await monitor.stop();
+    await monitor.start();
+    await monitor.stop();
+    const outbound = new ContextOutboundRuntime({ contextClient: client as never, adapters: [] });
+    await outbound.start();
+    await outbound.stop();
+    await outbound.start();
+    await outbound.stop();
+    expect(monitorClaims).toBe(2);
+    expect(outboundClaims).toBe(2);
+  });
+
+  test("Monitor aggregates retained notes and summaries into one durable scope row", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const saved: Array<{ scope: unknown; summary: string }> = [];
+    client.claim = () => Promise.resolve([{
+      event: {
+        id: "aggregate-event",
+        kind: "conversation_turn" as const,
+        occurredAt: 1,
+        source: { surface: "pi" as const, conversationId: "conversation", visibility: "private" as const, principalId: "owner", workspaceId: "workspace" },
+        content: { text: "context" },
+      },
+      claimToken: "lease",
+      attempts: 1,
+      leaseUntil: 60_000,
+    }]);
+    client.compile = () => Promise.resolve({
+      scope: { kind: "owner", ownerId: "owner", workspaceId: "workspace" },
+      summaries: [{ summary: "retained note", scopeKind: "owner", scopeId: "owner", visibility: "private" }],
+      events: [],
+      wikiPages: [],
+    });
+    client.saveSummary = (input) => {
+      saved.push({ scope: input.scope, summary: input.summary });
+      return Promise.resolve({ inserted: true });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      monitorAgent: () => Promise.resolve({
+        summaries: [
+          { conversationId: "conversation", visibility: "private" as const, summary: "summary one" },
+          { conversationId: "conversation", visibility: "private" as const, summary: "summary two" },
+        ],
+        wikiTasks: [],
+        notifications: [],
+        notes: "new note",
+      }),
+    });
+    await monitor.drain();
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.scope).toMatchObject({ kind: "owner", ownerId: "owner" });
+    expect(saved[0]?.summary).toContain("retained note");
+    expect(saved[0]?.summary).toContain("summary one");
+    expect(saved[0]?.summary).toContain("summary two");
+    expect(saved[0]?.summary).toContain("new note");
+  });
+
+  test("Same-text notifications from distinct claimed batches receive distinct durable IDs", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const first = (id: string) => ({
+      event: {
+        id,
+        kind: "conversation_turn" as const,
+        occurredAt: 1,
+        source: { surface: "pi" as const, conversationId: id, visibility: "private" as const, principalId: "owner", workspaceId: "workspace" },
+        content: { text: id },
+      },
+      claimToken: `lease-${id}`,
+      attempts: 1,
+      leaseUntil: 60_000,
+    });
+    let calls = 0;
+    client.claim = () => {
+      calls += 1;
+      return Promise.resolve(calls === 1 ? [first("batch-one")] : [first("batch-two")]);
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      ownerDestinations: [{ visibility: "private", surface: "discord", channelId: "dm" }],
+      monitorAgent: () => Promise.resolve({ summaries: [], wikiTasks: [], notifications: [{ text: "same text", reason: "test" }], notes: "" }),
+    });
+    await monitor.drain();
+    await monitor.drain();
+    const ids = log.filter((entry) => entry.startsWith("enqueue:")).map((entry) => entry.slice("enqueue:".length));
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
+  test("Outbound rows without a configured adapter remain retryable", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    await client.enqueueOutbound({ id: "missing-adapter", destination: { surface: "sms", channelId: "dm" }, text: "retry me" });
+    const outbound = new ContextOutboundRuntime({ contextClient: client as never, adapters: [] });
+    await outbound.drain();
+    expect(log).toContain("complete:missing-adapter:retry");
+  });
+
+  test("Discord replays only inbound surface/kind and acknowledges after durable enqueue", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const claims: ContextClaimRequest[] = [];
+    const acknowledgments: ContextAckRequest[] = [];
+    const sequence: string[] = [];
+    client.claim = (input) => {
+      claims.push(input);
+      if (claims.length > 1) return Promise.resolve([]);
+      return Promise.resolve([{
+        event: {
+          id: "persisted-discord",
+          kind: "conversation_turn" as const,
+          occurredAt: 1,
+          source: { surface: "discord" as const, conversationId: "discord:bot:dm:", visibility: "private" as const, principalId: "owner", workspaceId: "workspace", channelId: "dm" },
+          content: { text: "replay me", prompt: "replay me", resourceId: "original-message" },
+        },
+        claimToken: "discord-lease",
+        attempts: 2,
+        leaseUntil: 60_000,
+      }]);
+    };
+    const enqueue = client.enqueueOutbound.bind(client);
+    client.enqueueOutbound = (input) => {
+      sequence.push("enqueue");
+      return enqueue(input);
+    };
+    client.ack = (input) => {
+      sequence.push("ack");
+      acknowledgments.push(input);
+      return Promise.resolve({ acknowledged: 1, cursor: 1 });
+    };
+    const adapter = new FakeAdapter();
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner", workspaceId: "workspace" }],
+      conversation: () => Promise.resolve("replayed"),
+    });
+    await runtime.start();
+    expect(claims[0]).toMatchObject({ surface: "discord", kind: "conversation_turn" });
+    expect(client.outbound).toHaveLength(1);
+    expect(acknowledgments).toEqual([{ consumer: "os-discord-replay", eventIds: ["persisted-discord"], claimToken: "discord-lease" }]);
+    expect(sequence).toEqual(["enqueue", "ack"]);
+    await runtime.stop();
+  });
+
   test("A persisted inbound event is retried after a model failure", async () => {
     const log: string[] = [];
     const client = fakeClient(log);
@@ -265,7 +447,8 @@ describe("context live runtimes", () => {
     await expectRejected(runtime.receive(message), "model unavailable");
     await runtime.receive(message);
     expect(attempts).toBe(2);
-    expect(adapter.sent).toHaveLength(1);
+    expect(client.outbound).toHaveLength(1);
+    expect(client.outbound[0]?.id).toMatch(/^discord-reply:/);
     expect(appended.filter((id) => id.startsWith("discord-event:"))).toHaveLength(2);
     expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(1);
   });
@@ -287,6 +470,7 @@ describe("context live runtimes", () => {
       bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
       conversation: () => Promise.resolve("replayed reply"),
     });
+    const outbound = new ContextOutboundRuntime({ contextClient: client as never, adapters: [adapter] });
     const message: InboundChannelMessage = {
       id: "send-retry-message",
       identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
@@ -295,12 +479,18 @@ describe("context live runtimes", () => {
       occurredAt: 2,
       attachments: [],
     };
-    await expectRejected(runtime.receive(message), "send unavailable");
+    await runtime.receive(message);
+    const firstId = client.outbound[0]?.id;
+    await outbound.drain();
+    expect(log).toContain(`complete:${firstId}:retry`);
     adapter.sendResult = { ok: true, messageId: "replayed" };
     await runtime.receive(message);
+    const secondId = client.outbound[0]?.id;
+    expect(secondId).toBe(firstId);
+    await outbound.drain();
     expect(adapter.sent).toHaveLength(2);
     expect(adapter.sent[0]?.message.id).toBe(adapter.sent[1]?.message.id);
-    expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(1);
+    expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(2);
   });
 
   test("Shutdown drains an in-flight model call before stopping the adapter", async () => {
@@ -335,6 +525,8 @@ describe("context live runtimes", () => {
     expect(adapter.stopCalls).toBe(0);
     releaseModel("drained reply");
     await receive;
+    const outbound = new ContextOutboundRuntime({ contextClient: client as never, adapters: [adapter] });
+    await outbound.drain();
     await stop;
     expect(adapter.stopCalls).toBe(1);
     expect(adapter.sent).toHaveLength(1);

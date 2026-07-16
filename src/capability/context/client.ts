@@ -5,7 +5,7 @@ import { ConvexHttpClient } from "convex/browser";
 import { getHomeDir } from "../../paths";
 import { decodeUnknown } from "../../core/effect/schema";
 import { api } from "../../../convex/_generated/api";
-import type { ContextEventInput, ContextSurface } from "./schema";
+import type { ContextEventInput, ContextEventKind, ContextSurface } from "./schema";
 
 export type ContextScopeRequest = {
   kind: "owner" | "workspace" | "channel";
@@ -29,6 +29,8 @@ export type ContextClaimRequest = {
   since?: number;
   limit?: number;
   leaseMs?: number;
+  surface?: ContextSurface;
+  kind?: ContextEventKind;
 };
 export type ContextAckRequest = {
   workspaceId?: string;
@@ -281,19 +283,54 @@ export function writeConvexSession(session: ConvexAuthSession, path = convexAuth
   renameSync(temporary, path);
   chmodSync(path, 0o600);
 }
-export function isConvexTokenValid(token: string): boolean {
+const TOKEN_REFRESH_SKEW_MS = 5 * 60_000;
+
+function convexTokenExpiry(token: string): number | null {
   try {
     const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString()) as { exp?: unknown };
-    return typeof payload.exp === "number" && payload.exp * 1_000 > Date.now() + 5 * 60_000;
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp * 1_000 : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function isConvexTokenValid(token: string): boolean {
+  const expiresAt = convexTokenExpiry(token);
+  return expiresAt !== null && expiresAt > Date.now() + TOKEN_REFRESH_SKEW_MS;
+}
+
+function isUnauthenticatedError(error: unknown): boolean {
+  const unauthenticatedMessage = /unauthenticated|unauthorized|authentication required|sign in is required|invalid token|token expired/i;
+  if (isRecord(error)) {
+    const status = error.status ?? error.statusCode ?? error.httpStatus;
+    if (status === 401 || status === "401") return true;
+    const code = error.code;
+    if (typeof code === "string" && unauthenticatedMessage.test(code)) return true;
+    const data = error.data;
+    if (isRecord(data)) {
+      const nestedCode = data.code;
+      if (typeof nestedCode === "string" && unauthenticatedMessage.test(nestedCode)) return true;
+      const nestedMessage = data.message;
+      if (typeof nestedMessage === "string" && unauthenticatedMessage.test(nestedMessage)) return true;
+    }
+  }
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : isRecord(error) && typeof error.message === "string"
+        ? error.message
+        : "";
+  return unauthenticatedMessage.test(message);
 }
 
 export class ConvexContextClient implements ContextCapabilityClient {
   private readonly options: ContextClientOptions;
   private transport: ConvexTransport | undefined;
   private authPromise: Promise<void> | undefined;
+  private authToken: string | undefined;
+  private authTokenExpiresAt: number | null | undefined;
+  private authGeneration = 0;
   constructor(options: ContextClientOptions = {}) {
     this.options = options;
     this.transport = options.client;
@@ -331,37 +368,72 @@ export class ConvexContextClient implements ContextCapabilityClient {
     await this.ensureAuthenticated();
     const transport = this.transport;
     if (!transport) throw new Error("Convex client is unavailable");
-    const result = kind === "query"
-      ? await transport.query(reference, input as Record<string, unknown>)
-      : await transport.mutation(reference, input as Record<string, unknown>);
+    const authGeneration = this.authGeneration;
+    let result: unknown;
+    try {
+      result = kind === "query"
+        ? await transport.query(reference, input as Record<string, unknown>)
+        : await transport.mutation(reference, input as Record<string, unknown>);
+    } catch (error) {
+      if (this.options.authRequired === false || !isUnauthenticatedError(error)) throw error;
+      const sameAuthentication = authGeneration === this.authGeneration;
+      if (sameAuthentication) this.clearAuthentication();
+      await this.ensureAuthenticated(sameAuthentication);
+      result = kind === "query"
+        ? await transport.query(reference, input as Record<string, unknown>)
+        : await transport.mutation(reference, input as Record<string, unknown>);
+    }
     return decodeUnknown(resultSchema as Schema.Schema<A, never, never>, result);
   }
-  private async ensureAuthenticated(): Promise<void> {
+  private async ensureAuthenticated(force = false): Promise<void> {
     if (this.options.authRequired === false) {
       if (!this.transport) this.transport = await this.newTransport();
       return;
     }
-    if (!this.authPromise) this.authPromise = this.authenticate();
-    try {
-      await this.authPromise;
-    } catch (error) {
-      this.authPromise = undefined;
-      throw error;
+    if (!force && this.hasValidCachedAuthentication()) return;
+    if (!this.authPromise) {
+      const authentication = this.authenticate(force);
+      this.authPromise = authentication;
+      try {
+        await authentication;
+      } finally {
+        if (this.authPromise === authentication) this.authPromise = undefined;
+      }
+      return;
     }
+    await this.authPromise;
   }
-  private async authenticate(): Promise<void> {
+  private hasValidCachedAuthentication(): boolean {
+    if (!this.authToken) return false;
+    if (this.authTokenExpiresAt === null || this.authTokenExpiresAt === undefined) return true;
+    return this.authTokenExpiresAt > Date.now() + TOKEN_REFRESH_SKEW_MS;
+  }
+  private clearAuthentication(): void {
+    this.authToken = undefined;
+    this.authTokenExpiresAt = undefined;
+    this.authGeneration += 1;
+  }
+  private rememberAuthentication(token: string): void {
+    this.authToken = token;
+    this.authTokenExpiresAt = convexTokenExpiry(token);
+    this.authGeneration += 1;
+  }
+  private async authenticate(force = false): Promise<void> {
+    this.clearAuthentication();
     if (!this.transport) this.transport = await this.newTransport();
     const env = this.options.env ?? process.env;
     const envToken = env.ANORVIS_CONVEX_AUTH_TOKEN?.trim();
     if (envToken) {
       this.transport.setAuth?.(envToken);
+      this.rememberAuthentication(envToken);
       return;
     }
     const home = this.options.home ?? getHomeDir();
     const sessionPath = this.options.sessionPath ?? convexAuthSessionPath(home);
     const session = readConvexSession(sessionPath) ?? readConvexSession(this.options.sessionPath ?? convexLegacyAuthSessionPath(home));
-    if (session && isConvexTokenValid(session.token)) {
+    if (!force && session && isConvexTokenValid(session.token)) {
       this.transport.setAuth?.(session.token);
+      this.rememberAuthentication(session.token);
       return;
     }
     if (session?.refreshToken) {
@@ -401,6 +473,7 @@ export class ConvexContextClient implements ContextCapabilityClient {
     const home = this.options.home ?? getHomeDir();
     writeConvexSession(session, this.options.sessionPath ?? convexAuthSessionPath(home));
     this.transport?.setAuth?.(session.token);
+    this.rememberAuthentication(session.token);
   }
   private async newTransport(): Promise<ConvexTransport> {
     return Promise.resolve(new ConvexHttpClient(
@@ -408,6 +481,7 @@ export class ConvexContextClient implements ContextCapabilityClient {
     ));
   }
 }
+
 export function createContextClient(options: ContextClientOptions = {}): ContextCapabilityClient {
   return new ConvexContextClient(options);
 }

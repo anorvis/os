@@ -38,9 +38,11 @@ The optional Wiki sidecar works with defaults; override these variables when nee
 | `ANORVIS_OS_PORT` (or `PORT`) | `8787`                    | Bind port      |
 | `ANORVIS_OS_API_TOKEN_PATH`   | `~/.anorvis/os/api-token` | API token file |
 
-Auth: loopback requests work without a token. Binding to a non-loopback host
-requires a configured token; the first `POST /v1/auth/handshake` writes one to
-the token file.
+Auth: loopback requests work without a token. On loopback, the first
+same-origin `POST /v1/auth/handshake` can write a token to the token file.
+Binding to a non-loopback host requires `ANORVIS_OS_API_TOKEN` or an existing
+`ANORVIS_OS_API_TOKEN_PATH` before startup; tokenless LAN handshakes are
+rejected.
 
 Machine-local state lives under `~/.anorvis/`, including the local LLM Wiki
 workspace and registered vault list.

@@ -39,7 +39,7 @@ export type ContextRuntimeClient = ContextCapabilityClient & {
 type Timer = ReturnType<typeof setTimeout>;
 const DEFAULT_INTERVAL_MS = 15_000;
 const DEFAULT_BATCH_SIZE = 50;
-const DEFAULT_LEASE_MS = 30_000;
+const DEFAULT_LEASE_MS = 120_000;
 
 export type OwnerNotificationDestination = ChannelDestination & {
   surface: "pi" | "discord" | "web" | "sms" | "integration" | "system";
@@ -79,7 +79,8 @@ export class ContextMonitorRuntime {
   }
 
   async start(): Promise<void> {
-    if (this.started || this.stopped) return;
+    if (this.started) return;
+    this.stopped = false;
     this.started = true;
     this.armTimer();
     await this.drain();
@@ -123,12 +124,14 @@ export class ContextMonitorRuntime {
     });
     if (!claimed.length) return;
     const events = claimed.map((entry) => entry.event);
+    const priorSummaries = await this.loadPriorSummaries();
+    const priorNotes = priorSummaries.map((summary) => summary.summary.trim()).filter(Boolean).join("\n").slice(-8_000);
     const result = await runMonitorAgent(
-      { events, priorNotes: "", signal: undefined },
+      { events, priorNotes, signal: undefined },
       this.options.monitorAgent ? { monitorAgent: this.options.monitorAgent, now: this.options.now() } : { now: this.options.now() },
     );
     if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
-    await this.persistResult(result, events);
+    await this.persistResult(result, events, priorSummaries);
     for (const entry of claimed) {
       await this.options.contextClient.ack({
         consumer: this.options.consumer,
@@ -137,28 +140,75 @@ export class ContextMonitorRuntime {
       });
     }
   }
+  private async loadPriorSummaries(): Promise<ContextCompileResult["summaries"]> {
+    const compiled = await this.options.contextClient.compile({
+      scope: { kind: "owner" },
+      limit: this.options.batchSize,
+    }) as ContextCompileResult;
+    return compiled.summaries;
+  }
 
-  private async persistResult(result: MonitorResult, events: readonly ContextEventRecord[]): Promise<void> {
-    for (const summary of result.summaries) {
-      const source = events.find((event) => event.source.conversationId === summary.conversationId && event.source.visibility === summary.visibility && (!summary.channelId || event.source.channelId === summary.channelId));
-      const scope = summary.visibility === "private"
-        ? { kind: "owner" as const, ownerId: source?.source.principalId }
-        : { kind: "channel" as const, workspaceId: source?.source.workspaceId, channelId: summary.channelId ?? source?.source.channelId };
-      if (scope.kind === "channel" && !scope.channelId) continue;
-      await this.options.contextClient.saveSummary({
-        workspaceId: source?.source.workspaceId,
-        scope,
-        summary: summary.summary,
-        updatedAt: this.options.now().getTime(),
-      });
+  private async persistResult(
+    result: MonitorResult,
+    events: readonly ContextEventRecord[],
+    priorSummaries: Readonly<ContextCompileResult["summaries"]>,
+  ): Promise<void> {
+    const aggregates = new Map<string, { workspaceId?: string; scope: ContextScopeRequest; values: string[] }>();
+    const effectiveWorkspaceId = events.find((event) => event.source.workspaceId)?.source.workspaceId;
+    const add = (scope: ContextScopeRequest, workspaceId: string | undefined, value: string): void => {
+      const text = value.trim();
+      if (!text) return;
+      const effectiveWorkspace = workspaceId ?? effectiveWorkspaceId;
+      const key = `${scope.kind}:${effectiveWorkspace ?? ""}:${scope.channelId ?? ""}`;
+      const prior = aggregates.get(key);
+      if (prior) {
+        if (scope.kind === "owner" && !prior.scope.ownerId && scope.ownerId) {
+          prior.scope = { ...prior.scope, ownerId: scope.ownerId };
+        }
+        if (!prior.values.includes(text)) prior.values.push(text);
+      } else {
+        aggregates.set(key, { scope, ...(effectiveWorkspace ? { workspaceId: effectiveWorkspace } : {}), values: [text] });
+      }
+    };
+    for (const summary of priorSummaries) {
+      if (summary.scopeKind === "channel" && summary.channelId) {
+        add({ kind: "channel", channelId: summary.channelId }, effectiveWorkspaceId, summary.summary);
+      } else if (summary.scopeKind === "owner" || summary.visibility === "private") {
+        add({ kind: "owner", ...(summary.scopeId ? { ownerId: summary.scopeId } : {}) }, effectiveWorkspaceId, summary.summary);
+      }
     }
+    for (const summary of result.summaries) {
+      const source = events.find((event) =>
+        event.source.conversationId === summary.conversationId &&
+        event.source.visibility === summary.visibility &&
+        (!summary.channelId || event.source.channelId === summary.channelId)
+      );
+      if (summary.visibility === "private") {
+        add(
+          { kind: "owner", ...(source?.source.principalId ? { ownerId: source.source.principalId } : {}) },
+          source?.source.workspaceId,
+          summary.summary,
+        );
+      } else {
+        const channelId = summary.channelId ?? source?.source.channelId;
+        if (channelId) add({ kind: "channel", channelId }, source?.source.workspaceId, summary.summary);
+      }
+    }
+    const owner = events.find((event) => event.source.visibility === "private");
     if (result.notes.trim()) {
-      const owner = events.find((event) => event.source.visibility === "private");
+      add(
+        { kind: "owner", ...(owner?.source.principalId ? { ownerId: owner.source.principalId } : {}) },
+        owner?.source.workspaceId,
+        result.notes,
+      );
+    }
+    const updatedAt = this.options.now().getTime();
+    for (const aggregate of aggregates.values()) {
       await this.options.contextClient.saveSummary({
-        workspaceId: owner?.source.workspaceId,
-        scope: { kind: "owner", ...(owner?.source.principalId ? { ownerId: owner.source.principalId } : {}) },
-        summary: result.notes.trim().slice(0, 8_000),
-        updatedAt: this.options.now().getTime(),
+        ...(aggregate.workspaceId ? { workspaceId: aggregate.workspaceId } : {}),
+        scope: aggregate.scope,
+        summary: aggregate.values.join("\n").slice(-8_000),
+        updatedAt,
       });
     }
     for (const task of result.wikiTasks) {
@@ -166,9 +216,10 @@ export class ContextMonitorRuntime {
       else await runWikiAgent({ task: task.task });
     }
     const destinations = this.options.ownerDestinations.filter((destination) => destination.visibility === "private");
+    const batchIdentity = events.map((event) => event.id).sort().join(",");
     for (const [index, notification] of result.notifications.entries()) {
       for (const destination of destinations) {
-        const id = deterministicId("monitor-notification", `${this.options.consumer}:${index}:${notification.text}:${destination.channelId}:${destination.threadId ?? ""}`);
+        const id = deterministicId("monitor-notification", `${this.options.consumer}:${batchIdentity}:${index}:${notification.text}:${destination.workspaceId ?? ""}:${destination.channelId}:${destination.threadId ?? ""}`);
         await this.options.contextClient.enqueueOutbound({
           id,
           workspaceId: destination.workspaceId,
@@ -182,7 +233,6 @@ export class ContextMonitorRuntime {
       }
     }
   }
-
   private armTimer(delay = this.options.intervalMs): void {
     if (!this.started || this.stopped) return;
     this.timer = setTimeout(() => {
@@ -224,7 +274,8 @@ export class ContextOutboundRuntime {
       : new Map((options.adapters as readonly ChannelAdapter[]).map((adapter: ChannelAdapter) => [adapter.id, adapter] as const));
   }
   async start(): Promise<void> {
-    if (this.started || this.stopped) return;
+    if (this.started) return;
+    this.stopped = false;
     this.started = true;
     this.armTimer();
     await this.drain();
@@ -261,7 +312,7 @@ export class ContextOutboundRuntime {
       }
       const adapter = this.adapters.get(row.destination.surface);
       if (!adapter) {
-        await this.complete(row, false, false, `No adapter registered for ${row.destination.surface}`);
+        await this.complete(row, false, true, `No adapter registered for ${row.destination.surface}`);
         continue;
       }
       let result;
@@ -309,40 +360,87 @@ export class ContextOutboundRuntime {
   }
 }
 
+type DiscordReplayClient = ContextCapabilityClient & Partial<Pick<ContextRuntimeClient, "claim" | "ack">>;
+
 export type DiscordContextRuntimeOptions = {
-  contextClient: ContextCapabilityClient;
+  contextClient: DiscordReplayClient;
   adapter: ChannelAdapter;
   bindings: readonly ChannelBinding[];
   conversation?: ContextConversationRunner;
   conversationDeps?: Omit<ContextConversationDeps, "conversation">;
   contextLimit?: number;
+  consumer?: string;
+  intervalMs?: number;
+  batchSize?: number;
+  leaseMs?: number;
   now?: () => Date;
 };
 
-/** Authorize Discord messages and process each origin conversation in order. */
+/** Authorize Discord messages, persist replies, and replay durable events in order. */
 export class DiscordContextRuntime {
-  private readonly options: Required<Pick<DiscordContextRuntimeOptions, "contextLimit" | "now">> & DiscordContextRuntimeOptions;
+  private readonly options: Required<Pick<DiscordContextRuntimeOptions, "contextLimit" | "consumer" | "intervalMs" | "batchSize" | "leaseMs" | "now">> & DiscordContextRuntimeOptions;
   private readonly tails = new Map<string, Promise<void>>();
   private readonly completed = new Set<string>();
   private started = false;
   private stopping = false;
+  private adapterStarted = false;
+  private replayTimer: Timer | undefined;
+  private replaying = false;
+  private activeReplay: Promise<void> | undefined;
   constructor(options: DiscordContextRuntimeOptions) {
-    this.options = { ...options, contextLimit: Math.min(200, Math.max(1, options.contextLimit ?? 50)), now: options.now ?? (() => new Date()) };
+    this.options = {
+      ...options,
+      contextLimit: Math.min(200, Math.max(1, options.contextLimit ?? 50)),
+      consumer: options.consumer ?? "os-discord-replay",
+      intervalMs: Math.max(250, options.intervalMs ?? DEFAULT_INTERVAL_MS),
+      batchSize: Math.min(100, Math.max(1, options.batchSize ?? 20)),
+      leaseMs: Math.min(86_400_000, Math.max(1_000, options.leaseMs ?? DEFAULT_LEASE_MS)),
+      now: options.now ?? (() => new Date()),
+    };
   }
   async start(): Promise<void> {
     if (this.started) return;
     this.stopping = false;
     this.started = true;
-    await this.options.adapter.start((message) => this.receive(message));
+    try {
+      await this.options.adapter.start((message) => this.receive(message));
+      this.adapterStarted = true;
+      this.armReplayTimer(0);
+      await this.replay();
+    } catch (error) {
+      this.started = false;
+      this.stopping = true;
+      clearTimeout(this.replayTimer);
+      this.replayTimer = undefined;
+      if (this.adapterStarted) {
+        this.adapterStarted = false;
+        await this.options.adapter.stop().catch(() => undefined);
+      }
+      throw error;
+    }
   }
-  async stop(): Promise<void> {
-    if (this.stopping) return;
+  async stopInbound(): Promise<void> {
+    if (this.stopping && !this.started) {
+      await this.activeReplay;
+      await Promise.allSettled(this.tails.values());
+      return;
+    }
     this.stopping = true;
-    const wasStarted = this.started;
     this.started = false;
+    clearTimeout(this.replayTimer);
+    this.replayTimer = undefined;
+    await this.activeReplay;
     await Promise.allSettled(this.tails.values());
     this.tails.clear();
-    if (wasStarted) await this.options.adapter.stop();
+  }
+  async stopAdapter(): Promise<void> {
+    if (!this.adapterStarted) return;
+    this.adapterStarted = false;
+    await this.options.adapter.stop();
+  }
+  async stop(): Promise<void> {
+    await this.stopInbound();
+    await this.stopAdapter();
   }
   async receive(message: InboundChannelMessage): Promise<void> {
     if (this.stopping) return;
@@ -375,41 +473,150 @@ export class DiscordContextRuntime {
       kind: "conversation_turn",
       occurredAt: message.occurredAt,
       source,
-      content: { text: message.text, prompt: message.text },
+      content: { text: message.text, prompt: message.text, resourceId: message.id },
     };
     await this.options.contextClient.append(inbound);
-    const scope = scopeRequest(message);
+    await this.processEvent(inbound, scopeRequest(message), message.destination, message.replyToId);
+  }
+  private async processEvent(
+    inbound: ContextEventRecord,
+    scope: ContextScopeRequest,
+    destination: ChannelDestination,
+    replyToId?: string,
+  ): Promise<void> {
+    const text = inbound.content.text ?? inbound.content.prompt ?? "";
     const compiled = await this.options.contextClient.compile({
       scope,
-      query: message.text.slice(0, 2_000),
+      query: text.slice(0, 2_000),
       limit: this.options.contextLimit,
     }) as ContextCompileResult;
-    const replyEventId = deterministicId("discord-turn", message.id);
-    if (this.completed.has(message.id) || compiled.events.some((event) => event.id === replyEventId)) {
-      this.completed.add(message.id);
-      return;
+    const originalId = typeof inbound.content.resourceId === "string" ? inbound.content.resourceId : inbound.id;
+    const replyEventId = deterministicId("discord-turn", originalId);
+    const priorReply = compiled.events.find((event) => event.id === replyEventId);
+    let reply = typeof priorReply?.content.assistant === "string"
+      ? priorReply.content.assistant
+      : typeof priorReply?.content.text === "string"
+        ? priorReply.content.text
+        : undefined;
+    if (!reply) {
+      reply = await runContextConversation({ text, compiledContext: compiled, now: this.options.now() }, {
+        ...(this.options.conversation ? { conversation: this.options.conversation } : {}),
+        ...this.options.conversationDeps,
+      });
+      await this.options.contextClient.append({
+        ...(inbound.workspaceId ? { workspaceId: inbound.workspaceId } : {}),
+        id: replyEventId,
+        kind: "agent_action",
+        occurredAt: this.options.now().getTime(),
+        source: inbound.source,
+        content: { text: reply, prompt: text, assistant: reply },
+      });
     }
-    const reply = await runContextConversation({ text: message.text, compiledContext: compiled, now: this.options.now() }, {
-      ...(this.options.conversation ? { conversation: this.options.conversation } : {}),
-      ...this.options.conversationDeps,
+    const outboundId = deterministicId("discord-reply", originalId);
+    await this.options.contextClient.enqueueOutbound({
+      ...(inbound.workspaceId ? { workspaceId: inbound.workspaceId } : {}),
+      id: outboundId,
+      destination: {
+        surface: "discord",
+        channelId: destination.channelId,
+        ...(destination.threadId ? { threadId: destination.threadId } : {}),
+      },
+      text: reply,
+      ...(replyToId ? { replyToId } : {}),
     });
-    const sent = await this.options.adapter.send(message.destination, { id: deterministicId("discord-reply", message.id), text: reply, replyToId: message.id });
-    if (!sent.ok) throw new Error(sent.error);
-    await this.options.contextClient.append({
-      ...(workspaceId ? { workspaceId } : {}),
-      id: replyEventId,
-      kind: "conversation_turn",
-      occurredAt: this.options.now().getTime(),
-      source,
-      content: { text: reply, prompt: message.text, assistant: reply },
+    this.completed.add(originalId);
+  }
+  private replayAllowed(event: ContextEventRecord): boolean {
+    return this.options.bindings.some((binding) => {
+      if (binding.workspaceId && event.source.workspaceId && binding.workspaceId !== event.source.workspaceId) return false;
+      if (event.source.visibility === "private") {
+        return binding.ownerId === event.source.principalId || (!binding.ownerId && !binding.channelId);
+      }
+      return Boolean(binding.channelId && binding.channelId === event.source.channelId);
     });
-    this.completed.add(message.id);
+  }
+  private async replay(): Promise<void> {
+    const client = this.options.contextClient;
+    if (!client.claim || !client.ack || this.replaying || this.stopping) return;
+    const claim = client.claim.bind(client);
+    const ack = client.ack.bind(client);
+    this.replaying = true;
+    const run = this.replayBatch(claim, ack).catch(() => {
+      // Leave the claim leased for replay after a transient failure.
+    });
+    this.activeReplay = run;
+    try {
+      await run;
+    } finally {
+      this.activeReplay = undefined;
+      this.replaying = false;
+    }
+  }
+  private async replayBatch(
+    claim: NonNullable<DiscordReplayClient["claim"]>,
+    ack: NonNullable<DiscordReplayClient["ack"]>,
+  ): Promise<void> {
+    for (const scope of replayScopes(this.options.bindings)) {
+      const claimed = await claim({
+        scope,
+        consumer: this.options.consumer,
+        limit: this.options.batchSize,
+        leaseMs: this.options.leaseMs,
+        surface: "discord",
+        kind: "conversation_turn",
+      });
+      for (const entry of claimed) {
+        if (!this.replayAllowed(entry.event) || (entry.event.kind === "conversation_turn" && entry.event.content.assistant !== undefined)) {
+          await ack({ consumer: this.options.consumer, eventIds: [entry.event.id], claimToken: entry.claimToken });
+          continue;
+        }
+        const destination: ChannelDestination = {
+          visibility: entry.event.source.visibility,
+          ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}),
+          channelId: entry.event.source.channelId ?? "",
+          ...(entry.event.source.threadId ? { threadId: entry.event.source.threadId } : {}),
+        };
+        if (!destination.channelId) continue;
+        const eventScope = entry.event.source.visibility === "private"
+          ? { kind: "owner" as const, ...(entry.event.source.principalId ? { ownerId: entry.event.source.principalId } : {}), ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}) }
+          : { kind: "channel" as const, channelId: destination.channelId, ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}) };
+        await this.processEvent(entry.event, eventScope, destination, typeof entry.event.content.resourceId === "string" ? entry.event.content.resourceId : undefined);
+        await ack({ consumer: this.options.consumer, eventIds: [entry.event.id], claimToken: entry.claimToken });
+      }
+    }
+  }
+  private armReplayTimer(delay = this.options.intervalMs): void {
+    if (!this.started || this.stopping) return;
+    this.replayTimer = setTimeout(() => {
+      this.replayTimer = undefined;
+      void this.replay().finally(() => this.armReplayTimer());
+    }, delay);
   }
 }
 
 export function createDiscordContextRuntime(options: DiscordContextRuntimeOptions): DiscordContextRuntime {
   return new DiscordContextRuntime(options);
 }
+function replayScopes(bindings: readonly ChannelBinding[]): ContextScopeRequest[] {
+  const scopes: ContextScopeRequest[] = [];
+  const seen = new Set<string>();
+  for (const binding of bindings) {
+    const scope: ContextScopeRequest = binding.ownerId
+      ? { kind: "owner", ownerId: binding.ownerId, ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}) }
+      : binding.channelId
+        ? { kind: "channel", channelId: binding.channelId, ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}) }
+        : binding.workspaceId
+          ? { kind: "workspace", workspaceId: binding.workspaceId }
+          : { kind: "owner" };
+    const key = `${scope.kind}:${scope.ownerId ?? ""}:${scope.workspaceId ?? ""}:${scope.channelId ?? ""}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      scopes.push(scope);
+    }
+  }
+  return scopes;
+}
+
 
 function scopeRequest(message: AuthorizedChannelMessage): ContextScopeRequest {
   const scope = message.authorization.contextScope;

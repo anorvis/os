@@ -134,6 +134,12 @@ describe("shared context capability", () => {
       workspaceId,
       consumer: "ack-consumer",
     });
+    await expect(client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "ack-consumer",
+      eventIds: ["ack-event", "ack-event"],
+      claimToken: claimed[0].claimToken,
+    })).rejects.toThrow("ack requires exactly one eventId");
     const result = await client.mutation(api.capability.context.ack, {
       workspaceId,
       consumer: "ack-consumer",
@@ -145,6 +151,55 @@ describe("shared context capability", () => {
       workspaceId,
       consumer: "ack-consumer",
     })).resolves.toEqual([]);
+  });
+
+  it("filters durable claims by surface and kind", async () => {
+    const { client, workspaceId } = await owner();
+    const discordTurn = {
+      ...event("discord-turn"),
+      source: { ...event("discord-turn").source, surface: "discord" as const },
+    };
+    const discordReply = {
+      ...event("discord-reply"),
+      kind: "agent_action" as const,
+      source: { ...event("discord-reply").source, surface: "discord" as const },
+    };
+    const webTurn = {
+      ...event("web-turn"),
+      source: { ...event("web-turn").source, surface: "web" as const },
+    };
+    await client.mutation(api.capability.context.append, { workspaceId, ...discordTurn });
+    await client.mutation(api.capability.context.append, { workspaceId, ...discordReply });
+    await client.mutation(api.capability.context.append, { workspaceId, ...webTurn });
+
+    const filtered = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "discord-responder",
+      surface: "discord",
+      kind: "conversation_turn",
+    });
+    expect(filtered.map((item) => item.event.id)).toEqual(["discord-turn"]);
+    await client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "discord-responder",
+      eventIds: ["discord-turn"],
+      claimToken: filtered[0].claimToken,
+    });
+    await expect(client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "discord-responder",
+      surface: "discord",
+      kind: "conversation_turn",
+    })).resolves.toEqual([]);
+
+    const monitor = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "context-monitor",
+      limit: 3,
+    });
+    expect(new Set(monitor.map((item) => item.event.id))).toEqual(
+      new Set(["discord-turn", "discord-reply", "web-turn"]),
+    );
   });
 
   it("rejects missing and stale event claim tokens", async () => {
@@ -202,6 +257,107 @@ describe("shared context capability", () => {
       limit: 2,
     });
     expect(listed.map((item) => item.id)).toEqual(["bounded-5", "bounded-4"]);
+  });
+
+  it("drains an append-ordered backlog without losing old-occurredAt appends", async () => {
+    vi.useFakeTimers();
+    const { t, client, workspaceId, userId } = await owner();
+    const total = 1_105;
+    const ids = Array.from({ length: total }, (_, index) => `drain-${index}`);
+    await t.run(async (ctx) => {
+      for (let index = 0; index < total; index += 1) {
+        await ctx.db.insert("contextEvents", {
+          id: ids[index],
+          workspaceId,
+          ownerId: userId,
+          kind: "conversation_turn",
+          occurredAt: index,
+          source: {
+            surface: "system",
+            principalId: String(userId),
+            conversationId: `drain-conversation-${index}`,
+            visibility: "private",
+            workspaceId: String(workspaceId),
+          },
+          content: { text: ids[index] },
+          createdAt: index + 1,
+        });
+      }
+    });
+
+    const first = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "drain-consumer",
+      limit: 1,
+      leaseMs: 1_000,
+    });
+    expect(first[0]?.event.id).toBe(ids[0]);
+    const second = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "drain-consumer",
+      limit: 1,
+      leaseMs: 1_000,
+    });
+    expect(second[0]?.event.id).toBe(ids[1]);
+    await client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "drain-consumer",
+      eventIds: [ids[1]],
+      claimToken: second[0].claimToken,
+    });
+    vi.advanceTimersByTime(1_001);
+    const retry = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "drain-consumer",
+      limit: 1,
+      leaseMs: 1_000,
+    });
+    expect(retry[0]?.event.id).toBe(ids[0]);
+    expect(retry[0]?.attempts).toBe(2);
+    await client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "drain-consumer",
+      eventIds: [ids[0]],
+      claimToken: retry[0].claimToken,
+    });
+
+    const claimedIds = new Set([ids[0], ids[1]]);
+    while (claimedIds.size < total) {
+      const batch = await client.mutation(api.capability.context.claim, {
+        workspaceId,
+        consumer: "drain-consumer",
+        limit: 50,
+        leaseMs: 1_000,
+      });
+      expect(batch.length).toBeGreaterThan(0);
+      for (const item of batch) {
+        claimedIds.add(item.event.id);
+        await client.mutation(api.capability.context.ack, {
+          workspaceId,
+          consumer: "drain-consumer",
+          eventIds: [item.event.id],
+          claimToken: item.claimToken,
+        });
+      }
+    }
+    expect(claimedIds).toEqual(new Set(ids));
+    await expect(client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "drain-consumer",
+      limit: 1,
+    })).resolves.toEqual([]);
+
+    await client.mutation(api.capability.context.append, {
+      workspaceId,
+      ...event("late-old-occurredAt"),
+      occurredAt: -1,
+    });
+    const late = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "drain-consumer",
+      limit: 1,
+    });
+    expect(late.map((item) => item.event.id)).toEqual(["late-old-occurredAt"]);
   });
 
   it("accepts legacy maintenance wiki-agent-run rows", async () => {
