@@ -1123,7 +1123,7 @@ const schema = defineSchema({
     .index("by_workspace_owner_status", ["workspaceId", "ownerId", "status"]),
   contextMonitorPlans: defineTable({
     workspaceId: v.id("workspaces"),
-    ownerId: v.optional(v.id("users")),
+    ownerId: v.id("users"),
     consumer: v.string(),
     planKey: v.string(),
     batchId: v.string(),
@@ -1140,8 +1140,8 @@ const schema = defineSchema({
     }),
     createdAt: v.number(),
   })
-    .index("by_workspace_consumer_plan", ["workspaceId", "consumer", "planKey"])
-    .index("by_workspace_consumer_batch", ["workspaceId", "consumer", "batchId"]),
+    .index("by_workspace_owner_plan", ["workspaceId", "ownerId", "consumer", "planKey"])
+    .index("by_workspace_owner_batch", ["workspaceId", "ownerId", "consumer", "batchId"]),
 });
 
 export default schema;

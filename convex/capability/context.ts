@@ -659,6 +659,7 @@ export const claim = mutation({
 async function cleanupMonitorPlanBatch(
   ctx: MutationCtx,
   workspaceId: Id<"workspaces">,
+  ownerId: Id<"users">,
   consumer: string,
   batchId: string,
 ): Promise<void> {
@@ -671,8 +672,8 @@ async function cleanupMonitorPlanBatch(
   if (claims.length === 0 || claims.some((claim) => claim.status !== "acked")) return;
   const plans = await ctx.db
     .query("contextMonitorPlans")
-    .withIndex("by_workspace_consumer_batch", (q) =>
-      q.eq("workspaceId", workspaceId).eq("consumer", consumer).eq("batchId", batchId),
+    .withIndex("by_workspace_owner_batch", (q) =>
+      q.eq("workspaceId", workspaceId).eq("ownerId", ownerId).eq("consumer", consumer).eq("batchId", batchId),
     )
     .take(CLAIM_SCAN_PAGE_SIZE);
   for (const plan of plans) await ctx.db.delete(plan._id);
@@ -707,8 +708,8 @@ export const getOrCreateMonitorPlan = mutation({
     const planKey = nonEmpty(args.planKey, "planKey");
     const existing = await ctx.db
       .query("contextMonitorPlans")
-      .withIndex("by_workspace_consumer_plan", (q) =>
-        q.eq("workspaceId", access.workspaceId).eq("consumer", consumer).eq("planKey", planKey),
+      .withIndex("by_workspace_owner_plan", (q) =>
+        q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("consumer", consumer).eq("planKey", planKey),
       )
       .unique();
     if (existing !== null) {
@@ -772,7 +773,7 @@ export const ack = mutation({
       }
     }
     if (batchId !== undefined) {
-      await cleanupMonitorPlanBatch(ctx, access.workspaceId, consumer, batchId);
+      await cleanupMonitorPlanBatch(ctx, access.workspaceId, access.userId, consumer, batchId);
     }
     const consumerRows = await ctx.db
       .query("contextConsumers")

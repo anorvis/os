@@ -588,7 +588,7 @@ describe("shared context capability", () => {
   });
 
   it("creates and replays a bounded Monitor plan within workspace scope", async () => {
-    const { t, client, workspaceId } = await owner("monitor-plan@example.test");
+    const { t, client, workspaceId, userId } = await owner("monitor-plan@example.test");
     const result = {
       summaries: [{ conversationId: "conversation", visibility: "private" as const, summary: "durable note" }],
       wikiTasks: [{ task: "curate this" }],
@@ -644,8 +644,8 @@ describe("shared context capability", () => {
       claimToken: cleanupClaim[0].claimToken,
     });
     await expect(t.run((ctx) => ctx.db.query("contextMonitorPlans")
-      .withIndex("by_workspace_consumer_plan", (q) =>
-        q.eq("workspaceId", workspaceId).eq("consumer", "cleanup-monitor").eq("planKey", "cleanup-plan"),
+      .withIndex("by_workspace_owner_plan", (q) =>
+        q.eq("workspaceId", workspaceId).eq("ownerId", userId).eq("consumer", "cleanup-monitor").eq("planKey", "cleanup-plan"),
       )
       .unique())).resolves.toBeNull();
 
@@ -656,6 +656,58 @@ describe("shared context capability", () => {
       planKey: "plan-2",
       result,
     })).rejects.toThrow("access to this workspace");
+  });
+
+  it("isolates Monitor plans between workspace members", async () => {
+    const { t, client, workspaceId, userId } = await owner("plan-owner@example.test");
+    const result = {
+      summaries: [],
+      wikiTasks: [{ task: "private owner task" }],
+      notifications: [],
+      notes: "owner notes",
+    };
+    await client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "member-batch",
+      planKey: "member-plan",
+      result,
+    });
+    const secondUser = await t.run((ctx) => ctx.db.insert("users", { email: "plan-member@example.test" }));
+    await t.run((ctx) => ctx.db.insert("workspaceMembers", {
+      workspaceId,
+      userId: secondUser,
+      role: "member",
+      createdAt: Date.now(),
+    }));
+    const member = t.withIdentity({ subject: secondUser });
+    // Same consumer + plan key: the member must not see the owner's plan.
+    await expect(member.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "member-batch",
+      planKey: "member-plan",
+    })).resolves.toEqual({ planKey: "member-plan", batchId: "member-batch", result: null });
+    const memberResult = { ...result, wikiTasks: [{ task: "member task" }], notes: "member notes" };
+    await expect(member.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "member-batch",
+      planKey: "member-plan",
+      result: memberResult,
+    })).resolves.toEqual({ planKey: "member-plan", batchId: "member-batch", result: memberResult });
+    // The owner's private plan is untouched and still replayed for the owner.
+    await expect(client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "member-batch",
+      planKey: "member-plan",
+    })).resolves.toEqual({ planKey: "member-plan", batchId: "member-batch", result });
+    await expect(t.run(async (ctx) => (await ctx.db.query("contextMonitorPlans")
+      .withIndex("by_workspace_owner_plan", (q) =>
+        q.eq("workspaceId", workspaceId).eq("ownerId", userId).eq("consumer", "os-monitor").eq("planKey", "member-plan"),
+      )
+      .unique())?.result)).resolves.toEqual(result);
   });
 
   it("claims and completes Monitor Wiki jobs exactly once", async () => {
