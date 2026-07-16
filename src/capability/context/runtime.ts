@@ -329,36 +329,36 @@ export class ContextMonitorRuntime {
     const claimJobs = this.options.contextClient.claimMonitorWikiEffects;
     const completeJob = this.options.contextClient.completeMonitorWikiEffect;
     if (typeof claimJobs !== "function" || typeof completeJob !== "function") return;
-    const jobs = await claimJobs.call(this.options.contextClient, {
-      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-      consumer: `${this.options.consumer}:wiki`,
-      limit: this.options.batchSize,
-      leaseMs: this.options.leaseMs,
-    });
-    for (const job of jobs) {
+    // Claim one job per iteration so an agent failure never strands other
+    // already-claimed jobs as running; only ledger mutations may throw.
+    for (let index = 0; index < this.options.batchSize; index += 1) {
+      const jobs = await claimJobs.call(this.options.contextClient, {
+        ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+        consumer: `${this.options.consumer}:wiki`,
+        limit: 1,
+        leaseMs: this.options.leaseMs,
+      });
+      const job = jobs[0];
+      if (!job) return;
+      let success = true;
+      let payload: string;
       try {
         const result = this.options.wikiAgent
           ? await this.options.wikiAgent(job.wikiTask)
           : await runWikiAgent({ task: job.wikiTask });
-        await completeJob.call(this.options.contextClient, {
-          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-          consumer: `${this.options.consumer}:wiki`,
-          effectKey: job.effectKey,
-          jobClaimToken: job.jobClaimToken,
-          success: true,
-          result: JSON.stringify(result).slice(-2_000),
-        });
+        payload = JSON.stringify(result).slice(-2_000);
       } catch (error) {
-        await completeJob.call(this.options.contextClient, {
-          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-          consumer: `${this.options.consumer}:wiki`,
-          effectKey: job.effectKey,
-          jobClaimToken: job.jobClaimToken,
-          success: false,
-          error: error instanceof Error ? error.message.slice(-2_000) : String(error).slice(-2_000),
-        });
-        throw error;
+        success = false;
+        payload = error instanceof Error ? error.message.slice(-2_000) : String(error).slice(-2_000);
       }
+      await completeJob.call(this.options.contextClient, {
+        ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+        consumer: `${this.options.consumer}:wiki`,
+        effectKey: job.effectKey,
+        jobClaimToken: job.jobClaimToken,
+        success,
+        ...(success ? { result: payload } : { error: payload }),
+      });
     }
   }
 
