@@ -20,7 +20,6 @@ describe("OS package surface after Convex cutover", () => {
     );
     expect(pkg.exports).toEqual({
       "./agent-process": "./src/core/agent/process.ts",
-      "./maintenance": "./src/capability/maintenance/index.ts",
       "./package.json": "./package.json",
     });
   });

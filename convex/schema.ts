@@ -59,6 +59,76 @@ const encryptedCredentials = v.optional(
     ciphertext: v.string(),
   }),
 );
+const contextEventKind = v.union(
+  v.literal("conversation_turn"),
+  v.literal("integration_update"),
+  v.literal("agent_action"),
+  v.literal("context_note"),
+);
+
+const contextSurface = v.union(
+  v.literal("pi"),
+  v.literal("discord"),
+  v.literal("web"),
+  v.literal("sms"),
+  v.literal("integration"),
+  v.literal("system"),
+);
+
+const contextVisibility = v.union(v.literal("private"), v.literal("shared"));
+
+const contextEventSource = v.object({
+  surface: contextSurface,
+  principalId: v.optional(v.string()),
+  conversationId: v.string(),
+  visibility: contextVisibility,
+  workspaceId: v.optional(v.string()),
+  channelId: v.optional(v.string()),
+  threadId: v.optional(v.string()),
+});
+
+const contextEventContent = v.object({
+  text: v.optional(v.string()),
+  prompt: v.optional(v.string()),
+  assistant: v.optional(v.any()),
+  toolResults: v.optional(v.any()),
+  resource: v.optional(v.string()),
+  resourceId: v.optional(v.string()),
+});
+
+const contextScope = v.object({
+  kind: v.union(v.literal("owner"), v.literal("workspace"), v.literal("channel")),
+  ownerId: v.optional(v.string()),
+  workspaceId: v.optional(v.id("workspaces")),
+  channelId: v.optional(v.string()),
+  scopeId: v.optional(v.string()),
+});
+
+const contextClaimStatus = v.union(
+  v.literal("claimed"),
+  v.literal("acked"),
+);
+
+const contextOutboundStatus = v.union(
+  v.literal("queued"),
+  v.literal("claimed"),
+  v.literal("completed"),
+  v.literal("failed"),
+);
+
+const contextAttachment = v.object({
+  id: v.string(),
+  name: v.string(),
+  mediaType: v.optional(v.string()),
+  url: v.optional(v.string()),
+});
+
+const contextDestination = v.object({
+  surface: contextSurface,
+  channelId: v.string(),
+  threadId: v.optional(v.string()),
+  conversationId: v.optional(v.string()),
+});
 
 const schema = defineSchema({
   ...authTables,
@@ -667,6 +737,7 @@ const schema = defineSchema({
       v.literal("archived"),
       v.literal("deleted"),
     ),
+    visibility: v.optional(contextVisibility),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
@@ -823,7 +894,6 @@ const schema = defineSchema({
       v.literal("research"),
       v.literal("compile"),
       v.literal("interaction_memory"),
-      v.literal("maintenance"),
     ),
     task: v.string(),
     status: jobStatus,
@@ -836,6 +906,94 @@ const schema = defineSchema({
   })
     .index("by_workspace_created", ["workspaceId", "createdAt"])
     .index("by_workspace_status", ["workspaceId", "status"]),
+
+  contextEvents: defineTable({
+    id: v.string(),
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    kind: contextEventKind,
+    occurredAt: v.number(),
+    source: contextEventSource,
+    content: contextEventContent,
+    createdAt: v.number(),
+  })
+    .index("by_id", ["id"])
+    .index("by_workspace_occurred", ["workspaceId", "occurredAt"]),
+
+  contextSummaries: defineTable({
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    scopeKind: v.union(
+      v.literal("owner"),
+      v.literal("workspace"),
+      v.literal("channel"),
+    ),
+    scopeId: v.string(),
+    visibility: contextVisibility,
+    channelId: v.optional(v.string()),
+    summary: v.string(),
+    updatedAt: v.number(),
+  })
+    .index("by_scope", ["workspaceId", "scopeKind", "scopeId"])
+    .index("by_workspace_updated", ["workspaceId", "updatedAt"])
+    .index("by_workspace_visibility_updated", [
+      "workspaceId",
+      "visibility",
+      "updatedAt",
+    ]),
+
+  contextConsumers: defineTable({
+    workspaceId: v.id("workspaces"),
+    consumer: v.string(),
+    cursor: v.number(),
+    updatedAt: v.number(),
+  }).index("by_workspace_consumer", ["workspaceId", "consumer"]),
+
+  contextEventClaims: defineTable({
+    workspaceId: v.id("workspaces"),
+    eventId: v.id("contextEvents"),
+    consumer: v.string(),
+    status: contextClaimStatus,
+    claimToken: v.string(),
+    leaseUntil: v.number(),
+    attempts: v.number(),
+    claimedAt: v.number(),
+    ackedAt: v.optional(v.number()),
+  })
+    .index("by_event_consumer", ["eventId", "consumer"])
+    .index("by_workspace_consumer", ["workspaceId", "consumer"])
+    .index("by_workspace_consumer_status", [
+      "workspaceId",
+      "consumer",
+      "status",
+    ]),
+
+  contextOutboundMessages: defineTable({
+    id: v.string(),
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    destination: contextDestination,
+    text: v.string(),
+    attachments: v.optional(v.array(contextAttachment)),
+    replyToId: v.optional(v.string()),
+    status: contextOutboundStatus,
+    attempts: v.number(),
+    nextAttemptAt: v.number(),
+    claimToken: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
+    claimedBy: v.optional(v.string()),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_id", ["id"])
+    .index("by_workspace_status_attempt", [
+      "workspaceId",
+      "status",
+      "nextAttemptAt",
+    ])
+    .index("by_workspace_created", ["workspaceId", "createdAt"]),
 });
 
 export default schema;

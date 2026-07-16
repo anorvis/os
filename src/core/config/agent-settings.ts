@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getHomeDir } from "../../paths";
 
-export type AgentKind = "wiki" | "tool";
+export type AgentKind = "wiki" | "tool" | "monitor";
 export const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -17,14 +17,17 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 const MODEL_ENV_BY_AGENT: Record<AgentKind, string> = {
   wiki: "ANORVIS_WIKI_AGENT_MODEL",
   tool: "ANORVIS_TOOL_AGENT_MODEL",
+  monitor: "ANORVIS_MONITOR_AGENT_MODEL",
 };
 const MODEL_FIELD_BY_AGENT: Record<AgentKind, string> = {
   wiki: "wikiModel",
   tool: "toolModel",
+  monitor: "monitorModel",
 };
 const THINKING_FIELD_BY_AGENT: Record<AgentKind, string> = {
   wiki: "wikiThinking",
   tool: "toolThinking",
+  monitor: "monitorThinking",
 };
 
 export function resolveAgentModel(

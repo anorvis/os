@@ -8,30 +8,40 @@ import { createServiceRegistry } from "../../core/service/service";
 import { runWikiAgent } from "../../llm-wiki";
 import { getHomeDir } from "../../paths";
 import { serviceFactories } from "../../registry";
-import type { MaintenanceSessionRoots } from "../../capability/maintenance";
+import type { ContextCapabilityClient } from "../../capability/context/client";
+import { createContextClient, hasConvexConfiguration } from "../../capability/context/client";
+import { ContextGatewayRuntime } from "../../capability/context/gateway-runtime";
+import { ContextMonitorRuntime, ContextOutboundRuntime, type ContextRuntimeClient } from "../../capability/context/runtime";
+import { DiscordContextRuntime } from "../../capability/context/runtime";
+import { DiscordChannelAdapter, parseDiscordConfig, type DiscordConfig } from "../channel/discord";
+import type { ChannelBinding } from "../channel/authorization";
 
-type CreateServerOptions = {
+export type CreateServerOptions = {
   port?: number;
   hostname?: string;
+  contextClient?: ContextCapabilityClient;
+  runtime?: ContextGatewayRuntime;
+  startRuntime?: boolean;
 };
 export type CreateAppOptions = {
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
   config?: LocalAuthorityConfig;
-  maintenanceRoot?: string;
-  maintenanceSessionRoots?: MaintenanceSessionRoots;
+  contextClient?: ContextCapabilityClient;
+  runtime?: ContextGatewayRuntime;
 };
 
 export type App = {
   fetch(request: Request): Promise<Response>;
   request(input: string | Request, init?: RequestInit): Promise<Response>;
+  start(): Promise<void>;
+  stop(): Promise<void>;
 };
 
 type AppServiceContext = {
   config: LocalAuthorityConfig;
   now(): Date;
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
-  maintenanceRoot?: string;
-  maintenanceSessionRoots?: MaintenanceSessionRoots;
+  contextClient?: ContextCapabilityClient;
   serviceIds?: () => string[];
 };
 
@@ -42,8 +52,7 @@ export function createApp(options: CreateAppOptions = {}): App {
     config,
     now: () => new Date(),
     wikiAgent: options.wikiAgent,
-    maintenanceRoot: options.maintenanceRoot,
-    maintenanceSessionRoots: options.maintenanceSessionRoots,
+    contextClient: options.contextClient,
     serviceIds: () => serviceIds,
   };
   const registry = createServiceRegistry(context, serviceFactories);
@@ -52,28 +61,24 @@ export function createApp(options: CreateAppOptions = {}): App {
   const app = new Hono();
   app.use("*", cors());
   app.onError((error) => json({ error: error instanceof Error ? error.message : String(error) }, 500));
-
   app.get("/health", () => json({ ok: true }));
   app.post("/v1/auth/handshake", (c) => authHandshake(c.req.raw));
-
   app.use("*", async (c, next) => {
     const unauthorized = authorize(c.req.raw, new URL(c.req.url), config);
     if (unauthorized) return unauthorized;
     await next();
   });
-
   for (const register of registry.routes) register(app);
-
   app.notFound(() => json({ error: "not_found" }, 404));
-
   const fetch = (request: Request): Promise<Response> => Promise.resolve(app.fetch(request));
-
   return {
     fetch,
     request(input, init) {
       const request = typeof input === "string" ? new Request(`http://127.0.0.1${input}`, init) : input;
       return fetch(request);
     },
+    start: async () => options.runtime?.start(),
+    stop: async () => options.runtime?.stop(),
   };
 }
 
@@ -81,14 +86,85 @@ export function createServer(options: CreateServerOptions = {}) {
   const config = readLocalAuthorityConfig();
   const port = options.port ?? config.port;
   const hostname = options.hostname ?? config.bindHost;
-  const app = createApp({ config });
+  const contextClient = options.contextClient ?? (hasConvexConfiguration() ? createContextClient() : undefined);
+  const runtime = options.runtime ?? createConfiguredRuntime(contextClient);
+  const app = createApp({ config, contextClient, runtime });
   const server = Bun.serve({
     port,
     hostname,
     idleTimeout: 120,
     fetch: (request) => app.fetch(request),
   });
-  return { app, server };
+  const ready = options.startRuntime === false ? Promise.resolve() : app.start().catch(() => undefined);
+  const stop = async () => {
+    await app.stop();
+    await server.stop();
+  };
+  return { app, server, ready, stop };
+}
+
+
+function createConfiguredRuntime(client: ContextCapabilityClient | undefined): ContextGatewayRuntime | undefined {
+  if (!client || typeof client.claim !== "function" || typeof client.ack !== "function" || typeof client.saveSummary !== "function" || typeof client.claimOutbound !== "function" || typeof client.completeOutbound !== "function") return undefined;
+  const richClient = client as ContextRuntimeClient;
+  let discord: DiscordContextRuntime | undefined;
+  let discordAdapter: DiscordChannelAdapter | undefined;
+  let discordConfig: DiscordConfig | undefined;
+  const botToken = process.env.ANORVIS_DISCORD_BOT_TOKEN?.trim() || process.env.DISCORD_BOT_TOKEN?.trim();
+  if (botToken) {
+    try {
+      discordConfig = parseDiscordConfig();
+      discordAdapter = new DiscordChannelAdapter(discordConfig);
+      discord = new DiscordContextRuntime({
+        contextClient: client,
+        adapter: discordAdapter,
+        bindings: discordBindings(discordConfig),
+      });
+    } catch {
+      // Invalid optional Discord configuration must not take down the gateway.
+    }
+  }
+  const ownerDestinations = discordConfig?.privateHomeRoute
+    ? [{
+        visibility: "private" as const,
+        surface: "discord" as const,
+        channelId: discordConfig.privateHomeRoute.channelId,
+        ...(discordConfig.privateHomeRoute.threadId ? { threadId: discordConfig.privateHomeRoute.threadId } : {}),
+      }]
+    : [];
+  const monitor = new ContextMonitorRuntime({
+    contextClient: richClient,
+    ownerDestinations,
+  });
+  const outbound = new ContextOutboundRuntime({
+    contextClient: richClient,
+    adapters: discordAdapter ? [discordAdapter] : [],
+  });
+  return new ContextGatewayRuntime({ monitor, outbound, discord });
+}
+
+function discordBindings(config: DiscordConfig): ChannelBinding[] {
+  const accountId = config.accountId ?? "";
+  const configured = config.bindings.map((binding) => ({
+    identity: {
+      provider: "discord" as const,
+      accountId: binding.accountId ?? accountId,
+      userId: binding.userId,
+    },
+    principalId: binding.principalId ?? binding.ownerId ?? binding.userId,
+    ...(binding.ownerId ? { ownerId: binding.ownerId } : config.ownerUserId ? { ownerId: config.ownerUserId } : {}),
+    ...(binding.scopeId ? { scopeId: binding.scopeId } : {}),
+    ...(binding.channelId ? { channelId: binding.channelId } : {}),
+    ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
+  }));
+  for (const userId of config.allowedUserIds) {
+    configured.push({
+      identity: { provider: "discord" as const, accountId, userId },
+      principalId: userId,
+      ...(config.ownerUserId ? { ownerId: config.ownerUserId } : {}),
+    });
+  }
+  return configured;
 }
 
 async function authHandshake(request: Request): Promise<Response> {
