@@ -27,6 +27,15 @@ export const ContextEventSourceSchema = Schema.Struct({
   channelId: Schema.optional(Schema.NonEmptyString),
   threadId: Schema.optional(Schema.NonEmptyString),
 });
+export const ContextEventAttachmentSchema = Schema.Struct({
+  id: Schema.NonEmptyString,
+  name: Schema.NonEmptyString,
+  mediaType: Schema.optional(Schema.String),
+  url: Schema.optional(Schema.String),
+});
+
+export type ContextEventAttachment = typeof ContextEventAttachmentSchema.Type;
+
 
 export const ContextEventContentSchema = Schema.Struct({
   text: Schema.optional(Schema.String),
@@ -35,6 +44,7 @@ export const ContextEventContentSchema = Schema.Struct({
   toolResults: Schema.optional(Schema.Unknown),
   resource: Schema.optional(Schema.NonEmptyString),
   resourceId: Schema.optional(Schema.NonEmptyString),
+  attachments: Schema.optional(Schema.Array(ContextEventAttachmentSchema)),
 });
 
 export const ContextEventInputSchema = Schema.Struct({

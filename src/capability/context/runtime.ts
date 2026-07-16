@@ -5,15 +5,22 @@ import type {
   ContextAckRequest,
   ContextAppendRequest,
   ContextCapabilityClient,
+  ContextClaimMonitorWikiEffectsRequest,
+  ContextClaimFence,
   ContextClaimOutboundRequest,
   ContextClaimRequest,
   ContextClaimedEvent,
   ContextCompileResult,
+  ContextCompleteMonitorWikiEffectRequest,
   ContextCompleteOutboundRequest,
   ContextEventRecord,
+  ContextMonitorWikiJob,
+  ContextMonitorEffectRequest,
+  ContextMonitorEffectResult,
   ContextOutboundRecord,
-  ContextSummaryRequest,
+  ContextRenewClaimRequest,
   ContextScopeRequest,
+  ContextSummaryRequest,
 } from "./client";
 import { runContextConversation, type ContextConversationDeps, type ContextConversationRunner } from "./conversation";
 import { authorizeChannelMessage, type ChannelBinding } from "../../platform/channel/authorization";
@@ -34,12 +41,19 @@ export type ContextRuntimeClient = ContextCapabilityClient & {
     status: "completed" | "queued" | "failed";
     attempts: number;
   }>;
+  renewClaim(input: ContextRenewClaimRequest): Promise<{
+    claims: readonly ContextClaimFence[];
+    leaseUntil: number;
+  }>;
+  claimMonitorWikiEffects(input: ContextClaimMonitorWikiEffectsRequest): Promise<readonly ContextMonitorWikiJob[]>;
+  completeMonitorWikiEffect(input: ContextCompleteMonitorWikiEffectRequest): Promise<ContextMonitorEffectResult>;
+  commitMonitorEffect(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
 };
 
 type Timer = ReturnType<typeof setTimeout>;
 const DEFAULT_INTERVAL_MS = 15_000;
 const DEFAULT_BATCH_SIZE = 50;
-const DEFAULT_LEASE_MS = 120_000;
+const DEFAULT_LEASE_MS = 300_000;
 
 export type OwnerNotificationDestination = ChannelDestination & {
   surface: "pi" | "discord" | "web" | "sms" | "integration" | "system";
@@ -48,6 +62,7 @@ export type OwnerNotificationDestination = ChannelDestination & {
 export type ContextMonitorRuntimeOptions = {
   contextClient: ContextRuntimeClient;
   consumer?: string;
+  workspaceId?: string;
   intervalMs?: number;
   batchSize?: number;
   leaseMs?: number;
@@ -57,7 +72,16 @@ export type ContextMonitorRuntimeOptions = {
   now?: () => Date;
 };
 
-/** Drain owner-private context without allowing a failed batch to be acked. */
+type MonitorPartition = {
+  key: string;
+  visibility: "private" | "shared";
+  workspaceId?: string;
+  scope: ContextScopeRequest;
+  claimed: readonly ContextClaimedEvent[];
+  priorSummaries: ContextCompileResult["summaries"];
+};
+
+/** Drain context through one isolated Monitor invocation per durable output scope. */
 export class ContextMonitorRuntime {
   private readonly options: Required<Pick<ContextMonitorRuntimeOptions, "consumer" | "intervalMs" | "batchSize" | "leaseMs" | "ownerDestinations" | "now">> & ContextMonitorRuntimeOptions;
   private timer: Timer | undefined;
@@ -82,8 +106,15 @@ export class ContextMonitorRuntime {
     if (this.started) return;
     this.stopped = false;
     this.started = true;
-    this.armTimer();
-    await this.drain();
+    try {
+      await this.drainWikiEffects();
+      await this.drain();
+      this.armTimer();
+    } catch (error) {
+      this.started = false;
+      this.stopped = true;
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -104,7 +135,7 @@ export class ContextMonitorRuntime {
     if (this.draining || this.stopped) return;
     this.draining = true;
     const run = this.drainBatch().catch(() => {
-      // Leases intentionally remain claimable when any durable effect fails.
+      // A failed fenced effect leaves every claim retryable.
     });
     this.active = run;
     try {
@@ -117,122 +148,258 @@ export class ContextMonitorRuntime {
 
   private async drainBatch(): Promise<void> {
     const claimed = await this.options.contextClient.claim({
+      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
       scope: { kind: "owner" },
       consumer: this.options.consumer,
       limit: this.options.batchSize,
       leaseMs: this.options.leaseMs,
     });
     if (!claimed.length) return;
-    const events = claimed.map((entry) => entry.event);
-    const priorSummaries = await this.loadPriorSummaries();
-    const priorNotes = priorSummaries.map((summary) => summary.summary.trim()).filter(Boolean).join("\n").slice(-8_000);
-    const result = await runMonitorAgent(
-      { events, priorNotes, signal: undefined },
-      this.options.monitorAgent ? { monitorAgent: this.options.monitorAgent, now: this.options.now() } : { now: this.options.now() },
-    );
-    if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
-    await this.persistResult(result, events, priorSummaries);
-    for (const entry of claimed) {
-      await this.options.contextClient.ack({
-        consumer: this.options.consumer,
-        eventIds: [entry.event.id],
-        claimToken: entry.claimToken,
-      });
+    const partitions = this.partitionClaims(claimed);
+    for (const partition of partitions) {
+      partition.priorSummaries = await this.loadPriorSummaries(partition);
+      const events = partition.claimed.map((entry) => entry.event);
+      const priorNotes = partition.priorSummaries
+        .map((summary) => summary.summary.trim())
+        .filter(Boolean)
+        .join("\n")
+        .slice(-8_000);
+      const result = await runMonitorAgent(
+        { events, priorNotes, signal: undefined },
+        this.options.monitorAgent
+          ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+          : { now: this.options.now() },
+      );
+      if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
+      await this.persistResult(result, partition);
     }
-  }
-  private async loadPriorSummaries(): Promise<ContextCompileResult["summaries"]> {
-    const compiled = await this.options.contextClient.compile({
-      scope: { kind: "owner" },
-      limit: this.options.batchSize,
-    }) as ContextCompileResult;
-    return compiled.summaries;
+    await this.drainWikiEffects();
+    for (const partition of partitions) {
+      const claims = await this.renew(partition);
+      for (const entry of partition.claimed) {
+        const claim = claims.find((item) => item.eventId === entry.event.id);
+        await this.options.contextClient.ack({
+          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+          consumer: this.options.consumer,
+          eventIds: [entry.event.id],
+          claimToken: claim?.claimToken ?? entry.claimToken,
+        });
+      }
+    }
   }
 
-  private async persistResult(
-    result: MonitorResult,
-    events: readonly ContextEventRecord[],
-    priorSummaries: Readonly<ContextCompileResult["summaries"]>,
-  ): Promise<void> {
-    const aggregates = new Map<string, { workspaceId?: string; scope: ContextScopeRequest; values: string[] }>();
-    const effectiveWorkspaceId = events.find((event) => event.source.workspaceId)?.source.workspaceId;
-    const add = (scope: ContextScopeRequest, workspaceId: string | undefined, value: string): void => {
-      const text = value.trim();
-      if (!text) return;
-      const effectiveWorkspace = workspaceId ?? effectiveWorkspaceId;
-      const key = `${scope.kind}:${effectiveWorkspace ?? ""}:${scope.channelId ?? ""}`;
-      const prior = aggregates.get(key);
+  private partitionClaims(claimed: readonly ContextClaimedEvent[]): MonitorPartition[] {
+    const partitions = new Map<string, MonitorPartition>();
+    for (const entry of claimed) {
+      const event = entry.event;
+      const eventWorkspaceId = event.workspaceId ?? event.source.workspaceId;
+      if (this.options.workspaceId && eventWorkspaceId && eventWorkspaceId !== this.options.workspaceId) {
+        throw new Error("Monitor claim belongs to a different workspace.");
+      }
+      const workspaceId = eventWorkspaceId ?? this.options.workspaceId;
+      const ownerId = event.ownerId ?? event.source.principalId;
+      const channelId = event.source.channelId;
+      const visibility = event.source.visibility;
+      const scope: ContextScopeRequest = visibility === "private"
+        ? { kind: "owner", ...(ownerId ? { ownerId } : {}) }
+        : channelId
+          ? { kind: "channel", channelId }
+          : { kind: "workspace" };
+      const scopeId = scope.kind === "owner"
+        ? (scope.ownerId ?? "")
+        : scope.kind === "channel"
+          ? (scope.channelId ?? "")
+          : "";
+      const key = `${visibility}:${scope.kind}:${workspaceId ?? ""}:${scopeId}`;
+      const prior = partitions.get(key);
       if (prior) {
-        if (scope.kind === "owner" && !prior.scope.ownerId && scope.ownerId) {
-          prior.scope = { ...prior.scope, ownerId: scope.ownerId };
-        }
-        if (!prior.values.includes(text)) prior.values.push(text);
-      } else {
-        aggregates.set(key, { scope, ...(effectiveWorkspace ? { workspaceId: effectiveWorkspace } : {}), values: [text] });
+        (prior.claimed as ContextClaimedEvent[]).push(entry);
+        continue;
       }
-    };
-    for (const summary of priorSummaries) {
-      if (summary.scopeKind === "channel" && summary.channelId) {
-        add({ kind: "channel", channelId: summary.channelId }, effectiveWorkspaceId, summary.summary);
-      } else if (summary.scopeKind === "owner" || summary.visibility === "private") {
-        add({ kind: "owner", ...(summary.scopeId ? { ownerId: summary.scopeId } : {}) }, effectiveWorkspaceId, summary.summary);
-      }
-    }
-    for (const summary of result.summaries) {
-      const source = events.find((event) =>
-        event.source.conversationId === summary.conversationId &&
-        event.source.visibility === summary.visibility &&
-        (!summary.channelId || event.source.channelId === summary.channelId)
-      );
-      if (summary.visibility === "private") {
-        add(
-          { kind: "owner", ...(source?.source.principalId ? { ownerId: source.source.principalId } : {}) },
-          source?.source.workspaceId,
-          summary.summary,
-        );
-      } else {
-        const channelId = summary.channelId ?? source?.source.channelId;
-        if (channelId) add({ kind: "channel", channelId }, source?.source.workspaceId, summary.summary);
-      }
-    }
-    const owner = events.find((event) => event.source.visibility === "private");
-    if (result.notes.trim()) {
-      add(
-        { kind: "owner", ...(owner?.source.principalId ? { ownerId: owner.source.principalId } : {}) },
-        owner?.source.workspaceId,
-        result.notes,
-      );
-    }
-    const updatedAt = this.options.now().getTime();
-    for (const aggregate of aggregates.values()) {
-      await this.options.contextClient.saveSummary({
-        ...(aggregate.workspaceId ? { workspaceId: aggregate.workspaceId } : {}),
-        scope: aggregate.scope,
-        summary: aggregate.values.join("\n").slice(-8_000),
-        updatedAt,
+      partitions.set(key, {
+        key,
+        visibility,
+        ...(workspaceId ? { workspaceId } : {}),
+        scope,
+        claimed: [entry],
+        priorSummaries: [],
       });
     }
-    for (const task of result.wikiTasks) {
-      if (this.options.wikiAgent) await this.options.wikiAgent(task.task);
-      else await runWikiAgent({ task: task.task });
+    return [...partitions.values()];
+  }
+
+  private async loadPriorSummaries(partition: MonitorPartition): Promise<ContextCompileResult["summaries"]> {
+    const compiled = await this.options.contextClient.compile({
+      ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+      scope: partition.scope,
+      limit: 200,
+    }) as ContextCompileResult;
+    return compiled.summaries.filter((summary) => {
+      if (partition.visibility === "private") {
+        return summary.visibility === "private"
+          && (partition.scope.ownerId === undefined || summary.scopeId === partition.scope.ownerId);
+      }
+      if (partition.scope.kind === "channel") {
+        return summary.visibility === "shared" && summary.channelId === partition.scope.channelId;
+      }
+      return summary.visibility === "shared" && !summary.channelId;
+    });
+  }
+
+  private async renew(partition: MonitorPartition): Promise<readonly ContextClaimFence[]> {
+    const claims = partition.claimed.map((entry) => ({ eventId: entry.event.id, claimToken: entry.claimToken }));
+    const renew = this.options.contextClient.renewClaim;
+    if (typeof renew === "function") {
+      const renewed = await renew.call(this.options.contextClient, {
+        ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+        consumer: this.options.consumer,
+        claims,
+        leaseMs: this.options.leaseMs,
+      });
+      return renewed.claims;
+    }
+    return claims;
+  }
+
+  private async commitEffect(request: ContextMonitorEffectRequest, partition: MonitorPartition): Promise<ContextMonitorEffectResult> {
+    const claims = await this.renew(partition);
+    const fenced = { ...request, claims };
+    const commit = this.options.contextClient.commitMonitorEffect;
+    if (typeof commit === "function") return commit.call(this.options.contextClient, fenced);
+    return { effectKey: request.effectKey, status: "completed" };
+  }
+  private async drainWikiEffects(): Promise<void> {
+    const claimJobs = this.options.contextClient.claimMonitorWikiEffects;
+    const completeJob = this.options.contextClient.completeMonitorWikiEffect;
+    if (typeof claimJobs !== "function" || typeof completeJob !== "function") return;
+    const jobs = await claimJobs.call(this.options.contextClient, {
+      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+      consumer: `${this.options.consumer}:wiki`,
+      limit: this.options.batchSize,
+      leaseMs: this.options.leaseMs,
+    });
+    for (const job of jobs) {
+      try {
+        const result = this.options.wikiAgent
+          ? await this.options.wikiAgent(job.wikiTask)
+          : await runWikiAgent({ task: job.wikiTask });
+        await completeJob.call(this.options.contextClient, {
+          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+          consumer: `${this.options.consumer}:wiki`,
+          effectKey: job.effectKey,
+          jobClaimToken: job.jobClaimToken,
+          success: true,
+          result: JSON.stringify(result).slice(-2_000),
+        });
+      } catch (error) {
+        await completeJob.call(this.options.contextClient, {
+          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+          consumer: `${this.options.consumer}:wiki`,
+          effectKey: job.effectKey,
+          jobClaimToken: job.jobClaimToken,
+          success: false,
+          error: error instanceof Error ? error.message.slice(-2_000) : String(error).slice(-2_000),
+        });
+        throw error;
+      }
+    }
+  }
+
+  private async persistResult(result: MonitorResult, partition: MonitorPartition): Promise<void> {
+    const events = partition.claimed.map((entry) => entry.event);
+    const eventIds = events.map((event) => event.id).sort().join(",");
+    const values = partition.priorSummaries
+      .map((summary) => summary.summary.trim())
+      .filter(Boolean);
+    const conversations = new Set(events.map((event) => event.source.conversationId));
+    for (const summary of result.summaries) {
+      if (summary.visibility !== partition.visibility || !conversations.has(summary.conversationId)) continue;
+      if (partition.scope.kind === "channel" && summary.channelId !== partition.scope.channelId) continue;
+      if (partition.visibility === "shared" && partition.scope.kind !== "channel" && summary.channelId) continue;
+      if (!values.includes(summary.summary.trim())) values.push(summary.summary.trim());
+    }
+    if (result.notes.trim() && !values.includes(result.notes.trim())) values.push(result.notes.trim());
+    const summary = values.filter(Boolean).join("\n").slice(-8_000);
+    if (summary) {
+      const effectKey = deterministicId("monitor-summary", `${this.options.consumer}:${eventIds}:${partition.key}:summary`);
+      const request: ContextMonitorEffectRequest = {
+        ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+        consumer: this.options.consumer,
+        effectKey,
+        kind: "summary",
+        claims: [],
+        scope: partition.scope,
+        summary,
+      };
+      if (typeof this.options.contextClient.commitMonitorEffect === "function") {
+        await this.commitEffect(request, partition);
+      } else {
+        await this.options.contextClient.saveSummary({
+          ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+          scope: partition.scope,
+          summary,
+          updatedAt: this.options.now().getTime(),
+        });
+      }
+    }
+    for (const [index, task] of result.wikiTasks.entries()) {
+      const effectKey = deterministicId("monitor-wiki", `${this.options.consumer}:${eventIds}:${partition.key}:${index}`);
+      const request: ContextMonitorEffectRequest = {
+        ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+        consumer: this.options.consumer,
+        effectKey,
+        kind: "wiki",
+        claims: [],
+        scope: partition.scope,
+        wikiTask: task.task,
+      };
+      const hasWikiJobs = typeof this.options.contextClient.claimMonitorWikiEffects === "function"
+        && typeof this.options.contextClient.completeMonitorWikiEffect === "function";
+      if (typeof this.options.contextClient.commitMonitorEffect === "function" && hasWikiJobs) {
+        await this.commitEffect(request, partition);
+      } else if (this.options.wikiAgent) {
+        await this.renew(partition);
+        await this.options.wikiAgent(task.task);
+      } else {
+        await this.renew(partition);
+        await runWikiAgent({ task: task.task });
+      }
     }
     const destinations = this.options.ownerDestinations.filter((destination) => destination.visibility === "private");
-    const batchIdentity = events.map((event) => event.id).sort().join(",");
     for (const [index, notification] of result.notifications.entries()) {
       for (const destination of destinations) {
-        const id = deterministicId("monitor-notification", `${this.options.consumer}:${batchIdentity}:${index}:${notification.text}:${destination.workspaceId ?? ""}:${destination.channelId}:${destination.threadId ?? ""}`);
-        await this.options.contextClient.enqueueOutbound({
-          id,
-          workspaceId: destination.workspaceId,
+        const effectKey = deterministicId("monitor-notification", `${this.options.consumer}:${eventIds}:${partition.key}:${index}:${destination.workspaceId ?? ""}:${destination.channelId}:${destination.threadId ?? ""}`);
+        const outbound = {
           destination: {
             surface: destination.surface,
             channelId: destination.channelId,
             ...(destination.threadId ? { threadId: destination.threadId } : {}),
           },
           text: notification.text,
-        });
+        };
+        const request: ContextMonitorEffectRequest = {
+          ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+          consumer: this.options.consumer,
+          effectKey,
+          kind: "notification",
+          claims: [],
+          scope: partition.scope,
+          notification: outbound,
+        };
+        if (typeof this.options.contextClient.commitMonitorEffect === "function") {
+          await this.commitEffect(request, partition);
+        } else {
+          await this.renew(partition);
+          await this.options.contextClient.enqueueOutbound({
+            id: effectKey,
+            ...(destination.workspaceId ? { workspaceId: destination.workspaceId } : {}),
+            ...outbound,
+          });
+        }
       }
     }
   }
+
   private armTimer(delay = this.options.intervalMs): void {
     if (!this.started || this.stopped) return;
     this.timer = setTimeout(() => {
@@ -245,6 +412,7 @@ export class ContextMonitorRuntime {
 export type OutboundRuntimeOptions = {
   contextClient: ContextRuntimeClient;
   adapters: readonly ChannelAdapter[] | ReadonlyMap<string, ChannelAdapter>;
+  workspaceId?: string;
   consumer?: string;
   intervalMs?: number;
   batchSize?: number;
@@ -302,8 +470,16 @@ export class ContextOutboundRuntime {
     }
   }
   private async drainBatch(): Promise<void> {
-    const rows = await this.options.contextClient.claimOutbound({ consumer: this.options.consumer, limit: this.options.batchSize, leaseMs: this.options.leaseMs });
+    const rows = await this.options.contextClient.claimOutbound({
+      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+      consumer: this.options.consumer,
+      limit: this.options.batchSize,
+      leaseMs: this.options.leaseMs,
+    });
     for (const row of rows) {
+      if (this.options.workspaceId && row.workspaceId !== this.options.workspaceId) {
+        throw new Error("Outbound claim workspace mismatch");
+      }
       const knownProviderResult = this.providerResults.get(row.id);
       if (knownProviderResult) {
         await this.complete(row, true, false);
@@ -343,6 +519,7 @@ export class ContextOutboundRuntime {
   }
   private async complete(row: ContextOutboundRecord, success: boolean, retryable: boolean, error?: string): Promise<void> {
     await this.options.contextClient.completeOutbound({
+      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
       id: row.id,
       consumer: this.options.consumer,
       claimToken: row.claimToken,
@@ -380,7 +557,6 @@ export type DiscordContextRuntimeOptions = {
 export class DiscordContextRuntime {
   private readonly options: Required<Pick<DiscordContextRuntimeOptions, "contextLimit" | "consumer" | "intervalMs" | "batchSize" | "leaseMs" | "now">> & DiscordContextRuntimeOptions;
   private readonly tails = new Map<string, Promise<void>>();
-  private readonly completed = new Set<string>();
   private started = false;
   private stopping = false;
   private adapterStarted = false;
@@ -467,13 +643,19 @@ export class DiscordContextRuntime {
       ...(message.destination.channelId ? { channelId: message.destination.channelId } : {}),
       ...(message.destination.threadId ? { threadId: message.destination.threadId } : {}),
     };
+    const attachments = boundAttachments(message.attachments);
     const inbound: ContextAppendRequest = {
       ...(workspaceId ? { workspaceId } : {}),
       id: deterministicId("discord-event", message.id),
       kind: "conversation_turn",
       occurredAt: message.occurredAt,
       source,
-      content: { text: message.text, prompt: message.text, resourceId: message.id },
+      content: {
+        text: message.text,
+        prompt: message.text,
+        resourceId: message.id,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      },
     };
     await this.options.contextClient.append(inbound);
     await this.processEvent(inbound, scopeRequest(message), message.destination, message.replyToId);
@@ -485,9 +667,10 @@ export class DiscordContextRuntime {
     replyToId?: string,
   ): Promise<void> {
     const text = inbound.content.text ?? inbound.content.prompt ?? "";
+    const modelText = contextModelText(text, inbound.content.attachments);
     const compiled = await this.options.contextClient.compile({
       scope,
-      query: text.slice(0, 2_000),
+      query: modelText.slice(0, 2_000),
       limit: this.options.contextLimit,
     }) as ContextCompileResult;
     const originalId = typeof inbound.content.resourceId === "string" ? inbound.content.resourceId : inbound.id;
@@ -499,7 +682,7 @@ export class DiscordContextRuntime {
         ? priorReply.content.text
         : undefined;
     if (!reply) {
-      reply = await runContextConversation({ text, compiledContext: compiled, now: this.options.now() }, {
+      reply = await runContextConversation({ text: modelText, compiledContext: compiled, now: this.options.now() }, {
         ...(this.options.conversation ? { conversation: this.options.conversation } : {}),
         ...this.options.conversationDeps,
       });
@@ -509,7 +692,7 @@ export class DiscordContextRuntime {
         kind: "agent_action",
         occurredAt: this.options.now().getTime(),
         source: inbound.source,
-        content: { text: reply, prompt: text, assistant: reply },
+        content: { text: reply, prompt: modelText, assistant: reply },
       });
     }
     const outboundId = deterministicId("discord-reply", originalId);
@@ -524,7 +707,6 @@ export class DiscordContextRuntime {
       text: reply,
       ...(replyToId ? { replyToId } : {}),
     });
-    this.completed.add(originalId);
   }
   private replayAllowed(event: ContextEventRecord): boolean {
     return this.options.bindings.some((binding) => {
@@ -632,4 +814,45 @@ function keyForMessage(message: AuthorizedChannelMessage): string {
 }
 function deterministicId(prefix: string, value: string): string {
   return `${prefix}:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+}
+const MAX_CONTEXT_ATTACHMENTS = 16;
+const MAX_CONTEXT_ATTACHMENT_ID = 256;
+const MAX_CONTEXT_ATTACHMENT_NAME = 256;
+const MAX_CONTEXT_ATTACHMENT_MEDIA_TYPE = 128;
+const MAX_CONTEXT_ATTACHMENT_URL = 4_096;
+
+function boundAttachments(
+  attachments: readonly InboundChannelMessage["attachments"][number][],
+): Array<{
+  id: string;
+  name: string;
+  mediaType?: string;
+  url?: string;
+}> {
+  return attachments.slice(0, MAX_CONTEXT_ATTACHMENTS).flatMap((attachment, index) => {
+    const id = attachment.id.trim().slice(0, MAX_CONTEXT_ATTACHMENT_ID) || `attachment-${index + 1}`;
+    const name = attachment.name.trim().slice(0, MAX_CONTEXT_ATTACHMENT_NAME) || `attachment-${index + 1}`;
+    if (!id || !name) return [];
+    const mediaType = attachment.mediaType?.trim().slice(0, MAX_CONTEXT_ATTACHMENT_MEDIA_TYPE);
+    const url = attachment.url?.trim().slice(0, MAX_CONTEXT_ATTACHMENT_URL);
+    return [{
+      id,
+      name,
+      ...(mediaType ? { mediaType } : {}),
+      ...(url ? { url } : {}),
+    }];
+  });
+}
+
+function contextModelText(
+  text: string,
+  attachments: ContextEventRecord["content"]["attachments"],
+): string {
+  if (!attachments?.length) return text;
+  const attachmentText = attachments.map((attachment) => [
+    `- ${attachment.name}`,
+    attachment.mediaType ? `(${attachment.mediaType})` : "",
+    attachment.url ? attachment.url : "",
+  ].filter(Boolean).join(" ")).join("\n");
+  return `${text}${text ? "\n\n" : ""}Attachments:\n${attachmentText}`.slice(0, 8_000);
 }

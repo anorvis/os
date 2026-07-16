@@ -42,7 +42,7 @@ describe("service registry", () => {
       const response = await createApp().request("/v1/os/status");
       expect(response.status).toBe(200);
       const body = await response.json() as { services: string[] };
-      expect(body.services).toEqual(["llm-wiki", "context", "os"]);
+      expect(body.services).toEqual(["llm-wiki", "context", "maintenance", "os"]);
     } finally {
       restoreEnvironment(environment);
     }

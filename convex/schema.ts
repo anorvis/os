@@ -94,6 +94,12 @@ const contextEventContent = v.object({
   toolResults: v.optional(v.any()),
   resource: v.optional(v.string()),
   resourceId: v.optional(v.string()),
+  attachments: v.optional(v.array(v.object({
+    id: v.string(),
+    name: v.string(),
+    mediaType: v.optional(v.string()),
+    url: v.optional(v.string()),
+  }))),
 });
 
 
@@ -994,6 +1000,9 @@ const schema = defineSchema({
     // scanner. New scans persist their creation-order position separately.
     cursor: v.number(),
     cursorCreatedAt: v.optional(v.number()),
+    // Built-in Convex pagination cursor for creation-order scans.
+    // Legacy cursor/cursorCreatedAt/cursorEventId rows remain readable.
+    scanCursor: v.optional(v.string()),
     cursorEventId: v.optional(v.id("contextEvents")),
     scopeKind: v.optional(
       v.union(
@@ -1085,6 +1094,30 @@ const schema = defineSchema({
       "nextAttemptAt",
     ])
     .index("by_workspace_created", ["workspaceId", "createdAt"]),
+  contextMonitorEffects: defineTable({
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    effectKey: v.string(),
+    consumer: v.string(),
+    jobConsumer: v.optional(v.string()),
+    kind: v.union(v.literal("summary"), v.literal("wiki"), v.literal("notification")),
+    eventIds: v.array(v.string()),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("running"),
+      v.literal("completed"),
+      v.literal("needs_reconciliation"),
+    ),
+    payload: v.any(),
+    createdAt: v.number(),
+    startedAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    jobClaimToken: v.optional(v.string()),
+    jobLeaseUntil: v.optional(v.number()),
+    error: v.optional(v.string()),
+  })
+    .index("by_workspace_effect_key", ["workspaceId", "effectKey"])
+    .index("by_workspace_status", ["workspaceId", "status"]),
 });
 
 export default schema;

@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "bun:test";
 import {
   DiscordChannelAdapter,
@@ -154,6 +157,90 @@ describe("Discord channel adapter", () => {
       vi.useRealTimers();
     }
   });
+  test("retains receiver failures beyond three callbacks and recovers", async () => {
+    vi.useFakeTimers();
+    const root = mkdtempSync(join(tmpdir(), "anorvis-discord-spool-"));
+    const spoolPath = join(root, "inbound.json");
+    try {
+      const client = new FakeClient();
+      let calls = 0;
+      const adapter = new DiscordChannelAdapter(config, { client, spoolPath });
+      await adapter.start(() => Promise.resolve().then(() => {
+        calls += 1;
+        if (calls < 5) throw new Error("append unavailable");
+      }));
+      client.emit("messageCreate", message({ id: "extended-retry", guildId: null }));
+      await Promise.resolve();
+      await Promise.resolve();
+      for (const delay of [25, 50, 100, 200]) {
+        vi.advanceTimersByTime(delay);
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+      expect(calls).toBe(5);
+      expect(readFileSync(spoolPath, "utf8")).toBe("[]");
+      await adapter.stop();
+    } finally {
+      vi.useRealTimers();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("replays the durable inbound spool after adapter restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "anorvis-discord-restart-"));
+    const spoolPath = join(root, "inbound.json");
+    try {
+      const client = new FakeClient();
+      const first = new DiscordChannelAdapter(config, { client, spoolPath });
+      await first.start(() => Promise.reject(new Error("append unavailable")));
+      client.emit("messageCreate", message({ id: "restart-message", guildId: null }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await first.stop();
+      expect(JSON.parse(readFileSync(spoolPath, "utf8"))).toHaveLength(1);
+
+      const recovered: InboundChannelMessage[] = [];
+      const second = new DiscordChannelAdapter(config, { client, spoolPath });
+      await second.start((candidate) => {
+        recovered.push(candidate);
+        return Promise.resolve();
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(recovered.map((candidate) => candidate.id)).toEqual(["restart-message"]);
+      expect(readFileSync(spoolPath, "utf8")).toBe("[]");
+      await second.stop();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps successful deliveries memory bounded", async () => {
+    const root = mkdtempSync(join(tmpdir(), "anorvis-discord-bounded-"));
+    const spoolPath = join(root, "inbound.json");
+    try {
+      const client = new FakeClient();
+      const received: InboundChannelMessage[] = [];
+      const adapter = new DiscordChannelAdapter(config, { client, spoolPath });
+      await adapter.start((candidate) => {
+        received.push(candidate);
+        return Promise.resolve();
+      });
+      for (let index = 0; index < 100; index += 1) {
+        client.emit("messageCreate", message({ id: `bounded-${index}`, guildId: null }));
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(received).toHaveLength(100);
+      expect(readFileSync(spoolPath, "utf8")).toBe("[]");
+      expect("completed" in adapter).toBe(false);
+      await adapter.stop();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
 
   test("supports owner DM full scope but guild messages only channel scope", async () => {
     const client = new FakeClient();

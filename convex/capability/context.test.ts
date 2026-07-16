@@ -55,6 +55,31 @@ describe("shared context capability", () => {
     })).resolves.toMatchObject({ inserted: true });
   });
 
+  it("bounds and durably stores inbound attachment metadata", async () => {
+    const { t, client, workspaceId } = await owner("context-attachments@example.test");
+    const inserted = await client.mutation(api.capability.context.append, {
+      workspaceId,
+      ...event("attachment-event"),
+      content: {
+        text: "attachment text",
+        attachments: Array.from({ length: 20 }, (_, index) => ({
+          id: ` id-${index} `.repeat(40),
+          name: ` name-${index} `.repeat(40),
+          mediaType: "text/plain".repeat(50),
+          url: `https://example.test/${index}`.repeat(500),
+        })),
+      },
+    });
+    const stored = await t.run((ctx) => ctx.db.get("contextEvents", inserted.eventId));
+    expect(stored?.content.attachments).toHaveLength(16);
+    expect(stored?.content.attachments?.[0]).toMatchObject({
+      id: ` id-0 `.repeat(40).trim().slice(0, 256),
+      name: ` name-0 `.repeat(40).trim().slice(0, 256),
+      mediaType: "text/plain".repeat(50).slice(0, 128),
+      url: `https://example.test/0`.repeat(500).slice(0, 4_096),
+    });
+  });
+
   it("isolates owner-private context and outbound payloads within a workspace", async () => {
     const first = await owner();
     const secondUser = await first.t.run((ctx) =>
@@ -322,14 +347,17 @@ describe("shared context capability", () => {
     });
 
     const claimedIds = new Set([ids[0], ids[1]]);
+    let scans = 0;
     while (claimedIds.size < total) {
+      scans += 1;
+      expect(scans).toBeLessThan(total);
       const batch = await client.mutation(api.capability.context.claim, {
         workspaceId,
         consumer: "drain-consumer",
         limit: 50,
         leaseMs: 1_000,
       });
-      expect(batch.length).toBeGreaterThan(0);
+      if (batch.length === 0) continue;
       for (const item of batch) {
         claimedIds.add(item.event.id);
         await client.mutation(api.capability.context.ack, {
@@ -358,6 +386,74 @@ describe("shared context capability", () => {
       limit: 1,
     });
     expect(late.map((item) => item.event.id)).toEqual(["late-old-occurredAt"]);
+  });
+
+  it("drains same-timestamp rows with adversarial event ids across restarts", async () => {
+    const { t, client, workspaceId, userId } = await owner("adversarial-context@example.test");
+    const total = 450;
+    const ids = Array.from({ length: total }, (_, index) =>
+      `adversarial-${String(total - index - 1).padStart(4, "0")}`,
+    );
+    const createdAt = 7_000;
+    await t.run(async (ctx) => {
+      for (const id of ids) {
+        await ctx.db.insert("contextEvents", {
+          id,
+          workspaceId,
+          ownerId: userId,
+          kind: "conversation_turn",
+          occurredAt: createdAt,
+          source: {
+            surface: "system",
+            principalId: String(userId),
+            conversationId: `conversation-${id}`,
+            visibility: "private",
+            workspaceId: String(workspaceId),
+          },
+          content: { text: id },
+          createdAt,
+        });
+      }
+      const first = await ctx.db
+        .query("contextEvents")
+        .withIndex("by_workspace_created", (q) => q.eq("workspaceId", workspaceId))
+        .first();
+      await ctx.db.insert("contextConsumers", {
+        workspaceId,
+        consumer: "adversarial-consumer",
+        cursor: createdAt,
+        cursorCreatedAt: createdAt,
+        cursorEventId: first?._id,
+        scopeKind: "owner",
+        scopeId: String(userId),
+        updatedAt: createdAt,
+      });
+    });
+
+    const claimedIds = new Set<string>();
+    let claimant = client;
+    let scans = 0;
+    while (claimedIds.size < total) {
+      scans += 1;
+      expect(scans).toBeLessThan(total);
+      const batch = await claimant.mutation(api.capability.context.claim, {
+        workspaceId,
+        consumer: "adversarial-consumer",
+        limit: 50,
+      });
+      for (const item of batch) {
+        expect(claimedIds.has(item.event.id)).toBe(false);
+        claimedIds.add(item.event.id);
+        await claimant.mutation(api.capability.context.ack, {
+          workspaceId,
+          consumer: "adversarial-consumer",
+          eventIds: [item.event.id],
+          claimToken: item.claimToken,
+        });
+      }
+      if (scans === 4) claimant = t.withIdentity({ subject: userId });
+    }
+    expect(claimedIds).toEqual(new Set(ids));
   });
 
   it("accepts legacy maintenance wiki-agent-run rows", async () => {
@@ -429,5 +525,76 @@ describe("shared context capability", () => {
     expect(compiled.events.map((item) => item.id)).toEqual(["shared-note"]);
     expect(compiled.events.map((item) => item.id)).not.toContain("private-note");
     expect(compiled.events.map((item) => item.id)).not.toContain("shared-health");
+  });
+  it("claims and completes Monitor Wiki jobs exactly once", async () => {
+    const { client, workspaceId } = await owner("wiki-monitor@example.test");
+    await client.mutation(api.capability.context.append, {
+      workspaceId,
+      ...event("wiki-effect"),
+    });
+    const claimed = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "os-monitor",
+      scope: { kind: "owner" },
+    });
+    expect(claimed).toHaveLength(1);
+    const committed = await client.mutation(api.capability.context.commitMonitorEffect, {
+      workspaceId,
+      consumer: "os-monitor",
+      effectKey: "wiki-effect-key",
+      kind: "wiki",
+      claims: [{ eventId: claimed[0].event.id, claimToken: claimed[0].claimToken }],
+      scope: { kind: "owner" },
+      wikiTask: "curate the durable task",
+    });
+    expect(committed).toEqual({ effectKey: "wiki-effect-key", status: "pending" });
+    const jobs = await client.mutation(api.capability.context.claimMonitorWikiEffects, {
+      workspaceId,
+      consumer: "os-monitor:wiki",
+    });
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ effectKey: "wiki-effect-key", wikiTask: "curate the durable task" });
+    const completed = await client.mutation(api.capability.context.completeMonitorWikiEffect, {
+      workspaceId,
+      consumer: "os-monitor:wiki",
+      effectKey: "wiki-effect-key",
+      jobClaimToken: jobs[0].jobClaimToken,
+      success: true,
+      result: "done",
+    });
+    expect(completed).toEqual({ effectKey: "wiki-effect-key", status: "completed" });
+    await expect(client.mutation(api.capability.context.claimMonitorWikiEffects, {
+      workspaceId,
+      consumer: "os-monitor:wiki",
+    })).resolves.toEqual([]);
+  });
+
+  it("reconciles a stale running Monitor Wiki job without rerunning it", async () => {
+    const { t, client, workspaceId, userId } = await owner("wiki-stale@example.test");
+    await t.run((ctx) => ctx.db.insert("contextMonitorEffects", {
+      workspaceId,
+      ownerId: userId,
+      effectKey: "stale-wiki",
+      consumer: "os-monitor",
+      kind: "wiki",
+      eventIds: [],
+      status: "running",
+      payload: { wikiTask: "already possibly executed" },
+      createdAt: Date.now() - 10_000,
+      startedAt: Date.now() - 10_000,
+      jobConsumer: "os-monitor:wiki",
+      jobClaimToken: "stale-token",
+      jobLeaseUntil: Date.now() - 1,
+    }));
+    const jobs = await client.mutation(api.capability.context.claimMonitorWikiEffects, {
+      workspaceId,
+      consumer: "os-monitor:wiki",
+    });
+    expect(jobs).toEqual([]);
+    await expect(t.run(async (ctx) =>
+      (await ctx.db.query("contextMonitorEffects").withIndex("by_workspace_effect_key", (q) =>
+        q.eq("workspaceId", workspaceId).eq("effectKey", "stale-wiki"),
+      ).unique())?.status,
+    )).resolves.toBe("needs_reconciliation");
   });
 });

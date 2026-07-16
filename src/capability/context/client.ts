@@ -5,7 +5,7 @@ import { ConvexHttpClient } from "convex/browser";
 import { getHomeDir } from "../../paths";
 import { decodeUnknown } from "../../core/effect/schema";
 import { api } from "../../../convex/_generated/api";
-import type { ContextEventInput, ContextEventKind, ContextSurface } from "./schema";
+import { ContextEventAttachmentSchema, type ContextEventInput, type ContextEventKind, type ContextSurface } from "./schema";
 
 export type ContextScopeRequest = {
   kind: "owner" | "workspace" | "channel";
@@ -113,6 +113,54 @@ export type ContextOutboundRecord = ContextOutboundRequest & {
   leaseUntil: number;
   messageId?: string;
 };
+export type ContextClaimFence = { eventId: string; claimToken: string };
+export type ContextRenewClaimRequest = {
+  workspaceId?: string;
+  consumer: string;
+  claims: readonly ContextClaimFence[];
+  leaseMs?: number;
+};
+export type ContextRenewClaimResult = {
+  claims: readonly ContextClaimFence[];
+  leaseUntil: number;
+};
+export type ContextMonitorEffectKind = "summary" | "wiki" | "notification";
+export type ContextMonitorEffectRequest = {
+  workspaceId?: string;
+  consumer: string;
+  effectKey: string;
+  kind: ContextMonitorEffectKind;
+  claims: readonly ContextClaimFence[];
+  scope: ContextScopeRequest;
+  summary?: string;
+  wikiTask?: string;
+  notification?: Omit<ContextOutboundRequest, "id">;
+};
+export type ContextMonitorEffectResult = {
+  effectKey: string;
+  status: "pending" | "running" | "completed" | "replayed" | "needs_reconciliation";
+};
+export type ContextMonitorWikiJob = {
+  effectKey: string;
+  wikiTask: string;
+  jobClaimToken: string;
+  leaseUntil: number;
+};
+export type ContextClaimMonitorWikiEffectsRequest = {
+  workspaceId?: string;
+  consumer: string;
+  limit?: number;
+  leaseMs?: number;
+};
+export type ContextCompleteMonitorWikiEffectRequest = {
+  workspaceId?: string;
+  consumer: string;
+  effectKey: string;
+  jobClaimToken: string;
+  success: boolean;
+  result?: string;
+  error?: string;
+};
 export type ContextCapabilityClient = {
   append(input: ContextAppendRequest): Promise<unknown>;
   compile(input: ContextCompileRequest): Promise<unknown>;
@@ -126,6 +174,10 @@ export type ContextCapabilityClient = {
     status: "completed" | "queued" | "failed";
     attempts: number;
   }>;
+  renewClaim?(input: ContextRenewClaimRequest): Promise<ContextRenewClaimResult>;
+  commitMonitorEffect?(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
+  claimMonitorWikiEffects?(input: ContextClaimMonitorWikiEffectsRequest): Promise<readonly ContextMonitorWikiJob[]>;
+  completeMonitorWikiEffect?(input: ContextCompleteMonitorWikiEffectRequest): Promise<ContextMonitorEffectResult>;
 };
 
 type ConvexTransport = {
@@ -166,6 +218,7 @@ const contentSchema = Schema.Struct({
   toolResults: Schema.optional(Schema.Unknown),
   resource: Schema.optional(Schema.String),
   resourceId: Schema.optional(Schema.String),
+  attachments: Schema.optional(Schema.Array(ContextEventAttachmentSchema)),
 });
 const eventSchema = Schema.Struct({
   id: Schema.String,
@@ -243,6 +296,20 @@ const completeResultSchema = Schema.Struct({
   id: Schema.String,
   status: Schema.Literal("completed", "queued", "failed"),
   attempts: Schema.Number,
+});
+const renewClaimResultSchema = Schema.Struct({
+  claims: Schema.Array(Schema.Struct({ eventId: Schema.String, claimToken: Schema.String })),
+  leaseUntil: Schema.Number,
+});
+const monitorEffectResultSchema = Schema.Struct({
+  effectKey: Schema.String,
+  status: Schema.Literal("pending", "running", "completed", "replayed", "needs_reconciliation"),
+});
+const monitorWikiJobSchema = Schema.Struct({
+  effectKey: Schema.String,
+  wikiTask: Schema.String,
+  jobClaimToken: Schema.String,
+  leaseUntil: Schema.Number,
 });
 
 export function resolveConvexUrl(
@@ -340,6 +407,18 @@ export class ConvexContextClient implements ContextCapabilityClient {
   }
   compile(input: ContextCompileRequest) {
     return this.invoke<ContextCompileResult, ContextCompileRequest>("query", api.capability.context.compile, input, compileResultSchema);
+  }
+  renewClaim(input: ContextRenewClaimRequest) {
+    return this.invoke<ContextRenewClaimResult, ContextRenewClaimRequest>("mutation", api.capability.context.renewClaim, input, renewClaimResultSchema);
+  }
+  commitMonitorEffect(input: ContextMonitorEffectRequest) {
+    return this.invoke<ContextMonitorEffectResult, ContextMonitorEffectRequest>("mutation", api.capability.context.commitMonitorEffect, input, monitorEffectResultSchema);
+  }
+  claimMonitorWikiEffects(input: ContextClaimMonitorWikiEffectsRequest) {
+    return this.invoke<readonly ContextMonitorWikiJob[], ContextClaimMonitorWikiEffectsRequest>("mutation", api.capability.context.claimMonitorWikiEffects, input, Schema.Array(monitorWikiJobSchema));
+  }
+  completeMonitorWikiEffect(input: ContextCompleteMonitorWikiEffectRequest) {
+    return this.invoke<ContextMonitorEffectResult, ContextCompleteMonitorWikiEffectRequest>("mutation", api.capability.context.completeMonitorWikiEffect, input, monitorEffectResultSchema);
   }
   claim(input: ContextClaimRequest) {
     return this.invoke<readonly ContextClaimedEvent[], ContextClaimRequest>("mutation", api.capability.context.claim, input, Schema.Array(claimedEventSchema));

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   Client,
   GatewayIntentBits,
@@ -13,11 +15,15 @@ import type {
   OutboundChannelMessage,
   InboundChannelMessage,
 } from "./channel";
-
 const MAX_DISCORD_MESSAGE_LENGTH = 2_000;
 const MAX_DISCORD_NONCE_LENGTH = 25;
-const RECEIVER_RETRY_ATTEMPTS = 3;
+const MAX_INBOUND_ATTACHMENTS = 16;
+const MAX_ATTACHMENT_ID_LENGTH = 256;
+const MAX_ATTACHMENT_NAME_LENGTH = 256;
+const MAX_ATTACHMENT_MEDIA_TYPE_LENGTH = 128;
+const MAX_ATTACHMENT_URL_LENGTH = 4_096;
 const RECEIVER_RETRY_DELAY_MS = 25;
+const RECEIVER_MAX_RETRY_DELAY_MS = 30_000;
 const RETRYABLE_ERROR_CODES: Record<string, true> = {
   ECONNRESET: true,
   ECONNREFUSED: true,
@@ -108,6 +114,7 @@ export type DiscordClientFactory = () => DiscordClientLike;
 export type DiscordChannelAdapterOptions = {
   client?: DiscordClientLike;
   clientFactory?: DiscordClientFactory;
+  spoolPath?: string;
 };
 
 export function parseDiscordConfig(
@@ -172,12 +179,21 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   private readonly onMessageBound: (...args: unknown[]) => void;
   private readonly onReadyBound: (...args: unknown[]) => void;
   private readonly onErrorBound: (...args: unknown[]) => void;
+  private readonly spoolPath: string;
+  private readonly pending = new Map<string, InboundChannelMessage>();
+  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly retryAttempts = new Map<string, number>();
+  private readonly deliveries = new Map<string, Promise<void>>();
+  private persistChain: Promise<void> = Promise.resolve();
 
   constructor(config: DiscordConfig, options: DiscordChannelAdapterOptions = {}) {
     this.config = config;
     this.clientFactory = options.clientFactory ?? (() => createDiscordClient());
     this.client = options.client;
     this.accountId = config.accountId;
+    this.spoolPath = options.spoolPath
+      ?? process.env.ANORVIS_DISCORD_INBOUND_SPOOL_PATH
+      ?? join(process.env.HOME ?? ".", ".anorvis", "discord", "inbound-spool.json");
     this.onMessageBound = (...args) => {
       const message = args[0] as DiscordMessageLike | undefined;
       if (message) void this.handleMessage(message);
@@ -193,6 +209,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
 
   async start(receive: ChannelReceiver): Promise<void> {
     if (this.started) return;
+    this.loadSpool();
 
     const client = this.client ?? this.clientFactory();
     this.client = client;
@@ -204,9 +221,11 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       await client.login(this.config.botToken);
       this.accountId = client.user?.id ?? this.accountId;
       if (!this.accountId) throw new Error("Discord client did not provide a bot account ID");
+      this.drainPending();
     } catch (error) {
       this.started = false;
       this.receiver = undefined;
+      this.clearRetryTimers();
       this.detachListeners(client);
       try {
         await client.destroy();
@@ -218,11 +237,13 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   }
   async stop(): Promise<void> {
     const client = this.client;
-    if (!client || !this.started) return;
-
     this.started = false;
     this.receiver = undefined;
+    this.clearRetryTimers();
+    if (!client) return;
     this.detachListeners(client);
+    await Promise.allSettled(this.deliveries.values());
+    await this.persistChain.catch(() => undefined);
     await client.destroy();
   }
 
@@ -291,28 +312,113 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   }
 
   private async handleMessage(message: DiscordMessageLike): Promise<void> {
-    const receiver = this.receiver;
-    if (!this.started || !receiver || !message.author) return;
+    if (!this.started || !message.author) return;
     if (message.author.bot || message.author.system) return;
     if (message.author.id === this.accountId || message.author.id === this.client?.user?.id) return;
 
     const isGuild = Boolean(message.guildId);
     if (isGuild && this.config.requireMention && !this.mentionsBot(message)) return;
-
     const candidate = normalizeDiscordMessage(message, this.accountId);
     if (!candidate) return;
-    for (let attempt = 0; attempt < RECEIVER_RETRY_ATTEMPTS; attempt += 1) {
+    const existing = [...this.pending.entries()].find(([, value]) => value.id === candidate.id);
+    const sameDelivery = existing ? JSON.stringify(existing[1]) === JSON.stringify(candidate) : false;
+    const key = existing && !sameDelivery
+      ? `${candidate.id}:${createHash("sha256").update(JSON.stringify(candidate)).digest("hex").slice(0, 16)}`
+      : candidate.id;
+    if (!this.pending.has(key)) {
+      this.pending.set(key, candidate);
+      this.retryAttempts.set(key, 0);
       try {
-        await receiver(candidate);
-        return;
+        void this.persistSpool();
       } catch {
-        if (attempt + 1 < RECEIVER_RETRY_ATTEMPTS) {
-          const { promise, resolve } = Promise.withResolvers<void>();
-          setTimeout(resolve, RECEIVER_RETRY_DELAY_MS * (attempt + 1));
-          await promise;
-        }
+        this.scheduleRetry(key);
+        return;
       }
     }
+    await this.deliverPending(key);
+  }
+
+  private drainPending(): void {
+    for (const id of this.pending.keys()) void this.deliverPending(id);
+  }
+
+  private deliverPending(id: string): Promise<void> {
+    const existing = this.deliveries.get(id);
+    if (existing) return existing;
+    const task = this.tryDeliverPending(id).finally(() => {
+      if (this.deliveries.get(id) === task) this.deliveries.delete(id);
+    });
+    this.deliveries.set(id, task);
+    return task;
+  }
+
+  private async tryDeliverPending(id: string): Promise<void> {
+    const candidate = this.pending.get(id);
+    const receiver = this.receiver;
+    if (!candidate || !this.started || !receiver) return;
+    if (!this.retryTimers.has(id)) this.scheduleRetry(id);
+    try {
+      await receiver(candidate);
+      const timer = this.retryTimers.get(id);
+      if (timer) clearTimeout(timer);
+      this.retryTimers.delete(id);
+      this.pending.delete(id);
+      this.retryAttempts.delete(id);
+      try {
+        await this.persistSpool();
+      } catch {
+        this.pending.set(id, candidate);
+        this.scheduleRetry(id);
+      }
+    } catch {
+      this.scheduleRetry(id);
+    }
+  }
+
+  private scheduleRetry(id: string): void {
+    if (!this.started || this.retryTimers.has(id) || !this.pending.has(id)) return;
+    const attempt = (this.retryAttempts.get(id) ?? 0) + 1;
+    this.retryAttempts.set(id, attempt);
+    const delay = Math.min(
+      RECEIVER_MAX_RETRY_DELAY_MS,
+      RECEIVER_RETRY_DELAY_MS * 2 ** Math.min(attempt - 1, 10),
+    );
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(id);
+      if (this.deliveries.has(id)) {
+        this.deliveries.delete(id);
+        void this.deliverPending(id);
+        return;
+      }
+      void this.deliverPending(id);
+    }, delay);
+    this.retryTimers.set(id, timer);
+  }
+
+  private clearRetryTimers(): void {
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
+  }
+
+  private loadSpool(): void {
+    if (!existsSync(this.spoolPath)) return;
+    const raw = readFileSync(this.spoolPath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("Discord inbound spool is invalid");
+    for (const entry of parsed) {
+      const value = decodeInboundChannelMessage(entry);
+      if (!value) throw new Error("Discord inbound spool is invalid");
+      if (!this.pending.has(value.id)) this.pending.set(value.id, value);
+    }
+  }
+  private persistSpool(): Promise<void> {
+    const records = [...this.pending.values()];
+    mkdirSync(dirname(this.spoolPath), { recursive: true });
+    const temporary = `${this.spoolPath}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(records), { mode: 0o600 });
+    renameSync(temporary, this.spoolPath);
+    this.persistChain = Promise.resolve();
+    return this.persistChain;
   }
 
   private mentionsBot(message: DiscordMessageLike): boolean {
@@ -357,6 +463,9 @@ export function normalizeDiscordMessage(
   const channelId = isThread ? message.channel?.parentId ?? message.channelId : message.channelId;
   const threadId = isThread ? message.channelId : undefined;
   const occurredAt = message.createdTimestamp ?? message.createdAt?.getTime() ?? Date.now();
+  const rawAttachments = Array.from(discordAttachmentValues(message.attachments));
+  const attachments = normalizeAttachments(rawAttachments);
+  if (rawAttachments.length > 0 && attachments.length === 0 && !(message.content ?? "").trim()) return undefined;
 
   return {
     id: message.id,
@@ -374,7 +483,7 @@ export function normalizeDiscordMessage(
     text: message.content ?? "",
     occurredAt,
     ...(message.reference?.messageId ? { replyToId: message.reference.messageId } : {}),
-    attachments: normalizeAttachments(message.attachments),
+    attachments,
   };
 }
 
@@ -427,21 +536,27 @@ function createDiscordClient(): DiscordClientLike {
 }
 
 function normalizeAttachments(
-  attachments: DiscordMessageLike["attachments"],
+  attachments: DiscordMessageLike["attachments"] | readonly unknown[],
 ): ChannelAttachment[] {
-  return Array.from(discordAttachmentValues(attachments)).flatMap((value, index) => {
-    if (!isDiscordAttachmentLike(value) || !value.url) return [];
-    return [{
-      id: value.id ?? value.url,
-      name: value.name?.trim() || `attachment-${index + 1}`,
-      ...(value.contentType ? { mediaType: value.contentType } : {}),
-      url: value.url,
-    }];
-  });
+  return Array.from(discordAttachmentValues(attachments))
+    .slice(0, MAX_INBOUND_ATTACHMENTS)
+    .flatMap((value, index) => {
+      if (!isDiscordAttachmentLike(value)) return [];
+      const id = (value.id?.trim() || value.url?.trim() || `attachment-${index + 1}`).slice(0, MAX_ATTACHMENT_ID_LENGTH);
+      const name = (value.name?.trim() || `attachment-${index + 1}`).slice(0, MAX_ATTACHMENT_NAME_LENGTH);
+      const mediaType = value.contentType?.trim().slice(0, MAX_ATTACHMENT_MEDIA_TYPE_LENGTH);
+      const url = value.url?.trim().slice(0, MAX_ATTACHMENT_URL_LENGTH);
+      return [{
+        id,
+        name,
+        ...(mediaType ? { mediaType } : {}),
+        ...(url ? { url } : {}),
+      }];
+    });
 }
 
 function discordAttachmentValues(
-  attachments: DiscordMessageLike["attachments"],
+  attachments: DiscordMessageLike["attachments"] | readonly unknown[],
 ): Iterable<unknown> {
   if (!attachments) return [];
   if (hasDiscordAttachmentValues(attachments)) return attachments.values();
@@ -473,6 +588,63 @@ function isDiscordAttachmentLike(value: unknown): value is DiscordAttachmentLike
       || candidate.contentType === null
       || typeof candidate.contentType === "string")
     && (candidate.url === undefined || candidate.url === null || typeof candidate.url === "string");
+}
+function decodeInboundChannelMessage(value: unknown): InboundChannelMessage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const input = value as Record<string, unknown>;
+  const identity = input.identity;
+  const destination = input.destination;
+  if (
+    typeof input.id !== "string"
+    || typeof input.text !== "string"
+    || typeof input.occurredAt !== "number"
+    || !identity || typeof identity !== "object"
+    || !destination || typeof destination !== "object"
+  ) return undefined;
+  const identityRecord = identity as Record<string, unknown>;
+  const destinationRecord = destination as Record<string, unknown>;
+  if (
+    identityRecord.provider !== "discord"
+    || typeof identityRecord.accountId !== "string"
+    || typeof identityRecord.userId !== "string"
+    || (destinationRecord.visibility !== "private" && destinationRecord.visibility !== "shared")
+    || typeof destinationRecord.channelId !== "string"
+  ) return undefined;
+  const rawAttachments = input.attachments;
+  if (rawAttachments !== undefined && !Array.isArray(rawAttachments)) return undefined;
+  const attachments = Array.isArray(rawAttachments)
+    ? rawAttachments.flatMap((attachment) => {
+        if (!attachment || typeof attachment !== "object") return [];
+        const value = attachment as Record<string, unknown>;
+        if (typeof value.id !== "string" || typeof value.name !== "string") return [];
+        return [{
+          id: value.id,
+          name: value.name,
+          ...(typeof value.mediaType === "string" ? { contentType: value.mediaType } : {}),
+          ...(typeof value.url === "string" ? { url: value.url } : {}),
+        }];
+      })
+    : [];
+  if (Array.isArray(rawAttachments) && attachments.length !== rawAttachments.length) return undefined;
+  return {
+    id: input.id,
+    identity: {
+      provider: "discord",
+      accountId: identityRecord.accountId,
+      userId: identityRecord.userId,
+    },
+    destination: {
+      visibility: destinationRecord.visibility,
+      channelId: destinationRecord.channelId,
+      ...(typeof destinationRecord.workspaceId === "string" ? { workspaceId: destinationRecord.workspaceId } : {}),
+      ...(typeof destinationRecord.scopeId === "string" ? { scopeId: destinationRecord.scopeId } : {}),
+      ...(typeof destinationRecord.threadId === "string" ? { threadId: destinationRecord.threadId } : {}),
+    },
+    text: input.text,
+    occurredAt: input.occurredAt,
+    ...(typeof input.replyToId === "string" ? { replyToId: input.replyToId } : {}),
+    attachments: normalizeAttachments(attachments),
+  };
 }
 
 

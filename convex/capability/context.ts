@@ -27,6 +27,12 @@ const eventSource = v.object({
   channelId: v.optional(v.string()),
   threadId: v.optional(v.string()),
 });
+const eventAttachments = v.optional(v.array(v.object({
+  id: v.string(),
+  name: v.string(),
+  mediaType: v.optional(v.string()),
+  url: v.optional(v.string()),
+})));
 const eventContent = v.object({
   text: v.optional(v.string()),
   prompt: v.optional(v.string()),
@@ -34,6 +40,7 @@ const eventContent = v.object({
   toolResults: v.optional(v.any()),
   resource: v.optional(v.string()),
   resourceId: v.optional(v.string()),
+  attachments: eventAttachments,
 });
 const scope = v.object({
   kind: v.union(v.literal("owner"), v.literal("workspace"), v.literal("channel")),
@@ -72,6 +79,12 @@ type ScopeInfo = {
   ownerId?: string;
 };
 
+const MAX_CONTEXT_ATTACHMENTS = 16;
+const MAX_CONTEXT_ATTACHMENT_ID = 256;
+const MAX_CONTEXT_ATTACHMENT_NAME = 256;
+const MAX_CONTEXT_ATTACHMENT_MEDIA_TYPE = 128;
+const MAX_CONTEXT_ATTACHMENT_URL = 4_096;
+
 function invalid(message: string): never {
   throw new ConvexError({ code: "INVALID_INPUT", message });
 }
@@ -80,6 +93,25 @@ function nonEmpty(value: string, name: string): string {
   const result = value.trim();
   if (!result) invalid(`${name} is required`);
   return result;
+}
+
+type ContextAttachment = NonNullable<ContextEvent["content"]["attachments"]>[number];
+
+function boundedAttachments(value: ContextEvent["content"]["attachments"]): ContextAttachment[] | undefined {
+  if (value === undefined) return undefined;
+  return value.slice(0, MAX_CONTEXT_ATTACHMENTS).flatMap((attachment, index) => {
+    const id = attachment.id.trim().slice(0, MAX_CONTEXT_ATTACHMENT_ID) || `attachment-${index + 1}`;
+    const name = attachment.name.trim().slice(0, MAX_CONTEXT_ATTACHMENT_NAME) || `attachment-${index + 1}`;
+    if (!id || !name) return [];
+    const mediaType = attachment.mediaType?.trim().slice(0, MAX_CONTEXT_ATTACHMENT_MEDIA_TYPE);
+    const url = attachment.url?.trim().slice(0, MAX_CONTEXT_ATTACHMENT_URL);
+    return [{
+      id,
+      name,
+      ...(mediaType ? { mediaType } : {}),
+      ...(url ? { url } : {}),
+    }];
+  });
 }
 
 async function accessForScope(
@@ -200,107 +232,57 @@ async function consumerForScope(
       row.scopeKind === undefined &&
       row.scopeId === undefined) ?? null;
 }
-type CreationBound = { op: "gt" | "eq"; value: number } | undefined;
-
 function claimEventQuery(
   ctx: Parameters<typeof requireWorkspace>[0],
   workspaceId: Id<"workspaces">,
   surfaceFilter: ContextSurface | undefined,
   kindFilter: ContextKind | undefined,
-  bound: CreationBound,
 ) {
   if (surfaceFilter !== undefined && kindFilter !== undefined) {
     return ctx.db
       .query("contextEvents")
-      .withIndex("by_workspace_surface_kind_created", (q) => {
-        const indexed = q
+      .withIndex("by_workspace_surface_kind_created", (q) =>
+        q
           .eq("workspaceId", workspaceId)
           .eq("source.surface", surfaceFilter)
-          .eq("kind", kindFilter);
-        return bound === undefined
-          ? indexed
-          : bound.op === "gt"
-            ? indexed.gt("createdAt", bound.value)
-            : indexed.eq("createdAt", bound.value);
-      });
+          .eq("kind", kindFilter),
+      );
   }
   if (surfaceFilter !== undefined) {
     return ctx.db
       .query("contextEvents")
-      .withIndex("by_workspace_surface_created", (q) => {
-        const indexed = q.eq("workspaceId", workspaceId).eq("source.surface", surfaceFilter);
-        return bound === undefined
-          ? indexed
-          : bound.op === "gt"
-            ? indexed.gt("createdAt", bound.value)
-            : indexed.eq("createdAt", bound.value);
-      });
+      .withIndex("by_workspace_surface_created", (q) =>
+        q.eq("workspaceId", workspaceId).eq("source.surface", surfaceFilter),
+      );
   }
   if (kindFilter !== undefined) {
     return ctx.db
       .query("contextEvents")
-      .withIndex("by_workspace_kind_created", (q) => {
-        const indexed = q.eq("workspaceId", workspaceId).eq("kind", kindFilter);
-        return bound === undefined
-          ? indexed
-          : bound.op === "gt"
-            ? indexed.gt("createdAt", bound.value)
-            : indexed.eq("createdAt", bound.value);
-      });
+      .withIndex("by_workspace_kind_created", (q) =>
+        q.eq("workspaceId", workspaceId).eq("kind", kindFilter),
+      );
   }
   return ctx.db
     .query("contextEvents")
-    .withIndex("by_workspace_created", (q) => {
-      const indexed = q.eq("workspaceId", workspaceId);
-      return bound === undefined
-        ? indexed
-        : bound.op === "gt"
-          ? indexed.gt("createdAt", bound.value)
-          : indexed.eq("createdAt", bound.value);
-    });
+    .withIndex("by_workspace_created", (q) => q.eq("workspaceId", workspaceId));
 }
 
+type ClaimScanPage = {
+  page: ContextEvent[];
+  continueCursor: string;
+  isDone: boolean;
+};
 
 async function claimScanEvents(
   ctx: Parameters<typeof requireWorkspace>[0],
   workspaceId: Id<"workspaces">,
   surfaceFilter: ContextSurface | undefined,
   kindFilter: ContextKind | undefined,
-  cursorCreatedAt: number | undefined,
-  cursorEventId: Id<"contextEvents"> | undefined,
-): Promise<ContextEvent[]> {
-  if (cursorCreatedAt === undefined) {
-    return (await claimEventQuery(ctx, workspaceId, surfaceFilter, kindFilter, undefined)
-      .order("asc")
-      .take(CLAIM_SCAN_PAGE_SIZE));
-  }
-
-  const later = await claimEventQuery(
-    ctx,
-    workspaceId,
-    surfaceFilter,
-    kindFilter,
-    { op: "gt", value: cursorCreatedAt },
-  )
+  scanCursor: string | undefined,
+): Promise<ClaimScanPage> {
+  return claimEventQuery(ctx, workspaceId, surfaceFilter, kindFilter)
     .order("asc")
-    .take(CLAIM_SCAN_PAGE_SIZE);
-  const sameQuery = claimEventQuery(
-    ctx,
-    workspaceId,
-    surfaceFilter,
-    kindFilter,
-    { op: "eq", value: cursorCreatedAt },
-  ).order("asc");
-  const same = cursorEventId === undefined
-    ? await sameQuery.take(CLAIM_SCAN_PAGE_SIZE)
-    : await sameQuery
-      .filter((q) => q.gt(q.field("_id"), cursorEventId))
-      .take(CLAIM_SCAN_PAGE_SIZE);
-  return [...same, ...later]
-    .sort((left, right) =>
-      left.createdAt - right.createdAt || (left._id < right._id ? -1 : left._id > right._id ? 1 : 0),
-    )
-    .slice(0, CLAIM_SCAN_PAGE_SIZE);
+    .paginate({ cursor: scanCursor ?? null, numItems: CLAIM_SCAN_PAGE_SIZE });
 }
 
 async function workspaceEvents(
@@ -358,9 +340,7 @@ async function workspaceEvents(
   const unique = new Map<string, ContextEvent>();
   for (const event of events) unique.set(String(event._id), event);
   return [...unique.values()]
-    .sort((left, right) =>
-      right.occurredAt - left.occurredAt || (right._id < left._id ? -1 : right._id > left._id ? 1 : 0),
-    )
+    .sort((left, right) => right.occurredAt - left.occurredAt)
     .filter((event) => visibleEvent(event, info, access))
     .slice(0, limit);
 }
@@ -448,6 +428,10 @@ export const append = mutation({
       }
       return { id: existing.id, eventId: existing._id, inserted: false };
     }
+    const normalizedAttachments = boundedAttachments(args.content.attachments);
+    const content = normalizedAttachments === undefined
+      ? args.content
+      : { ...args.content, attachments: normalizedAttachments };
     const now = Date.now();
     const eventId = await ctx.db.insert("contextEvents", {
       id,
@@ -461,7 +445,7 @@ export const append = mutation({
         principalId: String(access.userId),
         workspaceId: String(access.workspaceId),
       },
-      content: args.content,
+      content,
       createdAt: now,
     });
     return { id, eventId, inserted: true };
@@ -521,14 +505,14 @@ export const claim = mutation({
         scopeId: info.scopeId,
       });
     }
-    const page = await claimScanEvents(
+    const scanPage = await claimScanEvents(
       ctx,
       access.workspaceId,
       args.surface,
       args.kind,
-      consumerRow?.cursorCreatedAt,
-      consumerRow?.cursorEventId,
+      consumerRow?.scanCursor,
     );
+    const page = scanPage.page;
     const claimed: Array<{ event: ContextEvent; claimToken: string; attempts: number; leaseUntil: number }> = [];
     let blocked = false;
     let safeCursor: ContextEvent | undefined;
@@ -583,6 +567,11 @@ export const claim = mutation({
     }
 
     if (!blocked && page.length > 0) safeCursor = page[page.length - 1];
+    const scanCursor = blocked
+      ? consumerRow?.scanCursor
+      : scanPage.isDone
+        ? consumerRow?.scanCursor
+        : scanPage.continueCursor;
     if (consumerRow === null) {
       await ctx.db.insert("contextConsumers", {
         workspaceId: access.workspaceId,
@@ -591,16 +580,16 @@ export const claim = mutation({
         kind: args.kind,
         cursor: safeCursor?.createdAt ?? 0,
         cursorCreatedAt: safeCursor?.createdAt,
-        cursorEventId: safeCursor?._id,
         scopeKind: info.kind,
         scopeId: info.scopeId,
+        scanCursor,
         updatedAt: now,
       });
-    } else if (safeCursor !== undefined) {
+    } else if (!blocked) {
       await ctx.db.patch(consumerRow._id, {
-        cursor: safeCursor.createdAt,
-        cursorCreatedAt: safeCursor.createdAt,
-        cursorEventId: safeCursor._id,
+        cursor: safeCursor?.createdAt ?? consumerRow.cursor,
+        cursorCreatedAt: safeCursor?.createdAt ?? consumerRow.cursorCreatedAt,
+        scanCursor,
         updatedAt: now,
       });
     }
@@ -658,6 +647,280 @@ export const ack = mutation({
       await ctx.db.insert("contextConsumers", { workspaceId: access.workspaceId, consumer, cursor: 0, updatedAt: now });
     }
     return { acknowledged, cursor };
+  },
+});
+const monitorClaim = v.object({ eventId: v.string(), claimToken: v.string() });
+
+export const renewClaim = mutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    consumer: v.string(),
+    claims: v.array(monitorClaim),
+    leaseMs: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const consumer = nonEmpty(args.consumer, "consumer");
+    const claims = args.claims;
+    if (claims.length === 0) invalid("claims are required");
+    const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 300_000), 1_000), 86_400_000);
+    const now = Date.now();
+    const leaseUntil = now + leaseMs;
+    for (const item of claims) {
+      const event = await ctx.db
+        .query("contextEvents")
+        .withIndex("by_event_id", (q) => q.eq("id", nonEmpty(item.eventId, "eventId")))
+        .unique();
+      if (event === null || event.workspaceId !== access.workspaceId) {
+        throw new ConvexError({ code: "NOT_FOUND", message: "Context event not found" });
+      }
+      const claim = await ctx.db
+        .query("contextEventClaims")
+        .withIndex("by_event_consumer", (q) => q.eq("eventId", event._id).eq("consumer", consumer))
+        .unique();
+      if (claim === null || claim.claimToken !== item.claimToken || claim.status !== "claimed" || claim.leaseUntil <= now) {
+        throw new ConvexError({ code: "CONFLICT", message: "Context claim token is invalid or expired" });
+      }
+    }
+    for (const item of claims) {
+      const event = await ctx.db
+        .query("contextEvents")
+        .withIndex("by_event_id", (q) => q.eq("id", item.eventId))
+        .unique();
+      if (event === null) continue;
+      const claim = await ctx.db
+        .query("contextEventClaims")
+        .withIndex("by_event_consumer", (q) => q.eq("eventId", event._id).eq("consumer", consumer))
+        .unique();
+      if (claim !== null) await ctx.db.patch(claim._id, { leaseUntil });
+    }
+    return { claims, leaseUntil };
+  },
+});
+
+export const commitMonitorEffect = mutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    consumer: v.string(),
+    effectKey: v.string(),
+    kind: v.union(v.literal("summary"), v.literal("wiki"), v.literal("notification")),
+    claims: v.array(monitorClaim),
+    scope,
+    summary: v.optional(v.string()),
+    wikiTask: v.optional(v.string()),
+    notification: v.optional(v.object({
+      destination,
+      text: v.string(),
+    })),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const consumer = nonEmpty(args.consumer, "consumer");
+    const effectKey = nonEmpty(args.effectKey, "effectKey");
+    if (args.claims.length === 0) invalid("claims are required");
+    const now = Date.now();
+    for (const item of args.claims) {
+      const event = await ctx.db
+        .query("contextEvents")
+        .withIndex("by_event_id", (q) => q.eq("id", nonEmpty(item.eventId, "eventId")))
+        .unique();
+      if (event === null || event.workspaceId !== access.workspaceId) {
+        throw new ConvexError({ code: "NOT_FOUND", message: "Context event not found" });
+      }
+      const claim = await ctx.db
+        .query("contextEventClaims")
+        .withIndex("by_event_consumer", (q) => q.eq("eventId", event._id).eq("consumer", consumer))
+        .unique();
+      if (claim === null || claim.claimToken !== item.claimToken || claim.status !== "claimed" || claim.leaseUntil <= now) {
+        throw new ConvexError({ code: "CONFLICT", message: "Context claim token is invalid or expired" });
+      }
+    }
+    const existing = await ctx.db
+      .query("contextMonitorEffects")
+      .withIndex("by_workspace_effect_key", (q) => q.eq("workspaceId", access.workspaceId).eq("effectKey", effectKey))
+      .unique();
+    if (existing !== null) {
+      if (existing.status === "completed") return { effectKey, status: "replayed" as const };
+      return { effectKey, status: existing.status };
+    }
+    const payload = {
+      scope: args.scope,
+      summary: args.summary,
+      wikiTask: args.wikiTask,
+      notification: args.notification,
+    };
+    await ctx.db.insert("contextMonitorEffects", {
+      workspaceId: access.workspaceId,
+      ownerId: access.userId,
+      effectKey,
+      consumer,
+      kind: args.kind,
+      eventIds: args.claims.map((item) => item.eventId),
+      status: args.kind === "wiki" ? "pending" as const : "completed" as const,
+      payload,
+      createdAt: now,
+    });
+    if (args.kind === "summary") {
+      const summary = nonEmpty(args.summary ?? "", "summary");
+      const { info } = await accessForScope(ctx, access.workspaceId, args.scope);
+      const existingSummary = await ctx.db
+        .query("contextSummaries")
+        .withIndex("by_scope", (q) => q.eq("workspaceId", access.workspaceId).eq("scopeKind", info.kind).eq("scopeId", info.scopeId))
+        .unique();
+      const value = {
+        workspaceId: access.workspaceId,
+        ownerId: access.userId,
+        scopeKind: info.kind,
+        scopeId: info.scopeId,
+        visibility: info.kind === "owner" ? "private" as const : "shared" as const,
+        channelId: info.channelId,
+        summary,
+        updatedAt: now,
+      };
+      if (existingSummary === null) await ctx.db.insert("contextSummaries", value);
+      else await ctx.db.patch(existingSummary._id, value);
+    } else if (args.kind === "notification") {
+      const note = args.notification;
+      if (note === undefined) invalid("notification is required");
+      const text = nonEmpty(note.text, "notification.text");
+      const existingOutbound = await ctx.db
+        .query("contextOutboundMessages")
+        .withIndex("by_outbound_id", (q) => q.eq("id", effectKey))
+        .unique();
+      if (existingOutbound !== null && existingOutbound.workspaceId !== access.workspaceId) {
+        throw new ConvexError({ code: "CONFLICT", message: "Monitor notification key belongs to another workspace" });
+      }
+      if (existingOutbound === null) {
+        await ctx.db.insert("contextOutboundMessages", {
+          id: effectKey,
+          workspaceId: access.workspaceId,
+          ownerId: access.userId,
+          destination: note.destination,
+          text,
+          status: "queued",
+          attempts: 0,
+          nextAttemptAt: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+    return { effectKey, status: args.kind === "wiki" ? "pending" as const : "completed" as const };
+  },
+});
+
+export const claimMonitorWikiEffects = mutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    consumer: v.string(),
+    limit: v.optional(v.number()),
+    leaseMs: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const consumer = nonEmpty(args.consumer, "consumer");
+    const limit = Math.min(Math.max(Math.floor(args.limit ?? 20), 1), 200);
+    const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 300_000), 1_000), 86_400_000);
+    const now = Date.now();
+    const stale = await ctx.db
+      .query("contextMonitorEffects")
+      .withIndex("by_workspace_status", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "running"))
+      .take(limit);
+    for (const row of stale) {
+      if ((row.jobLeaseUntil ?? 0) <= now) {
+        await ctx.db.patch(row._id, {
+          status: "needs_reconciliation",
+          error: "Wiki task lease expired; manual reconciliation required.",
+          completedAt: now,
+          jobConsumer: undefined,
+          jobClaimToken: undefined,
+          jobLeaseUntil: undefined,
+        });
+      }
+    }
+    const pending = await ctx.db
+      .query("contextMonitorEffects")
+      .withIndex("by_workspace_status", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "pending"))
+      .order("asc")
+      .take(limit);
+    const jobs: Array<{ effectKey: string; wikiTask: string; jobClaimToken: string; leaseUntil: number }> = [];
+    for (const row of pending) {
+      const rawPayload: unknown = row.payload;
+      const payload = rawPayload !== null && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+        ? rawPayload as Record<string, unknown>
+        : {};
+      const task = typeof payload.wikiTask === "string" ? payload.wikiTask.trim() : "";
+      if (!task) {
+        await ctx.db.patch(row._id, {
+          status: "needs_reconciliation",
+          error: "Wiki task payload is missing.",
+          completedAt: now,
+        });
+        continue;
+      }
+      const jobClaimToken = `${consumer}:${now}:${row.effectKey}`;
+      const leaseUntil = now + leaseMs;
+      await ctx.db.patch(row._id, {
+        status: "running",
+        startedAt: now,
+        jobConsumer: consumer,
+        jobClaimToken,
+        jobLeaseUntil: leaseUntil,
+      });
+      jobs.push({ effectKey: row.effectKey, wikiTask: task, jobClaimToken, leaseUntil });
+    }
+    return jobs;
+  },
+});
+
+export const completeMonitorWikiEffect = mutation({
+  args: {
+    workspaceId: v.optional(v.id("workspaces")),
+    consumer: v.string(),
+    effectKey: v.string(),
+    jobClaimToken: v.string(),
+    success: v.boolean(),
+    result: v.optional(v.string()),
+    error: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const consumer = nonEmpty(args.consumer, "consumer");
+    const effectKey = nonEmpty(args.effectKey, "effectKey");
+    const token = nonEmpty(args.jobClaimToken, "jobClaimToken");
+    const row = await ctx.db
+      .query("contextMonitorEffects")
+      .withIndex("by_workspace_effect_key", (q) => q.eq("workspaceId", access.workspaceId).eq("effectKey", effectKey))
+      .unique();
+    if (row === null || row.kind !== "wiki") throw new ConvexError({ code: "NOT_FOUND", message: "Wiki effect not found" });
+    if (row.jobConsumer !== consumer || row.status !== "running" || row.jobClaimToken !== token) {
+      throw new ConvexError({ code: "CONFLICT", message: "Wiki effect claim token is invalid" });
+    }
+    const rawPayload: unknown = row.payload;
+    const payload = rawPayload !== null && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+      ? rawPayload as Record<string, unknown>
+      : {};
+    const now = Date.now();
+    const boundedResult = args.result?.slice(-2_000);
+    const boundedError = args.error?.slice(-2_000);
+    await ctx.db.patch(row._id, args.success
+      ? {
+        status: "completed",
+        completedAt: now,
+        payload: { ...payload, result: boundedResult },
+        jobConsumer: undefined,
+        jobClaimToken: undefined,
+        jobLeaseUntil: undefined,
+      }
+      : {
+        status: "needs_reconciliation",
+        completedAt: now,
+        error: boundedError ?? "Wiki task failed; manual reconciliation required.",
+        jobConsumer: undefined,
+        jobClaimToken: undefined,
+        jobLeaseUntil: undefined,
+      });
+    return { effectKey, status: args.success ? "completed" as const : "needs_reconciliation" as const };
   },
 });
 

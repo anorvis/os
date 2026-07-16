@@ -2,8 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp, createServer, type App, type CreateAppOptions } from "../src/platform/gateway/app";
+import {
+  createApp,
+  createServer,
+  createWorkspaceGatewayRuntime,
+  type App,
+  type CreateAppOptions,
+} from "../src/platform/gateway/app";
 import type { ContextGatewayRuntime } from "../src/capability/context/gateway-runtime";
+import type { ContextRuntimeClient } from "../src/capability/context/runtime";
+import type { ChannelAdapter } from "../src/platform/channel/channel";
 
 type GatewayFixture = {
   app: App;
@@ -495,5 +503,120 @@ describe("minimal Anorvis OS gateway", () => {
       },
       { runtime },
     );
+  });
+  test("drains each configured workspace through isolated monitor and outbound workers", async () => {
+    const monitorClaims: string[] = [];
+    const outboundClaims: string[] = [];
+    const sentWorkspaces: string[] = [];
+    const completedWorkspaces: string[] = [];
+    const client = {
+      append: () => Promise.resolve({ inserted: true }),
+      compile: () => Promise.resolve({
+        scope: { kind: "owner" as const },
+        summaries: [],
+        events: [],
+        wikiPages: [],
+      }),
+      claim: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace claim required");
+        monitorClaims.push(input.workspaceId);
+        return Promise.resolve([]);
+      },
+      ack: () => Promise.resolve({ acknowledged: 1, cursor: 1 }),
+      saveSummary: () => Promise.resolve({ inserted: true }),
+      enqueueOutbound: () => Promise.resolve({ inserted: true }),
+      claimOutbound: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace outbound claim required");
+        outboundClaims.push(input.workspaceId);
+        return Promise.resolve([{
+          workspaceId: input.workspaceId,
+          id: `outbound-${input.workspaceId}`,
+          destination: { surface: "discord" as const, channelId: `channel-${input.workspaceId}` },
+          text: input.workspaceId,
+          status: "claimed" as const,
+          attempts: 1,
+          claimToken: `lease-${input.workspaceId}`,
+          leaseUntil: Date.now() + 1_000,
+        }]);
+      },
+      completeOutbound: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace outbound completion required");
+        completedWorkspaces.push(input.workspaceId);
+        return Promise.resolve({
+          id: `outbound-${input.workspaceId}`,
+          status: "completed" as const,
+          attempts: 1,
+        });
+      },
+    } as unknown as ContextRuntimeClient;
+    const adapter: ChannelAdapter = {
+      id: "discord",
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      send: (destination) => {
+        if (!destination.workspaceId) throw new Error("workspace destination required");
+        sentWorkspaces.push(destination.workspaceId);
+        return Promise.resolve({ ok: true, messageId: `message-${destination.workspaceId}` });
+      },
+    };
+    const runtime = createWorkspaceGatewayRuntime({
+      contextClient: client,
+      workspaceIds: ["workspace-1", "workspace-2"],
+      adapters: [adapter],
+    });
+
+    await runtime.start();
+    await runtime.stop();
+
+    expect(monitorClaims).toEqual(["workspace-1", "workspace-2"]);
+    expect([...new Set(outboundClaims)]).toEqual(["workspace-1", "workspace-2"]);
+    expect(sentWorkspaces).toEqual(outboundClaims);
+    expect(completedWorkspaces).toEqual(outboundClaims);
+  });
+  test("leaves a mismatched outbound claim fenced to its own workspace", async () => {
+    const sent: string[] = [];
+    const completed: string[] = [];
+    const client = {
+      append: () => Promise.resolve({ inserted: true }),
+      compile: () => Promise.resolve({ scope: { kind: "owner" as const }, summaries: [], events: [], wikiPages: [] }),
+      claim: () => Promise.resolve([]),
+      ack: () => Promise.resolve({ acknowledged: 1, cursor: 1 }),
+      saveSummary: () => Promise.resolve({ inserted: true }),
+      enqueueOutbound: () => Promise.resolve({ inserted: true }),
+      claimOutbound: () => Promise.resolve([{
+        workspaceId: "workspace-2",
+        id: "cross-workspace-row",
+        destination: { surface: "discord" as const, channelId: "channel-2" },
+        text: "must not cross",
+        status: "claimed" as const,
+        attempts: 1,
+        claimToken: "cross-workspace-lease",
+        leaseUntil: Date.now() + 1_000,
+      }]),
+      completeOutbound: () => {
+        completed.push("workspace-2");
+        return Promise.resolve({ id: "cross-workspace-row", status: "completed" as const, attempts: 1 });
+      },
+    } as unknown as ContextRuntimeClient;
+    const adapter: ChannelAdapter = {
+      id: "discord",
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      send: (destination) => {
+        sent.push(destination.workspaceId ?? "");
+        return Promise.resolve({ ok: true, messageId: "should-not-send" });
+      },
+    };
+    const runtime = createWorkspaceGatewayRuntime({
+      contextClient: client,
+      workspaceIds: ["workspace-1"],
+      adapters: [adapter],
+    });
+
+    await runtime.start();
+    await runtime.stop();
+
+    expect(sent).toEqual([]);
+    expect(completed).toEqual([]);
   });
 });

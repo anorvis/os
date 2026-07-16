@@ -8,12 +8,19 @@ import { createServiceRegistry } from "../../core/service/service";
 import { runWikiAgent } from "../../llm-wiki";
 import { getHomeDir } from "../../paths";
 import { serviceFactories } from "../../registry";
+import type { MaintenanceSessionRoots } from "../../capability/maintenance";
 import type { ContextCapabilityClient } from "../../capability/context/client";
 import { createContextClient, hasConvexConfiguration } from "../../capability/context/client";
 import { ContextGatewayRuntime } from "../../capability/context/gateway-runtime";
-import { ContextMonitorRuntime, ContextOutboundRuntime, type ContextRuntimeClient } from "../../capability/context/runtime";
+import {
+  ContextMonitorRuntime,
+  ContextOutboundRuntime,
+  type ContextRuntimeClient,
+  type OwnerNotificationDestination,
+} from "../../capability/context/runtime";
 import { DiscordContextRuntime } from "../../capability/context/runtime";
 import { DiscordChannelAdapter, parseDiscordConfig, type DiscordConfig } from "../channel/discord";
+import type { ChannelAdapter } from "../channel/channel";
 import type { ChannelBinding } from "../channel/authorization";
 
 export type CreateServerOptions = {
@@ -28,6 +35,8 @@ export type CreateAppOptions = {
   config?: LocalAuthorityConfig;
   contextClient?: ContextCapabilityClient;
   runtime?: ContextGatewayRuntime;
+  maintenanceRoot?: string;
+  maintenanceSessionRoots?: MaintenanceSessionRoots;
 };
 
 export type App = {
@@ -38,12 +47,13 @@ export type App = {
 };
 
 type AppLifecycle = "idle" | "starting" | "ready" | "failed" | "stopped";
-
 type AppServiceContext = {
   config: LocalAuthorityConfig;
   now(): Date;
   wikiAgent?: NonNullable<Parameters<typeof runWikiAgent>[1]>["wikiAgent"];
   contextClient?: ContextCapabilityClient;
+  maintenanceRoot?: string;
+  maintenanceSessionRoots?: MaintenanceSessionRoots;
   serviceIds?: () => string[];
 };
 
@@ -59,6 +69,8 @@ export function createApp(options: CreateAppOptions = {}): App {
     now: () => new Date(),
     wikiAgent: options.wikiAgent,
     contextClient: options.contextClient,
+    maintenanceRoot: options.maintenanceRoot,
+    maintenanceSessionRoots: options.maintenanceSessionRoots,
     serviceIds: () => serviceIds,
   };
   const registry = createServiceRegistry(context, serviceFactories);
@@ -168,51 +180,204 @@ export function createServer(options: CreateServerOptions = {}) {
       throw error;
     }
   })();
+
   const stop = async () => {
     await app.stop();
     await server.stop();
   };
   return { app, server, ready, stop };
 }
+export type WorkspaceGatewayRuntimeOptions = {
+  contextClient: ContextRuntimeClient;
+  workspaceIds: readonly string[];
+  ownerDestinations?: readonly OwnerNotificationDestination[];
+  adapters?: readonly ChannelAdapter[];
+  discord?: DiscordContextRuntime;
+};
+
+/**
+ * Compose one isolated monitor and outbound worker pair for every workspace.
+ * The singular gateway runtime remains responsible for globally ordered
+ * monitor/inbound stop, outbound drain, and adapter teardown.
+ */
+export function createWorkspaceGatewayRuntime(
+  options: WorkspaceGatewayRuntimeOptions,
+): ContextGatewayRuntime {
+  const workspaceIds = uniqueWorkspaceIds(options.workspaceIds);
+  const partitions: readonly (string | undefined)[] = workspaceIds.length ? workspaceIds : [undefined];
+  const monitors = partitions.map((workspaceId) =>
+    new ContextMonitorRuntime({
+      contextClient: options.contextClient,
+      ...(workspaceId ? { workspaceId, consumer: workspaceConsumer("monitor", workspaceId) } : {}),
+      ownerDestinations: (options.ownerDestinations ?? []).filter((destination) =>
+        workspaceId ? destination.workspaceId === workspaceId : destination.workspaceId === undefined,
+      ),
+    }),
+  );
+  const outbounds = partitions.map((workspaceId) =>
+    new ContextOutboundRuntime({
+      contextClient: options.contextClient,
+      adapters: options.adapters ?? [],
+      ...(workspaceId ? { workspaceId, consumer: workspaceConsumer("outbound", workspaceId) } : {}),
+    }),
+  );
+  return new ContextGatewayRuntime({
+    monitor: new MonitorCollection(monitors),
+    outbound: new OutboundCollection(outbounds),
+    ...(options.discord ? { discord: options.discord } : {}),
+  });
+}
+
+class MonitorCollection {
+  constructor(private readonly runtimes: readonly ContextMonitorRuntime[]) {}
+
+  async start(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const runtime of this.runtimes) {
+      try {
+        await runtime.start();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throwCollectionErrors(errors, "Context monitor startup failed");
+  }
+
+  async stop(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const runtime of this.runtimes) {
+      try {
+        await runtime.stop();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throwCollectionErrors(errors, "Context monitor shutdown failed");
+  }
+}
+
+class OutboundCollection {
+  constructor(private readonly runtimes: readonly ContextOutboundRuntime[]) {}
+
+  async start(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const runtime of this.runtimes) {
+      try {
+        await runtime.start();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throwCollectionErrors(errors, "Context outbound startup failed");
+  }
+
+  async stop(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const runtime of this.runtimes) {
+      try {
+        await runtime.stop();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throwCollectionErrors(errors, "Context outbound shutdown failed");
+  }
+
+  async drain(): Promise<void> {
+    const errors: unknown[] = [];
+    for (const runtime of this.runtimes) {
+      try {
+        await runtime.drain();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throwCollectionErrors(errors, "Context outbound drain failed");
+  }
+}
+
+function throwCollectionErrors(errors: readonly unknown[], message: string): void {
+  if (!errors.length) return;
+  if (errors.length === 1) throw errors[0];
+  throw new AggregateError(errors, message);
+}
+
+function workspaceConsumer(kind: "monitor" | "outbound", workspaceId: string): string {
+  return `os-${kind}:${encodeURIComponent(workspaceId)}`;
+}
+
+function uniqueWorkspaceIds(workspaceIds: readonly string[]): string[] {
+  return [...new Set(workspaceIds.map((workspaceId) => workspaceId.trim()).filter(Boolean))];
+}
+
+function configuredWorkspaceIds(bindings: readonly ChannelBinding[]): string[] {
+  return uniqueWorkspaceIds(bindings.flatMap((binding) => binding.workspaceId ? [binding.workspaceId] : []));
+}
 
 
 function createConfiguredRuntime(client: ContextCapabilityClient | undefined): ContextGatewayRuntime | undefined {
-  if (!client || typeof client.claim !== "function" || typeof client.ack !== "function" || typeof client.saveSummary !== "function" || typeof client.claimOutbound !== "function" || typeof client.completeOutbound !== "function") return undefined;
+  if (
+    !client ||
+    typeof client.append !== "function" ||
+    typeof client.compile !== "function" ||
+    typeof client.enqueueOutbound !== "function" ||
+    typeof client.claim !== "function" ||
+    typeof client.ack !== "function" ||
+    typeof client.saveSummary !== "function" ||
+    typeof client.claimOutbound !== "function" ||
+    typeof client.completeOutbound !== "function" ||
+    typeof client.renewClaim !== "function" ||
+    typeof client.claimMonitorWikiEffects !== "function" ||
+    typeof client.completeMonitorWikiEffect !== "function" ||
+    typeof client.commitMonitorEffect !== "function"
+  ) return undefined;
   const richClient = client as ContextRuntimeClient;
-  let discord: DiscordContextRuntime | undefined;
-  let discordAdapter: DiscordChannelAdapter | undefined;
-  let discordConfig: DiscordConfig | undefined;
+  let bindings: ChannelBinding[] = [];
   const botToken = process.env.ANORVIS_DISCORD_BOT_TOKEN?.trim() || process.env.DISCORD_BOT_TOKEN?.trim();
   if (botToken) {
     try {
-      discordConfig = parseDiscordConfig();
-      discordAdapter = new DiscordChannelAdapter(discordConfig);
-      discord = new DiscordContextRuntime({
+      const discordConfig = parseDiscordConfig();
+      const configuredBindings = discordBindings(discordConfig);
+      const adapter = new DiscordChannelAdapter(discordConfig);
+      const discordRuntime = new DiscordContextRuntime({
         contextClient: client,
-        adapter: discordAdapter,
-        bindings: discordBindings(discordConfig),
+        adapter,
+        bindings: configuredBindings,
+      });
+      bindings = configuredBindings;
+      const workspaceIds = configuredWorkspaceIds(bindings);
+      const ownerDestinations: OwnerNotificationDestination[] = discordConfig.privateHomeRoute
+        ? (workspaceIds.length
+          ? workspaceIds.map((workspaceId) => ({
+              visibility: "private" as const,
+              surface: "discord" as const,
+              workspaceId,
+              channelId: discordConfig.privateHomeRoute!.channelId,
+              ...(discordConfig.privateHomeRoute!.threadId ? { threadId: discordConfig.privateHomeRoute!.threadId } : {}),
+            }))
+          : [{
+              visibility: "private" as const,
+              surface: "discord" as const,
+              channelId: discordConfig.privateHomeRoute.channelId,
+              ...(discordConfig.privateHomeRoute.threadId ? { threadId: discordConfig.privateHomeRoute.threadId } : {}),
+            }])
+        : [];
+      return createWorkspaceGatewayRuntime({
+        contextClient: richClient,
+        workspaceIds,
+        ownerDestinations,
+        adapters: [adapter],
+        discord: discordRuntime,
       });
     } catch {
       // Invalid optional Discord configuration must not take down the gateway.
+      bindings = [];
     }
   }
-  const ownerDestinations = discordConfig?.privateHomeRoute
-    ? [{
-        visibility: "private" as const,
-        surface: "discord" as const,
-        channelId: discordConfig.privateHomeRoute.channelId,
-        ...(discordConfig.privateHomeRoute.threadId ? { threadId: discordConfig.privateHomeRoute.threadId } : {}),
-      }]
-    : [];
-  const monitor = new ContextMonitorRuntime({
+  return createWorkspaceGatewayRuntime({
     contextClient: richClient,
-    ownerDestinations,
+    workspaceIds: configuredWorkspaceIds(bindings),
   });
-  const outbound = new ContextOutboundRuntime({
-    contextClient: richClient,
-    adapters: discordAdapter ? [discordAdapter] : [],
-  });
-  return new ContextGatewayRuntime({ monitor, outbound, discord });
 }
 
 function discordBindings(config: DiscordConfig): ChannelBinding[] {
@@ -230,6 +395,7 @@ function discordBindings(config: DiscordConfig): ChannelBinding[] {
     ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
   }));
   for (const userId of config.allowedUserIds) {
+    if (config.bindings.some((binding) => binding.userId === userId)) continue;
     configured.push({
       identity: { provider: "discord" as const, accountId, userId },
       principalId: userId,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ContextAckRequest, ContextCapabilityClient, ContextClaimRequest, ContextCompileResult, ContextClaimedEvent, ContextOutboundRecord } from "../../src/capability/context/client";
+import type { ContextAckRequest, ContextCapabilityClient, ContextClaimRequest, ContextCompileResult, ContextClaimedEvent, ContextEventRecord, ContextOutboundRecord } from "../../src/capability/context/client";
 import { ContextMonitorRuntime, ContextOutboundRuntime, DiscordContextRuntime } from "../../src/capability/context/runtime";
 import type { ChannelAdapter, ChannelReceiver, ChannelSendResult, InboundChannelMessage } from "../../src/platform/channel/channel";
 
@@ -116,6 +116,43 @@ describe("context live runtimes", () => {
     await outbound.drain();
     expect(adapter.sent[0]?.destination).toEqual({ visibility: "private", workspaceId: "workspace", channelId: "dm", threadId: "thread" });
     expect(log.filter((entry) => entry.startsWith("append:")).length).toBe(2);
+    await runtime.stop();
+  });
+  test("persists attachment-only inbound metadata and gives it to the model", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const appendedInputs: unknown[] = [];
+    const modelInputs: string[] = [];
+    const append = client.append.bind(client);
+    client.append = (input) => {
+      appendedInputs.push(input);
+      return append(input);
+    };
+    const adapter = new FakeAdapter();
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
+      conversation: (input) => {
+        modelInputs.push(input.text);
+        return Promise.resolve("attachment reply");
+      },
+    });
+    await runtime.receive({
+      id: "attachment-only",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "",
+      occurredAt: 2,
+      attachments: [{ id: "file-1", name: "photo.png", mediaType: "image/png" }],
+    });
+    expect(appendedInputs[0]).toMatchObject({
+      content: {
+        text: "",
+        attachments: [{ id: "file-1", name: "photo.png", mediaType: "image/png" }],
+      },
+    });
+    expect(modelInputs[0]).toContain("photo.png");
     await runtime.stop();
   });
 
@@ -492,6 +529,54 @@ describe("context live runtimes", () => {
     expect(adapter.sent[0]?.message.id).toBe(adapter.sent[1]?.message.id);
     expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(2);
   });
+  test("duplicate inbound deliveries reuse durable reply and outbound IDs", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const adapter = new FakeAdapter();
+    let replyEvent: ContextEventRecord | undefined;
+    let modelCalls = 0;
+    const append = client.append.bind(client);
+    client.append = (input) => {
+      if (input.kind === "agent_action") replyEvent = input;
+      return append(input);
+    };
+    client.compile = (input) => Promise.resolve({
+      scope: input.scope,
+      events: replyEvent ? [replyEvent] : [],
+      summaries: [],
+      wikiPages: [],
+    } satisfies ContextCompileResult);
+    const enqueue = client.enqueueOutbound.bind(client);
+    client.enqueueOutbound = (input) => {
+      if (client.outbound.some((row) => row.id === input.id)) {
+        return Promise.resolve({ inserted: false, id: input.id });
+      }
+      return enqueue(input);
+    };
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
+      conversation: () => {
+        modelCalls += 1;
+        return Promise.resolve("deduplicated reply");
+      },
+    });
+    const message: InboundChannelMessage = {
+      id: "duplicate-message",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "same",
+      occurredAt: 2,
+      attachments: [],
+    };
+    await runtime.receive(message);
+    await runtime.receive(message);
+    expect(modelCalls).toBe(1);
+    expect(client.outbound).toHaveLength(1);
+    expect(client.outbound[0]?.id).toMatch(/^discord-reply:/);
+    await runtime.stop();
+  });
 
   test("Shutdown drains an in-flight model call before stopping the adapter", async () => {
     const log: string[] = [];
@@ -539,5 +624,276 @@ describe("context live runtimes", () => {
       attachments: [],
     });
     expect(adapter.sent).toHaveLength(1);
+  });
+  test("Monitor isolates private and channel scopes before invoking the model", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const event = (id: string, visibility: "private" | "shared", channelId?: string): ContextClaimedEvent => ({
+      event: {
+        id,
+        kind: "conversation_turn",
+        occurredAt: 1,
+        source: {
+          surface: "pi",
+          conversationId: id,
+          visibility,
+          ...(visibility === "private" ? { principalId: "owner" } : {}),
+          workspaceId: "workspace",
+          ...(channelId ? { channelId } : {}),
+        },
+        content: { text: id },
+      },
+      claimToken: `lease-${id}`,
+      attempts: 1,
+      leaseUntil: Date.now() + 60_000,
+    });
+    const claimed = [event("private", "private"), event("channel-a", "shared", "a"), event("channel-b", "shared", "b")];
+    client.claim = () => Promise.resolve(claimed);
+    const invocations: string[][] = [];
+    const saved: string[] = [];
+    client.saveSummary = (input) => {
+      saved.push(input.summary);
+      return Promise.resolve({ inserted: true });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      monitorAgent: (input) => {
+        invocations.push(input.events.map((item) => item.id));
+        return Promise.resolve({
+          summaries: [{
+            conversationId: input.events[0]?.source.conversationId ?? "",
+            visibility: "shared" as const,
+            channelId: "channel-b",
+            summary: "must not cross scope",
+          }],
+          wikiTasks: [],
+          notifications: [],
+          notes: "",
+        });
+      },
+    });
+    await monitor.drain();
+    expect(invocations).toEqual([["private"], ["channel-a"], ["channel-b"]]);
+    expect(saved).toHaveLength(0);
+    expect(log.filter((entry) => entry === "ack")).toHaveLength(3);
+  });
+  test("Monitor rejects a claimed event from a different configured workspace", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    client.claim = () => Promise.resolve([{
+      event: {
+        id: "wrong-workspace",
+        kind: "conversation_turn" as const,
+        occurredAt: 1,
+        source: {
+          surface: "pi" as const,
+          conversationId: "wrong-workspace",
+          visibility: "shared" as const,
+          workspaceId: "other-workspace",
+          channelId: "channel",
+        },
+        content: { text: "must remain retryable" },
+      },
+      claimToken: "lease",
+      attempts: 1,
+      leaseUntil: Date.now() + 60_000,
+    }]);
+    let invoked = false;
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      workspaceId: "configured-workspace",
+      monitorAgent: () => {
+        invoked = true;
+        return Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: "" });
+      },
+    });
+    await monitor.drain();
+    expect(invoked).toBe(false);
+    expect(log).not.toContain("ack");
+  });
+
+  test("Monitor loads and saves every affected scope beyond the batch-size window", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const claimed: ContextClaimedEvent[] = Array.from({ length: 60 }, (_, index) => ({
+      event: {
+        id: `scope-${index}`,
+        kind: "conversation_turn",
+        occurredAt: index,
+        source: {
+          surface: "pi",
+          conversationId: `scope-${index}`,
+          visibility: "shared",
+          workspaceId: "workspace",
+          channelId: `channel-${index}`,
+        },
+        content: { text: `scope-${index}` },
+      },
+      claimToken: `lease-${index}`,
+      attempts: 1,
+      leaseUntil: Date.now() + 60_000,
+    }));
+    client.claim = () => Promise.resolve(claimed);
+    const compileScopes: unknown[] = [];
+    let saves = 0;
+    client.compile = (input) => {
+      compileScopes.push(input.scope);
+      return Promise.resolve({ scope: input.scope, summaries: [], events: [], wikiPages: [] } satisfies ContextCompileResult);
+    };
+    client.saveSummary = () => {
+      saves += 1;
+      return Promise.resolve({ inserted: true });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      batchSize: 100,
+      monitorAgent: (input) => Promise.resolve({
+        summaries: [],
+        wikiTasks: [],
+        notifications: [],
+        notes: input.events[0]?.source.channelId ?? "",
+      }),
+    });
+    await monitor.drain();
+    expect(compileScopes).toHaveLength(60);
+    expect(saves).toBe(60);
+  });
+
+  test("Monitor leaves an expired or concurrently reclaimed claim unacked", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    let claims = 0;
+    const event = (token: string): ContextClaimedEvent => ({
+      event: {
+        id: "lease-event",
+        kind: "conversation_turn",
+        occurredAt: 1,
+        source: { surface: "pi", conversationId: "lease", visibility: "private", principalId: "owner" },
+        content: { text: "lease" },
+      },
+      claimToken: token,
+      attempts: claims,
+      leaseUntil: Date.now() + 60_000,
+    });
+    client.claim = () => {
+      claims += 1;
+      return Promise.resolve(claims === 1 ? [event("expired-token")] : [event("reclaimed-token")]);
+    };
+    let renewals = 0;
+    client.renewClaim = (input) => {
+      renewals += 1;
+      if (renewals === 1) return Promise.reject(new Error("claim reclaimed"));
+      return Promise.resolve({ claims: input.claims, leaseUntil: Date.now() + 300_000 });
+    };
+    client.commitMonitorEffect = (input) => Promise.resolve({ effectKey: input.effectKey, status: "completed" as const });
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      monitorAgent: () => Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: "durable" }),
+    });
+    await monitor.drain();
+    expect(log).not.toContain("ack");
+    await monitor.drain();
+    expect(log.filter((entry) => entry === "ack")).toHaveLength(1);
+  });
+
+  test("Monitor replay after a partial effect skips the completed effect key", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    let claims = 0;
+    const claimed = (token: string): ContextClaimedEvent => ({
+      event: {
+        id: "replay-event",
+        kind: "conversation_turn",
+        occurredAt: 1,
+        source: { surface: "pi", conversationId: "replay", visibility: "private", principalId: "owner" },
+        content: { text: "replay" },
+      },
+      claimToken: token,
+      attempts: claims,
+      leaseUntil: Date.now() + 60_000,
+    });
+    client.claim = () => {
+      claims += 1;
+      return Promise.resolve(claims === 1 ? [claimed("first-token")] : [claimed("reclaimed-token")]);
+    };
+    const seen = new Set<string>();
+    const effects: string[] = [];
+    let failNotification = true;
+    client.renewClaim = (input) => Promise.resolve({ claims: input.claims, leaseUntil: Date.now() + 300_000 });
+    client.commitMonitorEffect = (input) => {
+      if (input.kind === "notification" && failNotification) {
+        failNotification = false;
+        return Promise.reject(new Error("crash after summary"));
+      }
+      if (seen.has(input.effectKey)) return Promise.resolve({ effectKey: input.effectKey, status: "replayed" as const });
+      seen.add(input.effectKey);
+      effects.push(input.kind);
+      return Promise.resolve({ effectKey: input.effectKey, status: "completed" as const });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      ownerDestinations: [{ visibility: "private", surface: "discord", channelId: "dm" }],
+      monitorAgent: () => Promise.resolve({
+        summaries: [],
+        wikiTasks: [],
+        notifications: [{ text: "notice", reason: "test" }],
+        notes: "summary",
+      }),
+    });
+    await monitor.drain();
+    expect(log).not.toContain("ack");
+    await monitor.drain();
+    expect(log.filter((entry) => entry === "ack")).toHaveLength(1);
+    expect(effects).toEqual(["summary", "notification"]);
+  });
+  test("Monitor drains a pending Wiki job once and records completion", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    client.claim = () => Promise.resolve([]);
+    let jobClaims = 0;
+    let runs = 0;
+    const completions: Array<{ success: boolean; effectKey: string }> = [];
+    client.claimMonitorWikiEffects = () => {
+      jobClaims += 1;
+      return Promise.resolve(jobClaims === 1
+        ? [{ effectKey: "wiki-effect", wikiTask: "curate durable task", jobClaimToken: "job-token", leaseUntil: Date.now() + 300_000 }]
+        : []);
+    };
+    client.completeMonitorWikiEffect = (input) => {
+      completions.push({ success: input.success, effectKey: input.effectKey });
+      return Promise.resolve({ effectKey: input.effectKey, status: "completed" as const });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      wikiAgent: () => {
+        runs += 1;
+        return Promise.resolve({ ok: true });
+      },
+    });
+    await monitor.start();
+    await monitor.stop();
+    await monitor.start();
+    await monitor.stop();
+    expect(runs).toBe(1);
+    expect(completions).toEqual([{ success: true, effectKey: "wiki-effect" }]);
+  });
+
+  test("Monitor retains stale Wiki jobs as reconciliation failures without rerunning", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    client.claim = () => Promise.resolve([]);
+    let runs = 0;
+    client.claimMonitorWikiEffects = () => Promise.resolve([]);
+    client.completeMonitorWikiEffect = () => Promise.resolve({ effectKey: "stale", status: "needs_reconciliation" as const });
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      wikiAgent: () => {
+        runs += 1;
+        return Promise.resolve();
+      },
+    });
+    await monitor.start();
+    await monitor.stop();
+    expect(runs).toBe(0);
   });
 });
