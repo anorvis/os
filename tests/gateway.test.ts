@@ -243,6 +243,33 @@ describe("minimal Anorvis OS gateway", () => {
     });
   });
 
+  test("keeps serving and retries when the context runtime start fails", async () => {
+    await withIsolatedGateway(async () => {
+      let attempts = 0;
+      const runtime = {
+        start() {
+          attempts += 1;
+          if (attempts === 1) return Promise.reject(new Error("Convex authentication is required."));
+          return Promise.resolve();
+        },
+        stop: () => Promise.resolve(),
+      };
+      const server = createServer({
+        port: 0,
+        runtime: runtime as never,
+        runtimeRetryDelayMs: 10,
+      });
+      try {
+        await server.ready;
+        expect(attempts).toBe(2);
+        const health = await server.app.request("/health");
+        expect(health.status).toBe(200);
+      } finally {
+        await server.stop();
+      }
+    });
+  });
+
   test("handshakes a browser-local token before protected requests", async () => {
     await withIsolatedGateway(async ({ app, home }) => {
       const token = "web-test-browser-token";
