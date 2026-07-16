@@ -94,6 +94,8 @@ export type MaintenanceOverview = {
     byModel: MaintenanceModelUsage[];
   };
   tickets: MaintenanceTicket[];
+  total?: number;
+  usageTotal?: number;
 };
 
 export type MaintenanceSessionRoot = {
@@ -110,6 +112,11 @@ export type MaintenanceOptions = {
   root?: string;
   sessionRoots?: MaintenanceSessionRoots;
   now?: Date | (() => Date);
+  limit?: number;
+  offset?: number;
+  ticketStatuses?: readonly MaintenanceTicketStatus[];
+  sessionLimit?: number;
+  sessionOffset?: number;
 };
 
 type PersistedState = {
@@ -316,13 +323,27 @@ export function getMaintenanceOverview(options: MaintenanceOptions = {}): Mainte
     aggregate.outputLimitWarningCount += row.outputLimitWarningCount;
     byModel.set(key, aggregate);
   }
+  const allTickets = listMaintenanceTickets(options);
+  const filteredTickets = options.ticketStatuses?.length
+    ? allTickets.filter((ticket) => options.ticketStatuses!.includes(ticket.status))
+    : allTickets;
+  const paginated = options.limit !== undefined || options.offset !== undefined || options.ticketStatuses !== undefined;
+  const offset = paginated ? Math.max(0, Math.trunc(options.offset ?? 0)) : 0;
+  const limit = paginated ? Math.min(100, Math.max(0, Math.trunc(options.limit ?? 20))) : undefined;
+  const tickets = limit === undefined ? filteredTickets : filteredTickets.slice(offset, offset + limit);
+  const sessionPaginated = options.sessionLimit !== undefined || options.sessionOffset !== undefined;
+  const sessionOffset = sessionPaginated ? Math.max(0, Math.trunc(options.sessionOffset ?? 0)) : 0;
+  const sessionLimit = sessionPaginated ? Math.min(100, Math.max(0, Math.trunc(options.sessionLimit ?? 20))) : undefined;
+  const recent = sessionLimit === undefined ? usage.slice(0, 25) : usage.slice(sessionOffset, sessionOffset + sessionLimit);
   return {
     usage: {
       totals,
-      recent: usage.slice(0, 25),
+      recent,
       byModel: [...byModel.values()].sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`)),
     },
-    tickets: listMaintenanceTickets(options),
+    tickets,
+    ...(paginated ? { total: filteredTickets.length } : {}),
+    ...(sessionPaginated ? { usageTotal: usage.length } : {}),
   };
 }
 
