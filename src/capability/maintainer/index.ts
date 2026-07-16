@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -6,10 +7,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -135,7 +134,7 @@ export function getMaintainerStatus(options: MaintainerOptions = {}): Maintainer
     docker,
     sandboxImage: docker && sandboxImageAvailable(commandRunner, commandPath),
     modelAuth: {
-      vault: nonEmptyPath(join(sandboxDir, "agent")),
+      vault: vaultHasActiveCredential(join(sandboxDir, "agent")),
       apiKeys: readCredentialNames(join(sandboxDir, "env")),
     },
     githubToken: hasStoredGitHubToken(join(sandboxDir, "env")),
@@ -338,11 +337,32 @@ function readSandboxImageVersion(commandPath: string): string | null {
   }
 }
 
-function nonEmptyPath(path: string): boolean {
+/**
+ * The vault counts as authenticated only when OMP's credential store holds a
+ * non-disabled row. A merely initialized agent directory (empty agent.db from
+ * a prior worker run) must not report model auth as ready. Read-only and
+ * fail-closed: any missing file, foreign schema, or query error means false,
+ * and no credential data is ever read — only a count.
+ */
+export function vaultHasActiveCredential(vaultDir: string): boolean {
+  const databasePath = join(vaultDir, "agent.db");
+  if (!existsSync(databasePath)) return false;
   try {
-    const stat = statSync(path);
-    if (stat.isDirectory()) return readdirSync(path).length > 0;
-    return stat.isFile() && stat.size > 0;
+    const database = new Database(databasePath, { readonly: true });
+    try {
+      const row: unknown = database
+        .query("SELECT count(*) AS active FROM auth_credentials WHERE disabled_cause IS NULL")
+        .get();
+      return (
+        typeof row === "object" &&
+        row !== null &&
+        "active" in row &&
+        typeof row.active === "number" &&
+        row.active > 0
+      );
+    } finally {
+      database.close();
+    }
   } catch {
     return false;
   }

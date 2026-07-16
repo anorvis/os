@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import {
+  vaultHasActiveCredential,
   getMaintainerStatus,
   launchMaintainerVaultLogin,
   runMaintainerPreflight,
@@ -15,13 +17,52 @@ import {
 import { maintainerRoutes } from "../src/capability/maintainer/route";
 import { Hono } from "hono";
 
+const VAULT_SCHEMA = `CREATE TABLE auth_credentials (
+  id INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  credential_type TEXT NOT NULL,
+  data TEXT NOT NULL,
+  disabled_cause TEXT DEFAULT NULL
+)`;
+
+function seedVault(vaultDir: string, rows: Array<{ disabledCause: string | null }>): void {
+  mkdirSync(vaultDir, { recursive: true });
+  const database = new Database(join(vaultDir, "agent.db"));
+  database.exec(VAULT_SCHEMA);
+  for (const row of rows) {
+    database
+      .query("INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause) VALUES ('p', 'oauth', 'x', ?)")
+      .run(row.disabledCause);
+  }
+  database.close();
+}
+
+test("vault auth requires an active credential row", () => {
+  const home = mkdtempSync(join(tmpdir(), "anorvis-maintainer-vault-"));
+  // Missing database: not authenticated.
+  expect(vaultHasActiveCredential(join(home, "absent"))).toBe(false);
+  // Empty credential store from a prior worker boot: not authenticated.
+  seedVault(join(home, "empty"), []);
+  expect(vaultHasActiveCredential(join(home, "empty"))).toBe(false);
+  // Only disabled rows: not authenticated.
+  seedVault(join(home, "disabled"), [{ disabledCause: "revoked" }]);
+  expect(vaultHasActiveCredential(join(home, "disabled"))).toBe(false);
+  // One active row: authenticated.
+  seedVault(join(home, "active"), [{ disabledCause: "revoked" }, { disabledCause: null }]);
+  expect(vaultHasActiveCredential(join(home, "active"))).toBe(true);
+  // Foreign schema: fail closed.
+  mkdirSync(join(home, "foreign"), { recursive: true });
+  new Database(join(home, "foreign", "agent.db")).close();
+  expect(vaultHasActiveCredential(join(home, "foreign"))).toBe(false);
+});
+
 test("status reports isolated setup without exposing credentials", () => {
   const home = mkdtempSync(join(tmpdir(), "anorvis-maintainer-status-"));
   const sandbox = join(home, "sandbox");
   const launcherDir = join(home, "launcher");
   const launcher = join(launcherDir, "anorvis-sandbox");
   mkdirSync(join(sandbox, "agent"), { recursive: true });
-  writeFileSync(join(sandbox, "agent", "auth.json"), "oauth");
+  seedVault(join(sandbox, "agent"), [{ disabledCause: null }]);
   writeFileSync(join(sandbox, "env"), "# keep\nOPENAI_API_KEY=secret-value\nEMPTY_API_KEY=\nGH_TOKEN=gh-secret\n");
   mkdirSync(join(home, ".anorvis", "maintainer"), { recursive: true });
   writeFileSync(join(home, ".anorvis", "maintainer", "github-cookies.json"), "cookies");
