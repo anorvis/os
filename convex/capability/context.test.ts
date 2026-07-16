@@ -558,6 +558,35 @@ describe("shared context capability", () => {
     expect(compiled.events.map((item) => item.id)).not.toContain("private-note");
     expect(compiled.events.map((item) => item.id)).not.toContain("shared-health");
   });
+  it("bounds Monitor plans using the Monitor result limits", async () => {
+    const { client, workspaceId } = await owner("monitor-plan-bounds@example.test");
+    const oversized = "x".repeat(10_000);
+    const stored = await client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "batch-bounds",
+      planKey: "plan-bounds",
+      result: {
+        summaries: Array.from({ length: 40 }, (_, index) => ({
+          conversationId: `conversation-${index}`,
+          visibility: "private" as const,
+          summary: oversized,
+        })),
+        wikiTasks: Array.from({ length: 20 }, () => ({ task: oversized })),
+        notifications: Array.from({ length: 20 }, () => ({ text: oversized, reason: oversized })),
+        notes: oversized,
+      },
+    });
+    expect(stored.result?.summaries).toHaveLength(32);
+    expect(stored.result?.summaries[0]?.summary).toHaveLength(2_000);
+    expect(stored.result?.wikiTasks).toHaveLength(16);
+    expect(stored.result?.wikiTasks[0]?.task).toHaveLength(800);
+    expect(stored.result?.notifications).toHaveLength(16);
+    expect(stored.result?.notifications[0]?.text).toHaveLength(1_000);
+    expect(stored.result?.notifications[0]?.reason).toHaveLength(600);
+    expect(stored.result?.notes).toHaveLength(8_000);
+  });
+
   it("creates and replays a bounded Monitor plan within workspace scope", async () => {
     const { t, client, workspaceId } = await owner("monitor-plan@example.test");
     const result = {
