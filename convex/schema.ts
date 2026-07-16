@@ -1049,6 +1049,7 @@ const schema = defineSchema({
     consumer: v.string(),
     status: contextClaimStatus,
     claimToken: v.string(),
+    batchId: v.optional(v.string()),
     leaseUntil: v.number(),
     attempts: v.number(),
     claimedAt: v.number(),
@@ -1096,7 +1097,7 @@ const schema = defineSchema({
     .index("by_workspace_created", ["workspaceId", "createdAt"]),
   contextMonitorEffects: defineTable({
     workspaceId: v.id("workspaces"),
-    ownerId: v.id("users"),
+    ownerId: v.optional(v.id("users")),
     effectKey: v.string(),
     consumer: v.string(),
     jobConsumer: v.optional(v.string()),
@@ -1117,7 +1118,8 @@ const schema = defineSchema({
     error: v.optional(v.string()),
   })
     .index("by_workspace_effect_key", ["workspaceId", "effectKey"])
-    .index("by_workspace_status", ["workspaceId", "status"]),
+    .index("by_workspace_status", ["workspaceId", "status"])
+    .index("by_workspace_owner_status", ["workspaceId", "ownerId", "status"]),
 });
 
 export default schema;

@@ -155,37 +155,102 @@ export class ContextMonitorRuntime {
       leaseMs: this.options.leaseMs,
     });
     if (!claimed.length) return;
-    const partitions = this.partitionClaims(claimed);
-    for (const partition of partitions) {
-      partition.priorSummaries = await this.loadPriorSummaries(partition);
-      const events = partition.claimed.map((entry) => entry.event);
-      const priorNotes = partition.priorSummaries
-        .map((summary) => summary.summary.trim())
-        .filter(Boolean)
-        .join("\n")
-        .slice(-8_000);
-      const result = await runMonitorAgent(
-        { events, priorNotes, signal: undefined },
-        this.options.monitorAgent
-          ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
-          : { now: this.options.now() },
-      );
-      if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
-      await this.persistResult(result, partition);
-    }
-    await this.drainWikiEffects();
-    for (const partition of partitions) {
-      const claims = await this.renew(partition);
-      for (const entry of partition.claimed) {
-        const claim = claims.find((item) => item.eventId === entry.event.id);
-        await this.options.contextClient.ack({
-          ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-          consumer: this.options.consumer,
-          eventIds: [entry.event.id],
-          claimToken: claim?.claimToken ?? entry.claimToken,
-        });
+    const heartbeat = this.startHeartbeat(claimed);
+    try {
+      const partitions = this.partitionClaims(claimed);
+      for (const partition of partitions) {
+        heartbeat.check();
+        partition.priorSummaries = await this.loadPriorSummaries(partition);
+        const events = partition.claimed.map((entry) => entry.event);
+        const priorNotes = partition.priorSummaries
+          .map((summary) => summary.summary.trim())
+          .filter(Boolean)
+          .join("\n")
+          .slice(-8_000);
+        const result = await runMonitorAgent(
+          { events, priorNotes, signal: undefined },
+          this.options.monitorAgent
+            ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+            : { now: this.options.now() },
+        );
+        if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
+        heartbeat.check();
+        await this.persistResult(result, partition);
+        heartbeat.check();
       }
+      await this.drainWikiEffects();
+      heartbeat.check();
+      for (const partition of partitions) {
+        heartbeat.check();
+        const claims = await this.renew(partition);
+        for (const entry of partition.claimed) {
+          const claim = claims.find((item) => item.eventId === entry.event.id);
+          await this.options.contextClient.ack({
+            ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+            consumer: this.options.consumer,
+            eventIds: [entry.event.id],
+            claimToken: claim?.claimToken ?? entry.claimToken,
+          });
+        }
+      }
+    } finally {
+      await heartbeat.stop();
     }
+  }
+
+  private startHeartbeat(claimed: readonly ContextClaimedEvent[]) {
+    let timer: Timer | undefined;
+    let pending: Promise<unknown> | undefined;
+    let stopped = false;
+    let failed = false;
+    let failure: unknown;
+    const tick = (): void => {
+      if (stopped) return;
+      pending = (pending ?? Promise.resolve()).then(async () => {
+        if (stopped || failed) return;
+        await this.renewClaims(claimed);
+      }).catch((error: unknown) => {
+        failed = true;
+        failure ??= error;
+      });
+      timer = setTimeout(tick, Math.max(250, Math.floor(this.options.leaseMs / 3)));
+    };
+    timer = setTimeout(tick, Math.max(250, Math.floor(this.options.leaseMs / 3)));
+    return {
+      check: (): void => {
+        if (failed) throw failure;
+      },
+      stop: async (): Promise<void> => {
+        stopped = true;
+        clearTimeout(timer);
+        await pending;
+        if (failed) throw failure;
+      },
+    };
+  }
+
+  private async renewClaims(claimed: readonly ContextClaimedEvent[]): Promise<readonly ContextClaimFence[]> {
+    const renew = this.options.contextClient.renewClaim;
+    const fences = claimed.map((entry) => ({ eventId: entry.event.id, claimToken: entry.claimToken }));
+    if (typeof renew !== "function" || fences.length === 0) return fences;
+    const grouped = new Map<string, ContextClaimedEvent[]>();
+    for (const entry of claimed) {
+      const workspaceId = entry.event.workspaceId ?? entry.event.source.workspaceId ?? this.options.workspaceId ?? "";
+      const group = grouped.get(workspaceId) ?? [];
+      group.push(entry);
+      grouped.set(workspaceId, group);
+    }
+    const renewed: ContextClaimFence[] = [];
+    for (const [workspaceId, entries] of grouped) {
+      const result = await renew.call(this.options.contextClient, {
+        ...(workspaceId ? { workspaceId } : {}),
+        consumer: this.options.consumer,
+        claims: entries.map((entry) => ({ eventId: entry.event.id, claimToken: entry.claimToken })),
+        leaseMs: this.options.leaseMs,
+      });
+      renewed.push(...result.claims);
+    }
+    return renewed;
   }
 
   private partitionClaims(claimed: readonly ContextClaimedEvent[]): MonitorPartition[] {
@@ -247,18 +312,7 @@ export class ContextMonitorRuntime {
   }
 
   private async renew(partition: MonitorPartition): Promise<readonly ContextClaimFence[]> {
-    const claims = partition.claimed.map((entry) => ({ eventId: entry.event.id, claimToken: entry.claimToken }));
-    const renew = this.options.contextClient.renewClaim;
-    if (typeof renew === "function") {
-      const renewed = await renew.call(this.options.contextClient, {
-        ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
-        consumer: this.options.consumer,
-        claims,
-        leaseMs: this.options.leaseMs,
-      });
-      return renewed.claims;
-    }
-    return claims;
+    return this.renewClaims(partition.claimed);
   }
 
   private async commitEffect(request: ContextMonitorEffectRequest, partition: MonitorPartition): Promise<ContextMonitorEffectResult> {
@@ -307,7 +361,7 @@ export class ContextMonitorRuntime {
 
   private async persistResult(result: MonitorResult, partition: MonitorPartition): Promise<void> {
     const events = partition.claimed.map((entry) => entry.event);
-    const eventIds = events.map((event) => event.id).sort().join(",");
+    const batchId = partition.claimed[0]?.batchId ?? events[0]?.id ?? "empty";
     const values = partition.priorSummaries
       .map((summary) => summary.summary.trim())
       .filter(Boolean);
@@ -321,7 +375,7 @@ export class ContextMonitorRuntime {
     if (result.notes.trim() && !values.includes(result.notes.trim())) values.push(result.notes.trim());
     const summary = values.filter(Boolean).join("\n").slice(-8_000);
     if (summary) {
-      const effectKey = deterministicId("monitor-summary", `${this.options.consumer}:${eventIds}:${partition.key}:summary`);
+      const effectKey = deterministicId("monitor-summary", `${this.options.consumer}:${batchId}:${partition.key}:summary`);
       const request: ContextMonitorEffectRequest = {
         ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
         consumer: this.options.consumer,
@@ -343,7 +397,7 @@ export class ContextMonitorRuntime {
       }
     }
     for (const [index, task] of result.wikiTasks.entries()) {
-      const effectKey = deterministicId("monitor-wiki", `${this.options.consumer}:${eventIds}:${partition.key}:${index}`);
+      const effectKey = deterministicId("monitor-wiki", `${this.options.consumer}:${batchId}:${partition.key}:${index}`);
       const request: ContextMonitorEffectRequest = {
         ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
         consumer: this.options.consumer,
@@ -368,7 +422,7 @@ export class ContextMonitorRuntime {
     const destinations = this.options.ownerDestinations.filter((destination) => destination.visibility === "private");
     for (const [index, notification] of result.notifications.entries()) {
       for (const destination of destinations) {
-        const effectKey = deterministicId("monitor-notification", `${this.options.consumer}:${eventIds}:${partition.key}:${index}:${destination.workspaceId ?? ""}:${destination.channelId}:${destination.threadId ?? ""}`);
+        const effectKey = deterministicId("monitor-notification", `${this.options.consumer}:${batchId}:${partition.key}:${index}:${destination.workspaceId ?? ""}:${destination.channelId}:${destination.threadId ?? ""}`);
         const outbound = {
           destination: {
             surface: destination.surface,
@@ -619,12 +673,16 @@ export class DiscordContextRuntime {
     await this.stopAdapter();
   }
   async receive(message: InboundChannelMessage): Promise<void> {
-    if (this.stopping) return;
+    if (this.stopping) throw new Error("Discord context runtime is stopping");
     const authorized = authorizeChannelMessage(message, this.options.bindings);
     if (!authorized) return;
     const key = conversationKey(authorized);
+    await this.enqueueConversation(key, () => this.process(authorized));
+  }
+
+  private async enqueueConversation(key: string, task: () => Promise<void>): Promise<void> {
     const prior = this.tails.get(key) ?? Promise.resolve();
-    const current = prior.catch(() => undefined).then(() => this.process(authorized));
+    const current = prior.catch(() => undefined).then(task);
     this.tails.set(key, current);
     try {
       await current;
@@ -748,22 +806,36 @@ export class DiscordContextRuntime {
         kind: "conversation_turn",
       });
       for (const entry of claimed) {
+        const workspaceId = entry.event.workspaceId ?? entry.event.source.workspaceId;
         if (!this.replayAllowed(entry.event) || (entry.event.kind === "conversation_turn" && entry.event.content.assistant !== undefined)) {
-          await ack({ consumer: this.options.consumer, eventIds: [entry.event.id], claimToken: entry.claimToken });
+          await ack({
+            ...(workspaceId ? { workspaceId } : {}),
+            consumer: this.options.consumer,
+            eventIds: [entry.event.id],
+            claimToken: entry.claimToken,
+          });
           continue;
         }
         const destination: ChannelDestination = {
           visibility: entry.event.source.visibility,
-          ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}),
+          ...(workspaceId ? { workspaceId } : {}),
           channelId: entry.event.source.channelId ?? "",
           ...(entry.event.source.threadId ? { threadId: entry.event.source.threadId } : {}),
         };
         if (!destination.channelId) continue;
         const eventScope = entry.event.source.visibility === "private"
-          ? { kind: "owner" as const, ...(entry.event.source.principalId ? { ownerId: entry.event.source.principalId } : {}), ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}) }
-          : { kind: "channel" as const, channelId: destination.channelId, ...(entry.event.source.workspaceId ? { workspaceId: entry.event.source.workspaceId } : {}) };
-        await this.processEvent(entry.event, eventScope, destination, typeof entry.event.content.resourceId === "string" ? entry.event.content.resourceId : undefined);
-        await ack({ consumer: this.options.consumer, eventIds: [entry.event.id], claimToken: entry.claimToken });
+          ? { kind: "owner" as const, ...(entry.event.source.principalId ? { ownerId: entry.event.source.principalId } : {}), ...(workspaceId ? { workspaceId } : {}) }
+          : { kind: "channel" as const, channelId: destination.channelId, ...(workspaceId ? { workspaceId } : {}) };
+        await this.enqueueConversation(
+          entry.event.source.conversationId,
+          () => this.processEvent(entry.event, eventScope, destination, typeof entry.event.content.resourceId === "string" ? entry.event.content.resourceId : undefined),
+        );
+        await ack({
+          ...(workspaceId ? { workspaceId } : {}),
+          consumer: this.options.consumer,
+          eventIds: [entry.event.id],
+          claimToken: entry.claimToken,
+        });
       }
     }
   }

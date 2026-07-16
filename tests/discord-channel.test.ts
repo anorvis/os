@@ -186,6 +186,73 @@ describe("Discord channel adapter", () => {
     }
   });
 
+  test("retains messages rejected while ordered shutdown is stopping", async () => {
+    vi.useFakeTimers();
+    const root = mkdtempSync(join(tmpdir(), "anorvis-discord-stopping-"));
+    const spoolPath = join(root, "inbound.json");
+    try {
+      const client = new FakeClient();
+      const adapter = new DiscordChannelAdapter(config, { client, spoolPath });
+      await adapter.start(() => Promise.reject(new Error("runtime is stopping")));
+      client.emit("messageCreate", message({ id: "stopping-message", guildId: null }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await adapter.stop();
+      expect(JSON.parse(readFileSync(spoolPath, "utf8"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not overlap receiver retries while a delivery is in flight", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeClient();
+      const adapter = new DiscordChannelAdapter(config, { client });
+      let calls = 0;
+      let active = 0;
+      let maximumActive = 0;
+      let releaseFirst!: () => void;
+      let signalFirstStarted!: () => void;
+      const firstStarted = new Promise<void>((resolve) => { signalFirstStarted = resolve; });
+      await adapter.start(() => {
+        calls += 1;
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (calls === 1) {
+          signalFirstStarted();
+          return new Promise<void>((_, reject) => {
+            releaseFirst = () => {
+              active -= 1;
+              reject(new Error("receiver unavailable"));
+            };
+          });
+        }
+        active -= 1;
+        return Promise.resolve();
+      });
+      client.emit("messageCreate", message({ id: "slow-delivery", guildId: null }));
+      await firstStarted;
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      releaseFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(50);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(2);
+      expect(maximumActive).toBe(1);
+      await adapter.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("replays the durable inbound spool after adapter restart", async () => {
     const root = mkdtempSync(join(tmpdir(), "anorvis-discord-restart-"));
     const spoolPath = join(root, "inbound.json");

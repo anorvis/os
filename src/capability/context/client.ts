@@ -89,6 +89,7 @@ export type ContextEventRecord = ContextEventInput & {
 export type ContextClaimedEvent = {
   event: ContextEventRecord;
   claimToken: string;
+  batchId?: string;
   attempts: number;
   leaseUntil: number;
 };
@@ -258,6 +259,7 @@ const compileResultSchema = Schema.Struct({
 const claimedEventSchema = Schema.Struct({
   event: eventSchema,
   claimToken: Schema.String,
+  batchId: Schema.optional(Schema.String),
   attempts: Schema.Number,
   leaseUntil: Schema.Number,
 });

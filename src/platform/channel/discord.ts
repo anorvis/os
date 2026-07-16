@@ -347,6 +347,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     if (existing) return existing;
     const task = this.tryDeliverPending(id).finally(() => {
       if (this.deliveries.get(id) === task) this.deliveries.delete(id);
+      if (this.started && this.pending.has(id) && !this.retryTimers.has(id)) this.scheduleRetry(id);
     });
     this.deliveries.set(id, task);
     return task;
@@ -371,6 +372,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         this.scheduleRetry(id);
       }
     } catch {
+      this.deliveries.delete(id);
       this.scheduleRetry(id);
     }
   }
@@ -385,11 +387,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     );
     const timer = setTimeout(() => {
       this.retryTimers.delete(id);
-      if (this.deliveries.has(id)) {
-        this.deliveries.delete(id);
-        void this.deliverPending(id);
-        return;
-      }
+      if (this.deliveries.has(id)) return;
       void this.deliverPending(id);
     }, delay);
     this.retryTimers.set(id, timer);

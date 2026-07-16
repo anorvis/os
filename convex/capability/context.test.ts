@@ -149,6 +149,38 @@ describe("shared context capability", () => {
     expect(retry[0]?.attempts).toBe(2);
   });
 
+  it("preserves a batch identity across partial acknowledgements", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T12:00:00.000Z"));
+    const { client, workspaceId } = await owner("batch-identity@example.test");
+    await client.mutation(api.capability.context.append, { workspaceId, ...event("batch-first") });
+    await client.mutation(api.capability.context.append, { workspaceId, ...event("batch-second") });
+    const first = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "batch-consumer",
+      limit: 2,
+      leaseMs: 1_000,
+    });
+    expect(first).toHaveLength(2);
+    expect(first[0]?.batchId).toBe(first[1]?.batchId);
+    await client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "batch-consumer",
+      eventIds: [first[0].event.id],
+      claimToken: first[0].claimToken,
+    });
+    vi.advanceTimersByTime(1_001);
+    const retry = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "batch-consumer",
+      limit: 2,
+      leaseMs: 1_000,
+    });
+    expect(retry).toHaveLength(1);
+    expect(retry[0]?.event.id).toBe(first[1].event.id);
+    expect(retry[0]?.batchId).toBe(first[0].batchId);
+  });
+
   it("acknowledges a claim and does not redeliver it", async () => {
     const { client, workspaceId } = await owner();
     await client.mutation(api.capability.context.append, {
@@ -527,7 +559,7 @@ describe("shared context capability", () => {
     expect(compiled.events.map((item) => item.id)).not.toContain("shared-health");
   });
   it("claims and completes Monitor Wiki jobs exactly once", async () => {
-    const { client, workspaceId } = await owner("wiki-monitor@example.test");
+    const { t, client, workspaceId } = await owner("wiki-monitor@example.test");
     await client.mutation(api.capability.context.append, {
       workspaceId,
       ...event("wiki-effect"),
@@ -548,6 +580,25 @@ describe("shared context capability", () => {
       wikiTask: "curate the durable task",
     });
     expect(committed).toEqual({ effectKey: "wiki-effect-key", status: "pending" });
+    const secondUser = await t.run((ctx) => ctx.db.insert("users", { email: "wiki-member@example.test" }));
+    await t.run((ctx) => ctx.db.insert("workspaceMembers", {
+      workspaceId,
+      userId: secondUser,
+      role: "member",
+      createdAt: Date.now(),
+    }));
+    const member = t.withIdentity({ subject: secondUser });
+    await expect(member.mutation(api.capability.context.claimMonitorWikiEffects, {
+      workspaceId,
+      consumer: "member-wiki",
+    })).resolves.toEqual([]);
+    await expect(member.mutation(api.capability.context.completeMonitorWikiEffect, {
+      workspaceId,
+      consumer: "member-wiki",
+      effectKey: "wiki-effect-key",
+      jobClaimToken: "not-owner-token",
+      success: true,
+    })).rejects.toThrow("Wiki effect not found");
     const jobs = await client.mutation(api.capability.context.claimMonitorWikiEffects, {
       workspaceId,
       consumer: "os-monitor:wiki",

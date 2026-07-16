@@ -486,6 +486,7 @@ export const claim = mutation({
     const limit = Math.min(Math.max(Math.floor(args.limit ?? 50), 1), 200);
     const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 30_000), 1_000), 86_400_000);
     const now = Date.now();
+    const batchId = `${consumer}:${now}`;
     const consumerScope: ConsumerScope = {
       kind: info.kind,
       scopeId: info.scopeId,
@@ -513,7 +514,7 @@ export const claim = mutation({
       consumerRow?.scanCursor,
     );
     const page = scanPage.page;
-    const claimed: Array<{ event: ContextEvent; claimToken: string; attempts: number; leaseUntil: number }> = [];
+    const claimed: Array<{ event: ContextEvent; claimToken: string; batchId: string; attempts: number; leaseUntil: number }> = [];
     let blocked = false;
     let safeCursor: ContextEvent | undefined;
     for (const event of page) {
@@ -540,6 +541,7 @@ export const claim = mutation({
       }
       const attempts = (prior?.attempts ?? 0) + 1;
       const claimToken = `${consumer}:${now}:${event.id}`;
+      const eventBatchId = prior?.batchId ?? batchId;
       const leaseUntil = now + leaseMs;
       if (prior === null) {
         await ctx.db.insert("contextEventClaims", {
@@ -548,6 +550,7 @@ export const claim = mutation({
           consumer,
           status: "claimed",
           claimToken,
+          batchId: eventBatchId,
           leaseUntil,
           attempts,
           claimedAt: now,
@@ -556,13 +559,14 @@ export const claim = mutation({
         await ctx.db.patch(prior._id, {
           status: "claimed",
           claimToken,
+          batchId: eventBatchId,
           leaseUntil,
           attempts,
           claimedAt: now,
           ackedAt: undefined,
         });
       }
-      claimed.push({ event, claimToken, attempts, leaseUntil });
+      claimed.push({ event, claimToken, batchId: eventBatchId, attempts, leaseUntil });
       blocked = true;
     }
 
@@ -824,7 +828,9 @@ export const claimMonitorWikiEffects = mutation({
     const now = Date.now();
     const stale = await ctx.db
       .query("contextMonitorEffects")
-      .withIndex("by_workspace_status", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "running"))
+      .withIndex("by_workspace_owner_status", (q) =>
+        q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("status", "running"),
+      )
       .take(limit);
     for (const row of stale) {
       if ((row.jobLeaseUntil ?? 0) <= now) {
@@ -840,7 +846,9 @@ export const claimMonitorWikiEffects = mutation({
     }
     const pending = await ctx.db
       .query("contextMonitorEffects")
-      .withIndex("by_workspace_status", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "pending"))
+      .withIndex("by_workspace_owner_status", (q) =>
+        q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("status", "pending"),
+      )
       .order("asc")
       .take(limit);
     const jobs: Array<{ effectKey: string; wikiTask: string; jobClaimToken: string; leaseUntil: number }> = [];
@@ -892,7 +900,9 @@ export const completeMonitorWikiEffect = mutation({
       .query("contextMonitorEffects")
       .withIndex("by_workspace_effect_key", (q) => q.eq("workspaceId", access.workspaceId).eq("effectKey", effectKey))
       .unique();
-    if (row === null || row.kind !== "wiki") throw new ConvexError({ code: "NOT_FOUND", message: "Wiki effect not found" });
+    if (row === null || row.kind !== "wiki" || row.ownerId !== access.userId) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Wiki effect not found" });
+    }
     if (row.jobConsumer !== consumer || row.status !== "running" || row.jobClaimToken !== token) {
       throw new ConvexError({ code: "CONFLICT", message: "Wiki effect claim token is invalid" });
     }
