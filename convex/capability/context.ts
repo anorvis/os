@@ -486,7 +486,7 @@ export const claim = mutation({
     const limit = Math.min(Math.max(Math.floor(args.limit ?? 50), 1), 200);
     const leaseMs = Math.min(Math.max(Math.floor(args.leaseMs ?? 30_000), 1_000), 86_400_000);
     const now = Date.now();
-    const batchId = `${consumer}:${now}`;
+    const batchId = `${consumer}:${now}:${crypto.randomUUID()}`;
     const consumerScope: ConsumerScope = {
       kind: info.kind,
       scopeId: info.scopeId,
