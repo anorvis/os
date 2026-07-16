@@ -10,6 +10,7 @@
 
 import type * as auth from "../auth.js";
 import type * as capability_calendar from "../capability/calendar.js";
+import type * as capability_context from "../capability/context.js";
 import type * as capability_finance from "../capability/finance.js";
 import type * as capability_finance_decimal from "../capability/finance/decimal.js";
 import type * as capability_finance_import from "../capability/finance/import.js";
@@ -47,6 +48,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   "capability/calendar": typeof capability_calendar;
+  "capability/context": typeof capability_context;
   "capability/finance": typeof capability_finance;
   "capability/finance/decimal": typeof capability_finance_decimal;
   "capability/finance/import": typeof capability_finance_import;

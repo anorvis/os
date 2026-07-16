@@ -2,7 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp, type App, type CreateAppOptions } from "../src/platform/gateway/app";
+import {
+  createApp,
+  createServer,
+  createWorkspaceGatewayRuntime,
+  type App,
+  type CreateAppOptions,
+} from "../src/platform/gateway/app";
+import type { ContextGatewayRuntime } from "../src/capability/context/gateway-runtime";
+import type { ContextRuntimeClient } from "../src/capability/context/runtime";
+import type { ChannelAdapter } from "../src/platform/channel/channel";
 
 type GatewayFixture = {
   app: App;
@@ -131,6 +140,107 @@ describe("minimal Anorvis OS gateway", () => {
         },
       },
     );
+  });
+
+  test("blocks cross-origin browser requests without a token but allows originless CLI POSTs", async () => {
+    let wikiAgentCalls = 0;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        const malicious = await app.request("/v1/llm-wiki/wiki", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "https://evil.example",
+          },
+          body: JSON.stringify({ task: "must not execute" }),
+        });
+        expect(malicious.status).toBe(403);
+        expect(await malicious.json()).toEqual({ error: "origin not allowed" });
+        expect(wikiAgentCalls).toBe(0);
+
+        const cli = await app.request("/v1/llm-wiki/wiki", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task: "run from CLI" }),
+        });
+        expect(cli.status).toBe(200);
+        expect(wikiAgentCalls).toBe(1);
+      },
+      {
+        wikiAgent: ({ task }) => {
+          wikiAgentCalls += 1;
+          return Promise.resolve({
+            task,
+            answer: "handled",
+            confidence: "high",
+            sources: [],
+            changed: [],
+            readNext: [],
+            contradictions: [],
+            gaps: [],
+            warnings: [],
+          });
+        },
+      },
+    );
+  });
+
+  test("rejects tokenless handshakes on non-loopback binds", async () => {
+    await withIsolatedGateway(
+      async ({ app, home }) => {
+        const handshake = await app.request("/v1/auth/handshake", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:3000",
+          },
+          body: JSON.stringify({ token: "lan-takeover-token" }),
+        });
+        expect(handshake.status).toBe(503);
+        expect(await handshake.json()).toEqual({
+          error: "auth_token_required",
+        });
+        expect(() =>
+          readFileSync(join(home, ".anorvis", "os", "api-token"), "utf8"),
+        ).toThrow();
+      },
+      {
+        config: {
+          baseUrl: "http://192.0.2.10:8787",
+          bindHost: "192.0.2.10",
+          port: 8787,
+          dataRoot: tmpdir(),
+          tailnetName: null,
+        },
+      },
+    );
+  });
+
+  test("requires a token when createServer overrides its bind host", async () => {
+    await withIsolatedGateway(async () => {
+      const server = createServer({
+        hostname: "0.0.0.0",
+        port: 0,
+        startRuntime: false,
+      });
+      try {
+        await server.ready;
+        const handshake = await server.app.request("/v1/auth/handshake", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:3000",
+          },
+          body: JSON.stringify({ token: "override-takeover-token" }),
+        });
+        expect(handshake.status).toBe(503);
+        expect(await handshake.json()).toEqual({
+          error: "auth_token_required",
+        });
+      } finally {
+        await server.stop();
+      }
+    });
   });
 
   test("handshakes a browser-local token before protected requests", async () => {
@@ -330,5 +440,183 @@ describe("minimal Anorvis OS gateway", () => {
       expect(listResponse.status).toBe(404);
       expect(await listResponse.json()).toEqual({ error: "not_found" });
     });
+  });
+  test("reports runtime startup rejection and cleans up before failing readiness", async () => {
+    let stopCalls = 0;
+    const runtime = {
+      start: () => Promise.reject(new Error("discord runtime rejected startup")),
+      stop: () => {
+        stopCalls += 1;
+        return Promise.resolve();
+      },
+    } as unknown as ContextGatewayRuntime;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        let startupFailure: unknown;
+        try {
+          await app.start();
+        } catch (error) {
+          startupFailure = error;
+        }
+        expect(startupFailure).toMatchObject({
+          message: "discord runtime rejected startup",
+        });
+        const health = await app.request("/health");
+        expect(health.status).toBe(503);
+        expect(await health.json()).toEqual({
+          ok: false,
+          error: "discord runtime rejected startup",
+        });
+        await app.stop();
+        expect(stopCalls).toBe(1);
+      },
+      { runtime },
+    );
+  });
+  test("can restart cleanly after a rejected runtime start", async () => {
+    let startCalls = 0;
+    let stopCalls = 0;
+    const runtime = {
+      start: () => {
+        startCalls += 1;
+        return startCalls === 1
+          ? Promise.reject(new Error("transient runtime rejection"))
+          : Promise.resolve();
+      },
+      stop: () => {
+        stopCalls += 1;
+        return Promise.resolve();
+      },
+    } as unknown as ContextGatewayRuntime;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        try {
+          await app.start();
+        } catch (error) {
+          expect(error).toMatchObject({ message: "transient runtime rejection" });
+        }
+        await app.stop();
+        await app.start();
+        expect(startCalls).toBe(2);
+        await app.stop();
+        expect(stopCalls).toBe(2);
+      },
+      { runtime },
+    );
+  });
+  test("drains each configured workspace through isolated monitor and outbound workers", async () => {
+    const monitorClaims: string[] = [];
+    const outboundClaims: string[] = [];
+    const sentWorkspaces: string[] = [];
+    const completedWorkspaces: string[] = [];
+    const client = {
+      append: () => Promise.resolve({ inserted: true }),
+      compile: () => Promise.resolve({
+        scope: { kind: "owner" as const },
+        summaries: [],
+        events: [],
+        wikiPages: [],
+      }),
+      claim: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace claim required");
+        monitorClaims.push(input.workspaceId);
+        return Promise.resolve([]);
+      },
+      ack: () => Promise.resolve({ acknowledged: 1, cursor: 1 }),
+      saveSummary: () => Promise.resolve({ inserted: true }),
+      enqueueOutbound: () => Promise.resolve({ inserted: true }),
+      claimOutbound: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace outbound claim required");
+        outboundClaims.push(input.workspaceId);
+        return Promise.resolve([{
+          workspaceId: input.workspaceId,
+          id: `outbound-${input.workspaceId}`,
+          destination: { surface: "discord" as const, channelId: `channel-${input.workspaceId}` },
+          text: input.workspaceId,
+          status: "claimed" as const,
+          attempts: 1,
+          claimToken: `lease-${input.workspaceId}`,
+          leaseUntil: Date.now() + 1_000,
+        }]);
+      },
+      completeOutbound: (input: { workspaceId?: string }) => {
+        if (!input.workspaceId) throw new Error("workspace outbound completion required");
+        completedWorkspaces.push(input.workspaceId);
+        return Promise.resolve({
+          id: `outbound-${input.workspaceId}`,
+          status: "completed" as const,
+          attempts: 1,
+        });
+      },
+    } as unknown as ContextRuntimeClient;
+    const adapter: ChannelAdapter = {
+      id: "discord",
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      send: (destination) => {
+        if (!destination.workspaceId) throw new Error("workspace destination required");
+        sentWorkspaces.push(destination.workspaceId);
+        return Promise.resolve({ ok: true, messageId: `message-${destination.workspaceId}` });
+      },
+    };
+    const runtime = createWorkspaceGatewayRuntime({
+      contextClient: client,
+      workspaceIds: ["workspace-1", "workspace-2"],
+      adapters: [adapter],
+    });
+
+    await runtime.start();
+    await runtime.stop();
+
+    expect(monitorClaims).toEqual(["workspace-1", "workspace-2"]);
+    expect([...new Set(outboundClaims)]).toEqual(["workspace-1", "workspace-2"]);
+    expect(sentWorkspaces).toEqual(outboundClaims);
+    expect(completedWorkspaces).toEqual(outboundClaims);
+  });
+  test("leaves a mismatched outbound claim fenced to its own workspace", async () => {
+    const sent: string[] = [];
+    const completed: string[] = [];
+    const client = {
+      append: () => Promise.resolve({ inserted: true }),
+      compile: () => Promise.resolve({ scope: { kind: "owner" as const }, summaries: [], events: [], wikiPages: [] }),
+      claim: () => Promise.resolve([]),
+      ack: () => Promise.resolve({ acknowledged: 1, cursor: 1 }),
+      saveSummary: () => Promise.resolve({ inserted: true }),
+      enqueueOutbound: () => Promise.resolve({ inserted: true }),
+      claimOutbound: () => Promise.resolve([{
+        workspaceId: "workspace-2",
+        id: "cross-workspace-row",
+        destination: { surface: "discord" as const, channelId: "channel-2" },
+        text: "must not cross",
+        status: "claimed" as const,
+        attempts: 1,
+        claimToken: "cross-workspace-lease",
+        leaseUntil: Date.now() + 1_000,
+      }]),
+      completeOutbound: () => {
+        completed.push("workspace-2");
+        return Promise.resolve({ id: "cross-workspace-row", status: "completed" as const, attempts: 1 });
+      },
+    } as unknown as ContextRuntimeClient;
+    const adapter: ChannelAdapter = {
+      id: "discord",
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      send: (destination) => {
+        sent.push(destination.workspaceId ?? "");
+        return Promise.resolve({ ok: true, messageId: "should-not-send" });
+      },
+    };
+    const runtime = createWorkspaceGatewayRuntime({
+      contextClient: client,
+      workspaceIds: ["workspace-1"],
+      adapters: [adapter],
+    });
+
+    await runtime.start();
+    await runtime.stop();
+
+    expect(sent).toEqual([]);
+    expect(completed).toEqual([]);
   });
 });

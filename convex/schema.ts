@@ -59,6 +59,75 @@ const encryptedCredentials = v.optional(
     ciphertext: v.string(),
   }),
 );
+const contextEventKind = v.union(
+  v.literal("conversation_turn"),
+  v.literal("integration_update"),
+  v.literal("agent_action"),
+  v.literal("context_note"),
+);
+
+const contextSurface = v.union(
+  v.literal("pi"),
+  v.literal("discord"),
+  v.literal("web"),
+  v.literal("sms"),
+  v.literal("integration"),
+  v.literal("system"),
+);
+
+const contextVisibility = v.union(v.literal("private"), v.literal("shared"));
+
+const contextEventSource = v.object({
+  surface: contextSurface,
+  principalId: v.optional(v.string()),
+  conversationId: v.string(),
+  visibility: contextVisibility,
+  workspaceId: v.optional(v.string()),
+  channelId: v.optional(v.string()),
+  threadId: v.optional(v.string()),
+});
+
+const contextEventContent = v.object({
+  text: v.optional(v.string()),
+  prompt: v.optional(v.string()),
+  assistant: v.optional(v.any()),
+  toolResults: v.optional(v.any()),
+  resource: v.optional(v.string()),
+  resourceId: v.optional(v.string()),
+  attachments: v.optional(v.array(v.object({
+    id: v.string(),
+    name: v.string(),
+    mediaType: v.optional(v.string()),
+    url: v.optional(v.string()),
+  }))),
+});
+
+
+const contextClaimStatus = v.union(
+  v.literal("claimed"),
+  v.literal("acked"),
+);
+
+const contextOutboundStatus = v.union(
+  v.literal("queued"),
+  v.literal("claimed"),
+  v.literal("completed"),
+  v.literal("failed"),
+);
+
+const contextAttachment = v.object({
+  id: v.string(),
+  name: v.string(),
+  mediaType: v.optional(v.string()),
+  url: v.optional(v.string()),
+});
+
+const contextDestination = v.object({
+  surface: contextSurface,
+  channelId: v.string(),
+  threadId: v.optional(v.string()),
+  conversationId: v.optional(v.string()),
+});
 
 const schema = defineSchema({
   ...authTables,
@@ -667,11 +736,18 @@ const schema = defineSchema({
       v.literal("archived"),
       v.literal("deleted"),
     ),
+    visibility: v.optional(contextVisibility),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_workspace_path", ["workspaceId", "path"])
     .index("by_workspace_status_updated", ["workspaceId", "status", "updatedAt"])
+    .index("by_workspace_status_visibility_updated", [
+      "workspaceId",
+      "status",
+      "visibility",
+      "updatedAt",
+    ])
     .index("by_workspace_updated", ["workspaceId", "updatedAt"]),
 
   wikiPageAliases: defineTable({
@@ -836,6 +912,214 @@ const schema = defineSchema({
   })
     .index("by_workspace_created", ["workspaceId", "createdAt"])
     .index("by_workspace_status", ["workspaceId", "status"]),
+
+  contextEvents: defineTable({
+    id: v.string(),
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    kind: contextEventKind,
+    occurredAt: v.number(),
+    source: contextEventSource,
+    content: contextEventContent,
+    createdAt: v.number(),
+  })
+    .index("by_event_id", ["id"])
+    .index("by_workspace_occurred", ["workspaceId", "occurredAt"])
+    .index("by_workspace_created", ["workspaceId", "createdAt"])
+    .index("by_workspace_surface_created", [
+      "workspaceId",
+      "source.surface",
+      "createdAt",
+    ])
+    .index("by_workspace_kind_created", [
+      "workspaceId",
+      "kind",
+      "createdAt",
+    ])
+    .index("by_workspace_surface_kind_created", [
+      "workspaceId",
+      "source.surface",
+      "kind",
+      "createdAt",
+    ])
+    .index("by_workspace_visibility_occurred", [
+      "workspaceId",
+      "source.visibility",
+      "occurredAt",
+    ])
+    .index("by_workspace_owner_occurred", [
+      "workspaceId",
+      "ownerId",
+      "occurredAt",
+    ])
+    .index("by_workspace_visibility_channel_occurred", [
+      "workspaceId",
+      "source.visibility",
+      "source.channelId",
+      "occurredAt",
+    ]),
+  contextSummaries: defineTable({
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    scopeKind: v.union(
+      v.literal("owner"),
+      v.literal("workspace"),
+      v.literal("channel"),
+    ),
+    scopeId: v.string(),
+    visibility: contextVisibility,
+    channelId: v.optional(v.string()),
+    summary: v.string(),
+    updatedAt: v.number(),
+  })
+    .index("by_scope", ["workspaceId", "scopeKind", "scopeId"])
+    .index("by_workspace_updated", ["workspaceId", "updatedAt"])
+    .index("by_workspace_visibility_updated", [
+      "workspaceId",
+      "visibility",
+      "updatedAt",
+    ])
+    .index("by_workspace_owner_updated", [
+      "workspaceId",
+      "ownerId",
+      "updatedAt",
+    ])
+    .index("by_workspace_visibility_channel_updated", [
+      "workspaceId",
+      "visibility",
+      "channelId",
+      "updatedAt",
+    ]),
+
+  contextConsumers: defineTable({
+    workspaceId: v.id("workspaces"),
+    consumer: v.string(),
+    surface: v.optional(contextSurface),
+    kind: v.optional(contextEventKind),
+    // `cursor` is retained for rows written by the original occurredAt-based
+    // scanner. New scans persist their creation-order position separately.
+    cursor: v.number(),
+    cursorCreatedAt: v.optional(v.number()),
+    // Built-in Convex pagination cursor for creation-order scans.
+    // Legacy cursor/cursorCreatedAt/cursorEventId rows remain readable.
+    scanCursor: v.optional(v.string()),
+    cursorEventId: v.optional(v.id("contextEvents")),
+    scopeKind: v.optional(
+      v.union(
+        v.literal("owner"),
+        v.literal("workspace"),
+        v.literal("channel"),
+      ),
+    ),
+    scopeId: v.optional(v.string()),
+    updatedAt: v.number(),
+  })
+    .index("by_workspace_consumer", ["workspaceId", "consumer"])
+    .index("by_workspace_consumer_scope", [
+      "workspaceId",
+      "consumer",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_surface_scope", [
+      "workspaceId",
+      "consumer",
+      "surface",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_kind_scope", [
+      "workspaceId",
+      "consumer",
+      "kind",
+      "scopeKind",
+      "scopeId",
+    ])
+    .index("by_workspace_consumer_surface_kind_scope", [
+      "workspaceId",
+      "consumer",
+      "surface",
+      "kind",
+      "scopeKind",
+      "scopeId",
+    ]),
+  contextEventClaims: defineTable({
+    workspaceId: v.id("workspaces"),
+    eventId: v.id("contextEvents"),
+    consumer: v.string(),
+    status: contextClaimStatus,
+    claimToken: v.string(),
+    batchId: v.optional(v.string()),
+    leaseUntil: v.number(),
+    attempts: v.number(),
+    claimedAt: v.number(),
+    ackedAt: v.optional(v.number()),
+  })
+    .index("by_event_consumer", ["eventId", "consumer"])
+    .index("by_workspace_consumer", ["workspaceId", "consumer"])
+    .index("by_workspace_consumer_status", [
+      "workspaceId",
+      "consumer",
+      "status",
+    ]),
+
+  contextOutboundMessages: defineTable({
+    id: v.string(),
+    workspaceId: v.id("workspaces"),
+    ownerId: v.id("users"),
+    destination: contextDestination,
+    text: v.string(),
+    attachments: v.optional(v.array(contextAttachment)),
+    replyToId: v.optional(v.string()),
+    status: contextOutboundStatus,
+    attempts: v.number(),
+    nextAttemptAt: v.number(),
+    claimToken: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
+    claimedBy: v.optional(v.string()),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_outbound_id", ["id"])
+    .index("by_workspace_status_attempt", [
+      "workspaceId",
+      "status",
+      "nextAttemptAt",
+    ])
+    .index("by_workspace_owner_status_attempt", [
+      "workspaceId",
+      "ownerId",
+      "status",
+      "nextAttemptAt",
+    ])
+    .index("by_workspace_created", ["workspaceId", "createdAt"]),
+  contextMonitorEffects: defineTable({
+    workspaceId: v.id("workspaces"),
+    ownerId: v.optional(v.id("users")),
+    effectKey: v.string(),
+    consumer: v.string(),
+    jobConsumer: v.optional(v.string()),
+    kind: v.union(v.literal("summary"), v.literal("wiki"), v.literal("notification")),
+    eventIds: v.array(v.string()),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("running"),
+      v.literal("completed"),
+      v.literal("needs_reconciliation"),
+    ),
+    payload: v.any(),
+    createdAt: v.number(),
+    startedAt: v.optional(v.number()),
+    completedAt: v.optional(v.number()),
+    jobClaimToken: v.optional(v.string()),
+    jobLeaseUntil: v.optional(v.number()),
+    error: v.optional(v.string()),
+  })
+    .index("by_workspace_effect_key", ["workspaceId", "effectKey"])
+    .index("by_workspace_status", ["workspaceId", "status"])
+    .index("by_workspace_owner_status", ["workspaceId", "ownerId", "status"]),
 });
 
 export default schema;

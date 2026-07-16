@@ -24,7 +24,6 @@ const runKind = v.union(
   v.literal("research"),
   v.literal("compile"),
   v.literal("interaction_memory"),
-  v.literal("maintenance"),
 );
 
 function contentHash(value: string): string {
@@ -423,6 +422,7 @@ export const save = mutation({
         tags: pageTags,
         revisionNumber: 0,
         status: "active",
+        visibility: "private",
         createdAt: now,
         updatedAt: now,
       });
