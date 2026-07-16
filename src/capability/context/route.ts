@@ -4,9 +4,7 @@ import { json, parseJsonRequest } from "../../core/http/http";
 import type { RouteRegistrar } from "../../core/service/service";
 import {
   type ContextCapabilityClient,
-  type ContextCompileRequest,
   type ContextOutboundRequest,
-  type ContextScopeRequest,
 } from "./client";
 import { ContextEventInputSchema } from "./schema";
 
@@ -73,7 +71,7 @@ export function contextRoutes(options: ContextRouteOptions): RouteRegistrar {
     if (!parsed.ok) return json({ error: parsed.error }, 400);
     const input = decodeUnknownResult(CompileRequestSchema, parsed.value);
     if (!input.ok) return json({ error: input.error.message }, 400);
-    const result = await options.contextClient.compile(input.value as ContextCompileRequest);
+    const result = await options.contextClient.compile(input.value);
     return json(result);
   };
   const outbound = async (request: Request): Promise<Response> => {

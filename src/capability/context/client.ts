@@ -403,9 +403,9 @@ export class ConvexContextClient implements ContextCapabilityClient {
     this.transport?.setAuth?.(session.token);
   }
   private async newTransport(): Promise<ConvexTransport> {
-    return new ConvexHttpClient(
+    return Promise.resolve(new ConvexHttpClient(
       this.options.url ?? resolveConvexUrl(this.options.env ?? process.env, this.options.home ?? getHomeDir()),
-    ) as unknown as ConvexTransport;
+    ));
   }
 }
 export function createContextClient(options: ContextClientOptions = {}): ContextCapabilityClient {

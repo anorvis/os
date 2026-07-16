@@ -45,7 +45,7 @@ describe("Monitor prompt contract", () => {
 describe("Monitor output normalization", () => {
   test("keeps the contract fields and strips unknown fields", async () => {
     const result = await runMonitorAgent(input(), {
-      monitorAgent: async () => ({
+      monitorAgent: () => Promise.resolve({
         summaries: [{ conversationId: "conversation-1", visibility: "shared", channelId: "channel-1", summary: "Useful summary", extra: "drop" }],
         wikiTasks: [{ task: "Curate durable preference", extra: true }],
         notifications: [{ text: "A timely update.", reason: "It affects the owner today.", extra: "drop" }],
@@ -62,7 +62,7 @@ describe("Monitor output normalization", () => {
   });
 
   test("returns a useful status instead of throwing for malformed output", async () => {
-    const result = await runMonitorAgent(input(), { monitorAgent: async () => ({ summaries: [] }) });
+    const result = await runMonitorAgent(input(), { monitorAgent: () => Promise.resolve({ summaries: [] }) });
     expect(result.summaries).toEqual([]);
     expect(result.notes).toContain("invalid result shape");
   });
@@ -91,7 +91,7 @@ describe("Monitor output normalization", () => {
 
   test("rejects summaries that cross a conversation or channel scope", async () => {
     const result = await runMonitorAgent(input(), {
-      monitorAgent: async () => ({
+      monitorAgent: () => Promise.resolve({
         summaries: [
           { conversationId: "conversation-1", visibility: "shared", summary: "Missing channel" },
           { conversationId: "other", visibility: "shared", channelId: "channel-1", summary: "Unknown conversation" },
@@ -109,7 +109,7 @@ describe("Monitor output normalization", () => {
     const result = await runMonitorAgent(input([event({
       source: { ...event().source, visibility: "private", channelId: undefined },
     })]), {
-      monitorAgent: async () => ({
+      monitorAgent: () => Promise.resolve({
         summaries: [{ conversationId: "conversation-1", visibility: "shared", channelId: "channel-1", summary: "Private detail" }],
         wikiTasks: [],
         notifications: [],
@@ -122,9 +122,9 @@ describe("Monitor output normalization", () => {
   test("does not invoke the agent for an empty batch", async () => {
     let called = false;
     const result = await runMonitorAgent({ events: [] }, {
-      monitorAgent: async () => {
+      monitorAgent: () => {
         called = true;
-        return { summaries: [], wikiTasks: [], notifications: [], notes: "" };
+        return Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: "" });
       },
     });
     expect(called).toBe(false);

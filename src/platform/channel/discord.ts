@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   Client,
   GatewayIntentBits,
@@ -14,6 +15,7 @@ import type {
 } from "./channel";
 
 const MAX_DISCORD_MESSAGE_LENGTH = 2_000;
+const MAX_DISCORD_NONCE_LENGTH = 25;
 const RETRYABLE_ERROR_CODES: Record<string, true> = {
   ECONNRESET: true,
   ECONNREFUSED: true,
@@ -263,7 +265,11 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     let lastMessageId: string | undefined;
     try {
       for (const [index, text] of chunks.entries()) {
-        const payload: Record<string, unknown> = { content: text };
+        const payload: Record<string, unknown> = {
+          content: text,
+          nonce: discordNonce(message.id, index),
+          enforceNonce: true,
+        };
         if (index === 0 && files.length > 0) payload.files = files;
         if (index === 0 && message.replyToId) {
           payload.reply = { messageReference: message.replyToId };
@@ -414,26 +420,62 @@ function createDiscordClient(): DiscordClientLike {
 function normalizeAttachments(
   attachments: DiscordMessageLike["attachments"],
 ): ChannelAttachment[] {
-  if (!attachments) return [];
-  const iterable = "values" in attachments && typeof attachments.values === "function"
-    ? attachments.values()
-    : Symbol.iterator in Object(attachments)
-      ? attachments as Iterable<DiscordAttachmentLike>
-      : Object.values(attachments);
-  return Array.from(iterable).flatMap((attachment, index) => {
-    if (!attachment.url) return [];
+  return Array.from(discordAttachmentValues(attachments)).flatMap((value, index) => {
+    if (!isDiscordAttachmentLike(value) || !value.url) return [];
     return [{
-      id: attachment.id ?? attachment.url,
-      name: attachment.name?.trim() || `attachment-${index + 1}`,
-      ...(attachment.contentType ? { mediaType: attachment.contentType } : {}),
-      url: attachment.url,
+      id: value.id ?? value.url,
+      name: value.name?.trim() || `attachment-${index + 1}`,
+      ...(value.contentType ? { mediaType: value.contentType } : {}),
+      url: value.url,
     }];
   });
+}
+
+function discordAttachmentValues(
+  attachments: DiscordMessageLike["attachments"],
+): Iterable<unknown> {
+  if (!attachments) return [];
+  if (hasDiscordAttachmentValues(attachments)) return attachments.values();
+  if (isIterable(attachments)) return attachments;
+  if (typeof attachments === "object") return Object.values(attachments);
+  return [];
+}
+
+function hasDiscordAttachmentValues(value: unknown): value is { values: () => Iterable<unknown> } {
+  return typeof value === "object"
+    && value !== null
+    && "values" in value
+    && typeof value.values === "function";
+}
+
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return typeof value === "object"
+    && value !== null
+    && Symbol.iterator in value
+    && typeof value[Symbol.iterator] === "function";
+}
+
+function isDiscordAttachmentLike(value: unknown): value is DiscordAttachmentLike {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (candidate.id === undefined || typeof candidate.id === "string")
+    && (candidate.name === undefined || candidate.name === null || typeof candidate.name === "string")
+    && (candidate.contentType === undefined
+      || candidate.contentType === null
+      || typeof candidate.contentType === "string")
+    && (candidate.url === undefined || candidate.url === null || typeof candidate.url === "string");
 }
 
 
 function toDiscordFile(attachment: ChannelAttachment): { attachment: string; name: string } {
   return { attachment: attachment.url as string, name: attachment.name };
+}
+
+function discordNonce(outboundId: string, chunkIndex: number): string {
+  return createHash("sha256")
+    .update(`${outboundId}:${chunkIndex}`)
+    .digest("hex")
+    .slice(0, MAX_DISCORD_NONCE_LENGTH);
 }
 
 function readOptional(env: NodeJS.ProcessEnv, keys: readonly string[]): string | undefined {

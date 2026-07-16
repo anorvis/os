@@ -25,7 +25,7 @@ export type InboundChannelMessage = {
 };
 
 export type ContextScope =
-  | { kind: "owner"; ownerId: string }
+  | { kind: "owner"; ownerId: string; workspaceId?: string }
   | { kind: "workspace"; workspaceId: string }
   | { kind: "channel"; workspaceId?: string; channelId: string };
 

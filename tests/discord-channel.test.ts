@@ -15,27 +15,27 @@ class FakeClient implements DiscordClientLike {
   loginCalls = 0;
   destroyCalls = 0;
   sent: unknown[] = [];
-  fetchError: unknown;
-  sendError: unknown;
+  fetchError: Error | undefined;
+  sendError: Error | undefined;
   private readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   channels = {
-    fetch: async (_channelId: string) => {
-      if (this.fetchError) throw this.fetchError;
-      return {
-        send: async (payload: unknown) => {
-          if (this.sendError) throw this.sendError;
+    fetch: (_channelId: string) => {
+      if (this.fetchError) return Promise.reject(this.fetchError);
+      return Promise.resolve({
+        send: (payload: unknown) => {
+          if (this.sendError) return Promise.reject(this.sendError);
           this.sent.push(payload);
-          return { id: `sent-${this.sent.length}` };
+          return Promise.resolve({ id: `sent-${this.sent.length}` });
         },
-      };
+      });
     },
   };
 
-  async login(_token: string): Promise<string> {
+  login(_token: string): Promise<string> {
     this.loginCalls += 1;
     this.emit("ready");
-    return "token";
+    return Promise.resolve("token");
   }
 
   destroy(): void {
@@ -115,8 +115,9 @@ describe("Discord channel adapter", () => {
     const client = new FakeClient();
     const received: InboundChannelMessage[] = [];
     const adapter = new DiscordChannelAdapter(config, { client });
-    await adapter.start(async (candidate) => {
+    await adapter.start((candidate) => {
       received.push(candidate);
+      return Promise.resolve();
     });
 
     client.emit("messageCreate", message({ author: { id: "other-bot", bot: true } }));
@@ -135,8 +136,9 @@ describe("Discord channel adapter", () => {
     const client = new FakeClient();
     const received: InboundChannelMessage[] = [];
     const adapter = new DiscordChannelAdapter(config, { client });
-    await adapter.start(async (candidate) => {
+    await adapter.start((candidate) => {
       received.push(candidate);
+      return Promise.resolve();
     });
 
     client.emit("messageCreate", message({ guildId: null }));
@@ -163,6 +165,36 @@ describe("Discord channel adapter", () => {
     expect(owner?.authorization.contextScope).toEqual({ kind: "owner", ownerId: "owner-1" });
     expect(shared?.authorization.contextScope).toEqual({ kind: "channel", workspaceId: "workspace-1", channelId: "channel-1" });
     await adapter.stop();
+  });
+
+  test("selects the matching workspace for private owner bindings", () => {
+    const normalized = normalizeDiscordMessage(message({ guildId: null }), "bot-1");
+    if (!normalized) throw new Error("expected normalized DM");
+    const destination = { ...normalized.destination, workspaceId: "workspace-2" };
+    const firstWorkspace = {
+      identity: { provider: "discord" as const, accountId: "bot-1", userId: "user-1" },
+      principalId: "principal-1",
+      ownerId: "owner-1",
+      workspaceId: "workspace-1",
+    };
+    const secondWorkspace = { ...firstWorkspace, workspaceId: "workspace-2" };
+
+    const authorized = authorizeChannelMessage({ ...normalized, destination }, [
+      firstWorkspace,
+      secondWorkspace,
+    ]);
+
+    expect(authorized?.authorization.contextScope).toEqual({
+      kind: "owner",
+      ownerId: "owner-1",
+      workspaceId: "workspace-2",
+    });
+    const boundWithoutDestination = authorizeChannelMessage(normalized, [secondWorkspace]);
+    expect(boundWithoutDestination?.authorization.contextScope).toEqual({
+      kind: "owner",
+      ownerId: "owner-1",
+      workspaceId: "workspace-2",
+    });
   });
 
   test("chunks sends at 2,000 characters and preserves thread reply", async () => {
@@ -195,21 +227,54 @@ describe("Discord channel adapter", () => {
     await adapter.stop();
   });
 
+  test("uses stable length-safe nonces with enforcement across retries", async () => {
+    const client = new FakeClient();
+    const adapter = new DiscordChannelAdapter(config, { client });
+    await adapter.start(async () => {});
+    const outbound: OutboundChannelMessage = {
+      id: "outbound-row-with-a-stable-id-that-is-longer-than-discord-allows",
+      text: "x".repeat(2_001),
+    };
+    const destination = {
+      visibility: "private" as const,
+      channelId: "dm-1",
+    };
+
+    await adapter.send(destination, outbound);
+    const firstAttempt = (client.sent as Array<{ nonce: string; enforceNonce: boolean }>).map((payload) => ({
+      nonce: payload.nonce,
+      enforceNonce: payload.enforceNonce,
+    }));
+    await adapter.send(destination, outbound);
+    const secondAttempt = (client.sent as Array<{ nonce: string; enforceNonce: boolean }>).slice(firstAttempt.length).map((payload) => ({
+      nonce: payload.nonce,
+      enforceNonce: payload.enforceNonce,
+    }));
+
+    expect(firstAttempt).toHaveLength(2);
+    expect(secondAttempt).toEqual(firstAttempt);
+    expect(firstAttempt.every(({ nonce, enforceNonce }) =>
+      enforceNonce && nonce.length <= 25 && /^[a-f0-9]+$/.test(nonce)
+    )).toBe(true);
+    expect(new Set(firstAttempt.map(({ nonce }) => nonce)).size).toBe(2);
+    await adapter.stop();
+  });
+
   test("classifies transient send failures as retryable and lifecycle is reconnect-safe", async () => {
     const client = new FakeClient();
     const adapter = new DiscordChannelAdapter(config, { client });
     await adapter.start(async () => {});
     client.sendError = Object.assign(new Error("rate limited"), { status: 429 });
-    await expect(adapter.send({ visibility: "private", channelId: "dm-1" }, {
+    expect(await adapter.send({ visibility: "private", channelId: "dm-1" }, {
       id: "out-1",
       text: "hello",
-    })).resolves.toEqual({ ok: false, error: "rate limited", retryable: true });
+    })).toEqual({ ok: false, error: "rate limited", retryable: true });
     await adapter.stop();
     expect(client.destroyCalls).toBe(1);
-    await expect(adapter.send({ visibility: "private", channelId: "dm-1" }, {
+    expect(await adapter.send({ visibility: "private", channelId: "dm-1" }, {
       id: "out-1",
       text: "hello",
-    })).resolves.toEqual({ ok: false, error: "Discord adapter is not started", retryable: false });
+    })).toEqual({ ok: false, error: "Discord adapter is not started", retryable: false });
     await adapter.start(async () => {});
     expect(client.loginCalls).toBe(2);
     await adapter.stop();

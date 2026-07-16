@@ -96,13 +96,6 @@ const contextEventContent = v.object({
   resourceId: v.optional(v.string()),
 });
 
-const contextScope = v.object({
-  kind: v.union(v.literal("owner"), v.literal("workspace"), v.literal("channel")),
-  ownerId: v.optional(v.string()),
-  workspaceId: v.optional(v.id("workspaces")),
-  channelId: v.optional(v.string()),
-  scopeId: v.optional(v.string()),
-});
 
 const contextClaimStatus = v.union(
   v.literal("claimed"),
@@ -894,6 +887,7 @@ const schema = defineSchema({
       v.literal("research"),
       v.literal("compile"),
       v.literal("interaction_memory"),
+      v.literal("maintenance"),
     ),
     task: v.string(),
     status: jobStatus,
@@ -917,7 +911,7 @@ const schema = defineSchema({
     content: contextEventContent,
     createdAt: v.number(),
   })
-    .index("by_id", ["id"])
+    .index("by_event_id", ["id"])
     .index("by_workspace_occurred", ["workspaceId", "occurredAt"]),
 
   contextSummaries: defineTable({
@@ -987,9 +981,15 @@ const schema = defineSchema({
     updatedAt: v.number(),
     completedAt: v.optional(v.number()),
   })
-    .index("by_id", ["id"])
+    .index("by_outbound_id", ["id"])
     .index("by_workspace_status_attempt", [
       "workspaceId",
+      "status",
+      "nextAttemptAt",
+    ])
+    .index("by_workspace_owner_status_attempt", [
+      "workspaceId",
+      "ownerId",
       "status",
       "nextAttemptAt",
     ])

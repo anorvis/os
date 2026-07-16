@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, type App, type CreateAppOptions } from "../src/platform/gateway/app";
+import type { ContextGatewayRuntime } from "../src/capability/context/gateway-runtime";
 
 type GatewayFixture = {
   app: App;
@@ -330,5 +331,68 @@ describe("minimal Anorvis OS gateway", () => {
       expect(listResponse.status).toBe(404);
       expect(await listResponse.json()).toEqual({ error: "not_found" });
     });
+  });
+  test("reports runtime startup rejection and cleans up before failing readiness", async () => {
+    let stopCalls = 0;
+    const runtime = {
+      start: () => Promise.reject(new Error("discord runtime rejected startup")),
+      stop: () => {
+        stopCalls += 1;
+        return Promise.resolve();
+      },
+    } as unknown as ContextGatewayRuntime;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        let startupFailure: unknown;
+        try {
+          await app.start();
+        } catch (error) {
+          startupFailure = error;
+        }
+        expect(startupFailure).toMatchObject({
+          message: "discord runtime rejected startup",
+        });
+        const health = await app.request("/health");
+        expect(health.status).toBe(503);
+        expect(await health.json()).toEqual({
+          ok: false,
+          error: "discord runtime rejected startup",
+        });
+        await app.stop();
+        expect(stopCalls).toBe(1);
+      },
+      { runtime },
+    );
+  });
+  test("can restart cleanly after a rejected runtime start", async () => {
+    let startCalls = 0;
+    let stopCalls = 0;
+    const runtime = {
+      start: () => {
+        startCalls += 1;
+        return startCalls === 1
+          ? Promise.reject(new Error("transient runtime rejection"))
+          : Promise.resolve();
+      },
+      stop: () => {
+        stopCalls += 1;
+        return Promise.resolve();
+      },
+    } as unknown as ContextGatewayRuntime;
+    await withIsolatedGateway(
+      async ({ app }) => {
+        try {
+          await app.start();
+        } catch (error) {
+          expect(error).toMatchObject({ message: "transient runtime rejection" });
+        }
+        await app.stop();
+        await app.start();
+        expect(startCalls).toBe(2);
+        await app.stop();
+        expect(stopCalls).toBe(2);
+      },
+      { runtime },
+    );
   });
 });

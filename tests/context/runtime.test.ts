@@ -3,6 +3,18 @@ import type { ContextCapabilityClient, ContextCompileResult, ContextClaimedEvent
 import { ContextMonitorRuntime, ContextOutboundRuntime, DiscordContextRuntime } from "../../src/capability/context/runtime";
 import type { ChannelAdapter, ChannelReceiver, ChannelSendResult, InboundChannelMessage } from "../../src/platform/channel/channel";
 
+async function expectRejected(promise: Promise<unknown>, message: string): Promise<void> {
+  await promise.then(
+    () => {
+      throw new Error(`Expected promise to reject with "${message}"`);
+    },
+    (error: unknown) => {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(message);
+    },
+  );
+}
+
 function fakeClient(log: string[]) {
   let claimed = true;
   const outbound: ContextOutboundRecord[] = [];
@@ -13,16 +25,16 @@ function fakeClient(log: string[]) {
   } = {
     compileScopes,
     outbound,
-    append: async (input) => {
+    append: (input) => {
       log.push(`append:${input.id}`);
-      return { inserted: true, id: input.id };
+      return Promise.resolve({ inserted: true, id: input.id });
     },
-    compile: async (input) => {
+    compile: (input) => {
       compileScopes.push(input.scope);
-      return { scope: input.scope, events: [], summaries: [], wikiPages: [] } satisfies ContextCompileResult;
+      return Promise.resolve({ scope: input.scope, events: [], summaries: [], wikiPages: [] } satisfies ContextCompileResult);
     },
-    claim: async () => {
-      if (!claimed) return [];
+    claim: () => {
+      if (!claimed) return Promise.resolve([]);
       claimed = false;
       const event: ContextClaimedEvent["event"] = {
         id: "monitor-event",
@@ -31,26 +43,26 @@ function fakeClient(log: string[]) {
         source: { surface: "pi", conversationId: "owner-conversation", visibility: "private", principalId: "owner" },
         content: { text: "check" },
       };
-      return [{ event, claimToken: "lease", attempts: 1, leaseUntil: Date.now() + 1_000 }];
+      return Promise.resolve([{ event, claimToken: "lease", attempts: 1, leaseUntil: Date.now() + 1_000 }]);
     },
-    saveSummary: async () => {
+    saveSummary: () => {
       log.push("summary");
-      return { inserted: true };
+      return Promise.resolve({ inserted: true });
     },
-    enqueueOutbound: async (input) => {
+    enqueueOutbound: (input) => {
       log.push(`enqueue:${input.id}`);
       const row = { ...input, status: "queued" as const, attempts: 0, claimToken: "out-lease", leaseUntil: Date.now() + 1_000 };
       outbound.push(row);
-      return { inserted: true, id: input.id };
+      return Promise.resolve({ inserted: true, id: input.id });
     },
-    claimOutbound: async () => outbound.splice(0),
-    completeOutbound: async (input) => {
+    claimOutbound: () => Promise.resolve(outbound.splice(0)),
+    completeOutbound: (input) => {
       log.push(`complete:${input.id}:${input.retryable === true ? "retry" : input.success === true ? "success" : "failed"}`);
-      return { id: input.id ?? "", status: "completed" as const, attempts: 1 };
+      return Promise.resolve({ id: input.id ?? "", status: "completed" as const, attempts: 1 });
     },
-    ack: async () => {
+    ack: () => {
       log.push("ack");
-      return { acknowledged: 1, cursor: 1 };
+      return Promise.resolve({ acknowledged: 1, cursor: 1 });
     },
   };
   return client;
@@ -60,13 +72,14 @@ function fakeClient(log: string[]) {
 class FakeAdapter implements ChannelAdapter {
   readonly id = "discord" as const;
   receiver: ChannelReceiver | undefined;
-  sent: Array<{ destination: unknown; message: unknown }> = [];
+  sent: Array<{ destination: unknown; message: { id: string; text: string; replyToId?: string } }> = [];
   sendResult: ChannelSendResult = { ok: true, messageId: "reply" };
-  async start(receiver: ChannelReceiver) { this.receiver = receiver; }
-  async stop() { this.receiver = undefined; }
-  async send(destination: InboundChannelMessage["destination"], message: { id: string; text: string; replyToId?: string }): Promise<ChannelSendResult> {
+  stopCalls = 0;
+  start(receiver: ChannelReceiver) { this.receiver = receiver; return Promise.resolve(); }
+  stop() { this.stopCalls += 1; this.receiver = undefined; return Promise.resolve(); }
+  send(destination: InboundChannelMessage["destination"], message: { id: string; text: string; replyToId?: string }): Promise<ChannelSendResult> {
     this.sent.push({ destination, message });
-    return this.sendResult;
+    return Promise.resolve(this.sendResult);
   }
 }
 
@@ -74,12 +87,18 @@ describe("context live runtimes", () => {
   test("Discord inbound compiles the exact owner scope and persists the reply", async () => {
     const log: string[] = [];
     const client = fakeClient(log);
+    const appendedInputs: unknown[] = [];
+    const append = client.append.bind(client);
+    client.append = (input) => {
+      appendedInputs.push(input);
+      return append(input);
+    };
     const adapter = new FakeAdapter();
     const runtime = new DiscordContextRuntime({
       contextClient: client,
       adapter,
-      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
-      conversation: async () => "owner reply",
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner", workspaceId: "workspace" }],
+      conversation: () => Promise.resolve("owner reply"),
     });
     await runtime.start();
     await runtime.receive({
@@ -90,7 +109,8 @@ describe("context live runtimes", () => {
       occurredAt: 2,
       attachments: [],
     });
-    expect(client.compileScopes).toEqual([{ kind: "owner", ownerId: "owner" }]);
+    expect(client.compileScopes).toEqual([{ kind: "owner", ownerId: "owner", workspaceId: "workspace" }]);
+    expect(appendedInputs[0]).toMatchObject({ workspaceId: "workspace", source: { workspaceId: "workspace" } });
     expect(adapter.sent[0]?.destination).toEqual({ visibility: "private", channelId: "dm", threadId: "thread" });
     expect(log.filter((entry) => entry.startsWith("append:")).length).toBe(2);
     await runtime.stop();
@@ -104,7 +124,7 @@ describe("context live runtimes", () => {
       contextClient: client,
       adapter,
       bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "shared-user" }, principalId: "principal", scopeId: "guild", channelId: "channel", workspaceId: "workspace" }],
-      conversation: async () => "shared reply",
+      conversation: () => Promise.resolve("shared reply"),
     });
     await runtime.receive({
       id: "unauthorized",
@@ -133,7 +153,7 @@ describe("context live runtimes", () => {
     const monitor = new ContextMonitorRuntime({
       contextClient: client as never,
       ownerDestinations: [{ visibility: "private", surface: "discord", channelId: "dm" }],
-      monitorAgent: async () => ({ summaries: [], wikiTasks: [], notifications: [{ text: "owner notice", reason: "test" }], notes: "" }),
+      monitorAgent: () => Promise.resolve({ summaries: [], wikiTasks: [], notifications: [{ text: "owner notice", reason: "test" }], notes: "" }),
     });
     await monitor.drain();
     expect(log.findIndex((entry) => entry.startsWith("enqueue:"))).toBeLessThan(log.indexOf("ack"));
@@ -163,11 +183,169 @@ describe("context live runtimes", () => {
     const client = fakeClient(log);
     const monitor = new ContextMonitorRuntime({
       contextClient: client as never,
-      monitorAgent: async () => {
-        throw new Error("agent unavailable");
-      },
+      monitorAgent: () => Promise.reject(new Error("agent unavailable")),
     });
     await monitor.drain();
     expect(log).not.toContain("ack");
+  });
+
+  test("Monitor acknowledges every event with its claim token", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const first = {
+      event: {
+        id: "monitor-event-1",
+        kind: "conversation_turn" as const,
+        occurredAt: 1,
+        source: { surface: "pi" as const, conversationId: "owner-conversation-1", visibility: "private" as const, principalId: "owner" },
+        content: { text: "check one" },
+      },
+      claimToken: "lease-1",
+      attempts: 1,
+      leaseUntil: 2_000,
+    };
+    const second = {
+      event: {
+        id: "monitor-event-2",
+        kind: "conversation_turn" as const,
+        occurredAt: 2,
+        source: { surface: "pi" as const, conversationId: "owner-conversation-2", visibility: "private" as const, principalId: "owner" },
+        content: { text: "check two" },
+      },
+      claimToken: "lease-2",
+      attempts: 1,
+      leaseUntil: 2_000,
+    };
+    const acknowledgments: Array<{ consumer: string; eventIds: readonly string[]; claimToken?: string }> = [];
+    client.claim = () => Promise.resolve([first, second]);
+    client.ack = (input) => {
+      acknowledgments.push(input);
+      return Promise.resolve({ acknowledged: 1, cursor: 2 });
+    };
+    const monitor = new ContextMonitorRuntime({
+      contextClient: client as never,
+      monitorAgent: () => Promise.resolve({ summaries: [], wikiTasks: [], notifications: [], notes: "" }),
+    });
+    await monitor.drain();
+    expect(acknowledgments).toEqual([
+      { consumer: "os-monitor", eventIds: ["monitor-event-1"], claimToken: "lease-1" },
+      { consumer: "os-monitor", eventIds: ["monitor-event-2"], claimToken: "lease-2" },
+    ]);
+  });
+
+  test("A persisted inbound event is retried after a model failure", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const appended: string[] = [];
+    client.append = (input) => {
+      const duplicate = appended.includes(input.id);
+      appended.push(input.id);
+      return Promise.resolve({ inserted: !duplicate, id: input.id });
+    };
+    let attempts = 0;
+    const adapter = new FakeAdapter();
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
+      conversation: () => {
+        attempts += 1;
+        if (attempts === 1) return Promise.reject(new Error("model unavailable"));
+        return Promise.resolve("recovered reply");
+      },
+    });
+    const message: InboundChannelMessage = {
+      id: "retry-message",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "retry me",
+      occurredAt: 2,
+      attachments: [],
+    };
+    await expectRejected(runtime.receive(message), "model unavailable");
+    await runtime.receive(message);
+    expect(attempts).toBe(2);
+    expect(adapter.sent).toHaveLength(1);
+    expect(appended.filter((id) => id.startsWith("discord-event:"))).toHaveLength(2);
+    expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(1);
+  });
+
+  test("A send failure can replay the persisted inbound with the same outbound id", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const appended: string[] = [];
+    client.append = (input) => {
+      const duplicate = appended.includes(input.id);
+      appended.push(input.id);
+      return Promise.resolve({ inserted: !duplicate, id: input.id });
+    };
+    const adapter = new FakeAdapter();
+    adapter.sendResult = { ok: false, error: "send unavailable", retryable: true };
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
+      conversation: () => Promise.resolve("replayed reply"),
+    });
+    const message: InboundChannelMessage = {
+      id: "send-retry-message",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "send retry",
+      occurredAt: 2,
+      attachments: [],
+    };
+    await expectRejected(runtime.receive(message), "send unavailable");
+    adapter.sendResult = { ok: true, messageId: "replayed" };
+    await runtime.receive(message);
+    expect(adapter.sent).toHaveLength(2);
+    expect(adapter.sent[0]?.message.id).toBe(adapter.sent[1]?.message.id);
+    expect(appended.filter((id) => id.startsWith("discord-turn:"))).toHaveLength(1);
+  });
+
+  test("Shutdown drains an in-flight model call before stopping the adapter", async () => {
+    const log: string[] = [];
+    const client = fakeClient(log);
+    const adapter = new FakeAdapter();
+    let modelStarted!: () => void;
+    const started = new Promise<void>((resolve) => { modelStarted = resolve; });
+    let releaseModel!: (reply: string) => void;
+    const model = new Promise<string>((resolve) => { releaseModel = resolve; });
+    const runtime = new DiscordContextRuntime({
+      contextClient: client,
+      adapter,
+      bindings: [{ identity: { provider: "discord", accountId: "bot", userId: "owner-user" }, principalId: "owner", ownerId: "owner" }],
+      conversation: () => {
+        modelStarted();
+        return model;
+      },
+    });
+    await runtime.start();
+    const receive = runtime.receive({
+      id: "shutdown-message",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "wait for me",
+      occurredAt: 2,
+      attachments: [],
+    });
+    await started;
+    const stop = runtime.stop();
+    await Promise.resolve();
+    expect(adapter.stopCalls).toBe(0);
+    releaseModel("drained reply");
+    await receive;
+    await stop;
+    expect(adapter.stopCalls).toBe(1);
+    expect(adapter.sent).toHaveLength(1);
+    await runtime.receive({
+      id: "late-message",
+      identity: { provider: "discord", accountId: "bot", userId: "owner-user" },
+      destination: { visibility: "private", channelId: "dm" },
+      text: "must be ignored",
+      occurredAt: 3,
+      attachments: [],
+    });
+    expect(adapter.sent).toHaveLength(1);
   });
 });

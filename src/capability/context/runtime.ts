@@ -8,7 +8,6 @@ import type {
   ContextClaimOutboundRequest,
   ContextClaimRequest,
   ContextClaimedEvent,
-  ContextCompileRequest,
   ContextCompileResult,
   ContextCompleteOutboundRequest,
   ContextEventRecord,
@@ -22,7 +21,6 @@ import type {
   AuthorizedChannelMessage,
   ChannelAdapter,
   ChannelDestination,
-  ChannelReceiver,
   InboundChannelMessage,
 } from "../../platform/channel/channel";
 
@@ -124,18 +122,20 @@ export class ContextMonitorRuntime {
       leaseMs: this.options.leaseMs,
     });
     if (!claimed.length) return;
-    const events = claimed.map((entry) => entry.event as ContextEventRecord);
+    const events = claimed.map((entry) => entry.event);
     const result = await runMonitorAgent(
       { events, priorNotes: "", signal: undefined },
       this.options.monitorAgent ? { monitorAgent: this.options.monitorAgent, now: this.options.now() } : { now: this.options.now() },
     );
     if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
     await this.persistResult(result, events);
-    await this.options.contextClient.ack({
-      consumer: this.options.consumer,
-      eventIds: claimed.map((entry) => entry.event.id),
-      claimToken: claimed.length === 1 ? claimed[0]?.claimToken : undefined,
-    });
+    for (const entry of claimed) {
+      await this.options.contextClient.ack({
+        consumer: this.options.consumer,
+        eventIds: [entry.event.id],
+        claimToken: entry.claimToken,
+      });
+    }
   }
 
   private async persistResult(result: MonitorResult, events: readonly ContextEventRecord[]): Promise<void> {
@@ -323,23 +323,29 @@ export type DiscordContextRuntimeOptions = {
 export class DiscordContextRuntime {
   private readonly options: Required<Pick<DiscordContextRuntimeOptions, "contextLimit" | "now">> & DiscordContextRuntimeOptions;
   private readonly tails = new Map<string, Promise<void>>();
+  private readonly completed = new Set<string>();
   private started = false;
+  private stopping = false;
   constructor(options: DiscordContextRuntimeOptions) {
     this.options = { ...options, contextLimit: Math.min(200, Math.max(1, options.contextLimit ?? 50)), now: options.now ?? (() => new Date()) };
   }
   async start(): Promise<void> {
     if (this.started) return;
+    this.stopping = false;
     this.started = true;
     await this.options.adapter.start((message) => this.receive(message));
   }
   async stop(): Promise<void> {
-    if (!this.started) return;
+    if (this.stopping) return;
+    this.stopping = true;
+    const wasStarted = this.started;
     this.started = false;
-    await this.options.adapter.stop();
     await Promise.allSettled(this.tails.values());
     this.tails.clear();
+    if (wasStarted) await this.options.adapter.stop();
   }
   async receive(message: InboundChannelMessage): Promise<void> {
+    if (this.stopping) return;
     const authorized = authorizeChannelMessage(message, this.options.bindings);
     if (!authorized) return;
     const key = conversationKey(authorized);
@@ -353,30 +359,36 @@ export class DiscordContextRuntime {
     }
   }
   private async process(message: AuthorizedChannelMessage): Promise<void> {
+    const workspaceId = message.authorization.contextScope.workspaceId;
     const source = {
       surface: "discord" as const,
       principalId: message.authorization.principalId,
       conversationId: keyForMessage(message),
       visibility: message.destination.visibility,
-      ...(message.authorization.contextScope.kind === "channel" && message.authorization.contextScope.workspaceId ? { workspaceId: message.authorization.contextScope.workspaceId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
       ...(message.destination.channelId ? { channelId: message.destination.channelId } : {}),
       ...(message.destination.threadId ? { threadId: message.destination.threadId } : {}),
     };
     const inbound: ContextAppendRequest = {
+      ...(workspaceId ? { workspaceId } : {}),
       id: deterministicId("discord-event", message.id),
       kind: "conversation_turn",
       occurredAt: message.occurredAt,
       source,
       content: { text: message.text, prompt: message.text },
     };
-    const appended = await this.options.contextClient.append(inbound);
-    if (isRecord(appended) && appended.inserted === false) return;
+    await this.options.contextClient.append(inbound);
     const scope = scopeRequest(message);
     const compiled = await this.options.contextClient.compile({
       scope,
       query: message.text.slice(0, 2_000),
       limit: this.options.contextLimit,
     }) as ContextCompileResult;
+    const replyEventId = deterministicId("discord-turn", message.id);
+    if (this.completed.has(message.id) || compiled.events.some((event) => event.id === replyEventId)) {
+      this.completed.add(message.id);
+      return;
+    }
     const reply = await runContextConversation({ text: message.text, compiledContext: compiled, now: this.options.now() }, {
       ...(this.options.conversation ? { conversation: this.options.conversation } : {}),
       ...this.options.conversationDeps,
@@ -384,12 +396,14 @@ export class DiscordContextRuntime {
     const sent = await this.options.adapter.send(message.destination, { id: deterministicId("discord-reply", message.id), text: reply, replyToId: message.id });
     if (!sent.ok) throw new Error(sent.error);
     await this.options.contextClient.append({
-      id: deterministicId("discord-turn", message.id),
+      ...(workspaceId ? { workspaceId } : {}),
+      id: replyEventId,
       kind: "conversation_turn",
       occurredAt: this.options.now().getTime(),
       source,
       content: { text: reply, prompt: message.text, assistant: reply },
     });
+    this.completed.add(message.id);
   }
 }
 
@@ -399,7 +413,7 @@ export function createDiscordContextRuntime(options: DiscordContextRuntimeOption
 
 function scopeRequest(message: AuthorizedChannelMessage): ContextScopeRequest {
   const scope = message.authorization.contextScope;
-  if (scope.kind === "owner") return { kind: "owner", ownerId: scope.ownerId };
+  if (scope.kind === "owner") return { kind: "owner", ownerId: scope.ownerId, ...(scope.workspaceId ? { workspaceId: scope.workspaceId } : {}) };
   if (scope.kind === "workspace") return { kind: "workspace", workspaceId: scope.workspaceId };
   return { kind: "channel", ...(scope.workspaceId ? { workspaceId: scope.workspaceId } : {}), channelId: scope.channelId };
 }
@@ -411,7 +425,4 @@ function keyForMessage(message: AuthorizedChannelMessage): string {
 }
 function deterministicId(prefix: string, value: string): string {
   return `${prefix}:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

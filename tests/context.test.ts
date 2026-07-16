@@ -4,9 +4,9 @@ process.env.ANORVIS_OS_API_TOKEN = "context-test-token";
 import type { ContextCapabilityClient } from "../src/capability/context/client";
 
 const client: ContextCapabilityClient = {
-  append: async (input) => ({ inserted: true, input }),
-  compile: async (input) => ({ events: [], summaries: [], wikiPages: [], input }),
-  enqueueOutbound: async (input) => ({ inserted: true, input }),
+  append: (input) => Promise.resolve({ inserted: true, input }),
+  compile: (input) => Promise.resolve({ events: [], summaries: [], wikiPages: [], input }),
+  enqueueOutbound: (input) => Promise.resolve({ inserted: true, input }),
 };
 
 describe("context sidecar routes", () => {
@@ -25,7 +25,7 @@ describe("context sidecar routes", () => {
       headers: { "content-type": "application/json", authorization: "Bearer context-test-token" },
     });
     expect(append.status).toBe(200);
-    expect((await append.json()).inserted).toBe(true);
+    expect(await append.json()).toMatchObject({ inserted: true });
 
     const compile = await app.request("/v1/context/compile", {
       method: "POST",

@@ -127,13 +127,28 @@ async function workspaceEvents(
   since: number | undefined,
   limit: number,
 ): Promise<ContextEvent[]> {
-  const events = await ctx.db
+  const scopeQuery = ctx.db
     .query("contextEvents")
     .withIndex("by_workspace_occurred", (q) => q.eq("workspaceId", workspaceId))
-    .order("desc")
-    .collect();
+    .order("desc");
+  const events = await scopeQuery
+    .filter((q) => {
+      const shared = q.eq(q.field("source.visibility"), "shared");
+      const owner = q.eq(q.field("ownerId"), access.userId);
+      const scoped = info.kind === "owner"
+        ? q.or(shared, owner)
+        : info.kind === "workspace"
+          ? shared
+          : q.and(shared, q.eq(q.field("source.channelId"), info.channelId));
+      return since === undefined
+        ? scoped
+        : q.and(scoped, q.gt(q.field("occurredAt"), since));
+    })
+    // Dynamic share-safety checks still run below. Keep the database read
+    // bounded while allowing a small amount of filtering headroom.
+    .take(Math.min(Math.max(limit * 20, limit), 1_000));
   return events
-    .filter((event) => (since === undefined || event.occurredAt > since) && visibleEvent(event, info, access))
+    .filter((event) => visibleEvent(event, info, access))
     .slice(0, limit);
 }
 
@@ -174,7 +189,7 @@ export const append = mutation({
     const conversationId = nonEmpty(args.source.conversationId, "source.conversationId");
     const existing = await ctx.db
       .query("contextEvents")
-      .filter((q) => q.eq(q.field("id"), id))
+      .withIndex("by_event_id", (q) => q.eq("id", id))
       .unique();
     if (existing !== null) {
       if (existing.workspaceId !== access.workspaceId) {
@@ -279,25 +294,36 @@ export const ack = mutation({
     workspaceId: v.optional(v.id("workspaces")),
     consumer: v.string(),
     eventIds: v.array(v.string()),
-    claimToken: v.optional(v.string()),
+    claimToken: v.string(),
   },
   handler: async (ctx, args) => {
     const access = await requireWorkspace(ctx, args.workspaceId);
     const consumer = nonEmpty(args.consumer, "consumer");
+    const claimToken = nonEmpty(args.claimToken, "claimToken");
     let acknowledged = 0;
     let cursor = 0;
     const now = Date.now();
     for (const eventId of args.eventIds) {
       const event = await ctx.db
         .query("contextEvents")
-        .filter((q) => q.eq(q.field("id"), eventId))
+        .withIndex("by_event_id", (q) => q.eq("id", eventId))
         .unique();
-      if (event === null || event.workspaceId !== access.workspaceId) continue;
+      if (event === null || event.workspaceId !== access.workspaceId) {
+        throw new ConvexError({ code: "NOT_FOUND", message: "Context event not found" });
+      }
       const claim = await ctx.db
         .query("contextEventClaims")
         .withIndex("by_event_consumer", (q) => q.eq("eventId", event._id).eq("consumer", consumer))
         .unique();
-      if (claim === null || (args.claimToken !== undefined && claim.claimToken !== args.claimToken)) continue;
+      if (claim === null) {
+        throw new ConvexError({ code: "CONFLICT", message: "Context event is not claimed by this consumer" });
+      }
+      if (claim.claimToken !== claimToken) {
+        throw new ConvexError({ code: "CONFLICT", message: "Context claim token is invalid" });
+      }
+      if (claim.status === "claimed" && claim.leaseUntil <= now) {
+        throw new ConvexError({ code: "CONFLICT", message: "Context claim token is expired" });
+      }
       if (claim.status !== "acked") {
         await ctx.db.patch(claim._id, { status: "acked", ackedAt: now, leaseUntil: now });
         acknowledged += 1;
@@ -415,7 +441,7 @@ export const enqueueOutbound = mutation({
     const text = nonEmpty(args.text, "text");
     const existing = await ctx.db
       .query("contextOutboundMessages")
-      .filter((q) => q.eq(q.field("id"), id))
+      .withIndex("by_outbound_id", (q) => q.eq("id", id))
       .unique();
     if (existing !== null) {
       if (existing.workspaceId !== access.workspaceId) {
@@ -457,13 +483,17 @@ export const claimOutbound = mutation({
     const now = Date.now();
     const [queued, leased] = await Promise.all([
       ctx.db.query("contextOutboundMessages")
-        .withIndex("by_workspace_status_attempt", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "queued"))
+        .withIndex("by_workspace_owner_status_attempt", (q) =>
+          q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("status", "queued"),
+        )
         .order("asc")
-        .collect(),
+        .take(limit),
       ctx.db.query("contextOutboundMessages")
-        .withIndex("by_workspace_status_attempt", (q) => q.eq("workspaceId", access.workspaceId).eq("status", "claimed"))
+        .withIndex("by_workspace_owner_status_attempt", (q) =>
+          q.eq("workspaceId", access.workspaceId).eq("ownerId", access.userId).eq("status", "claimed"),
+        )
         .order("asc")
-        .collect(),
+        .take(limit),
     ]);
     const candidates = [...queued, ...leased].sort((left, right) => left.nextAttemptAt - right.nextAttemptAt);
     const claimed: Array<Doc<"contextOutboundMessages"> & { claimToken: string; leaseUntil: number }> = [];
@@ -495,13 +525,25 @@ export const completeOutbound = mutation({
   },
   handler: async (ctx, args) => {
     const access = await requireWorkspace(ctx, args.workspaceId);
+    const now = Date.now();
     const key = args.id ?? args.messageId;
-    const message = await ctx.db.query("contextOutboundMessages").filter((q) => q.eq(q.field("id"), key)).unique();
-    if (message === null || message.workspaceId !== access.workspaceId) throw new ConvexError({ code: "NOT_FOUND", message: "Outbound message not found" });
+    if (key === undefined || key.trim() === "") invalid("id or messageId is required");
+    const message = await ctx.db
+      .query("contextOutboundMessages")
+      .withIndex("by_outbound_id", (q) => q.eq("id", key))
+      .unique();
+    if (message === null || message.workspaceId !== access.workspaceId || message.ownerId !== access.userId) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Outbound message not found" });
+    }
     if (args.consumer !== undefined && message.claimedBy !== args.consumer) throw new ConvexError({ code: "CONFLICT", message: "Outbound message is claimed by another consumer" });
     if (args.claimToken !== undefined && message.claimToken !== args.claimToken) throw new ConvexError({ code: "CONFLICT", message: "Outbound claim token is invalid" });
+    if (message.status === "claimed" && (args.consumer === undefined || args.claimToken === undefined)) {
+      throw new ConvexError({ code: "CONFLICT", message: "Outbound claim token is required" });
+    }
+    if (message.status === "claimed" && (message.leaseUntil ?? 0) <= now) {
+      throw new ConvexError({ code: "CONFLICT", message: "Outbound claim token is expired" });
+    }
     if (message.status === "completed") return { id: message.id, status: message.status, attempts: message.attempts };
-    const now = Date.now();
     const success = args.success ?? args.ok ?? !(args.retryable ?? false);
     if (success) {
       await ctx.db.patch(message._id, { status: "completed", leaseUntil: undefined, claimToken: undefined, claimedBy: undefined, completedAt: now, updatedAt: now });

@@ -24,7 +24,7 @@ export type DevSupervisorOptions = {
 
 export type DevSupervisor = {
   convex: ChildProcess;
-  gateway: ChildProcess;
+  gateway?: ChildProcess;
   stop(signal?: NodeJS.Signals): void;
 };
 
@@ -32,18 +32,27 @@ export type DevSupervisor = {
 export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSupervisor {
   const spawnChild = options.spawn ?? ((command, args, spawnOptions) => spawn(command, [...args], spawnOptions));
   const convex = spawnChild("bunx", ["convex", "dev", ...(options.convexArgs ?? Bun.argv.slice(2))], { stdio: "inherit" });
-  const gateway = spawnChild("bun", ["src/platform/gateway/server.ts", ...(options.gatewayArgs ?? [])], { stdio: "inherit" });
-  const children = [convex, gateway];
+  const children: ChildProcess[] = [convex];
+  const exitedChildren = new Set<ChildProcess>();
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  let gateway: ChildProcess | undefined;
   let stopping = false;
   let exited = 0;
   let exitCode = 0;
   let finished = false;
-  const exitedChildren = new Set<ChildProcess>();
+  let timer: Parameters<typeof globalThis.clearInterval>[0] | undefined;
+
+  const clearBootstrapTimer = (): void => {
+    if (timer === undefined) return;
+    (options.clearInterval ?? globalThis.clearInterval)(timer);
+    timer = undefined;
+  };
 
   const finish = (code: number, reason: string): void => {
     if (finished) return;
     stopping = true;
     exitCode = code;
+    clearBootstrapTimer();
     console.error(`anorvis: ${reason}; stopping the other runtime`);
     for (const child of children) {
       try {
@@ -54,7 +63,7 @@ export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSuper
     }
     if (exited >= children.length) {
       finished = true;
-      options.exit?.(exitCode);
+      exit(exitCode);
     }
   };
 
@@ -68,27 +77,16 @@ export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSuper
     }
     if (exited >= children.length && !finished) {
       finished = true;
-      options.exit?.(exitCode);
+      clearBootstrapTimer();
+      exit(exitCode);
     }
   };
-  convex.on("exit", (code, signal) => onExit(convex, "Convex", code, signal));
-  gateway.on("exit", (code, signal) => onExit(gateway, "gateway", code, signal));
-  convex.on("error", () => onExit(convex, "Convex", 1, null));
-  gateway.on("error", () => onExit(gateway, "gateway", 1, null));
 
-  const stop = (signal: NodeJS.Signals = "SIGTERM"): void => {
-    if (stopping) return;
-    stopping = true;
-    exitCode = 0;
-    for (const child of children) {
-      try {
-        child.kill(signal);
-      } catch {
-        // A child that already exited needs no further signal.
-      }
-    }
+  const attachExitHandlers = (child: ChildProcess, name: string): void => {
+    child.on("exit", (code, signal) => onExit(child, name, code, signal));
+    child.on("error", () => onExit(child, name, 1, null));
   };
-  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => stop(signal));
+  attachExitHandlers(convex, "Convex");
 
   const publish = options.publish ?? (() => publishConvexDeployment(process.cwd()));
   const trust = options.ensureTrust ?? ensureLocalTrust;
@@ -106,24 +104,69 @@ export function startDevSupervisor(options: DevSupervisorOptions = {}): DevSuper
   } satisfies DeploymentEnv;
   let registered = false;
   let trusted = false;
+  let bootstrapped = false;
   const deadline = Date.now() + 180_000;
-  const timer = (options.setInterval ?? globalThis.setInterval)(() => {
-    if (!registered) {
-      const deployment = publish();
-      if (deployment !== null) {
-        console.error(`anorvis: Convex deployment registered at ${deployment.url}`);
-        registered = true;
+
+  const startGateway = (): void => {
+    if (gateway || stopping) return;
+    gateway = spawnChild("bun", ["src/platform/gateway/server.ts", ...(options.gatewayArgs ?? [])], { stdio: "inherit" });
+    children.push(gateway);
+    attachExitHandlers(gateway, "gateway");
+  };
+
+  const bootstrap = (): void => {
+    if (stopping || bootstrapped) return;
+    try {
+      if (!registered) {
+        const deployment = publish();
+        if (deployment !== null) {
+          console.error(`anorvis: Convex deployment registered at ${deployment.url}`);
+          registered = true;
+        }
+      }
+      if (registered && !trusted && trust(deploymentEnv)) {
+        console.error("anorvis: local trust keys are in place");
+        trusted = true;
+      }
+    } catch (error) {
+      console.error(`anorvis: local gateway bootstrap retry: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (registered && trusted) {
+      try {
+        startGateway();
+        bootstrapped = true;
+        clearBootstrapTimer();
+      } catch (error) {
+        finish(1, `gateway failed to start: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    if (Date.now() > deadline) finish(1, "local gateway bootstrap timed out");
+  };
+
+  bootstrap();
+  if (!stopping && !bootstrapped) {
+    timer = (options.setInterval ?? globalThis.setInterval)(bootstrap, 2_000);
+    if (bootstrapped || stopping) clearBootstrapTimer();
+    if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
+  }
+
+  const stop = (signal: NodeJS.Signals = "SIGTERM"): void => {
+    if (stopping) return;
+    stopping = true;
+    exitCode = 0;
+    clearBootstrapTimer();
+    for (const child of children) {
+      try {
+        child.kill(signal);
+      } catch {
+        // A child that already exited needs no further signal.
       }
     }
-    if (registered && !trusted && trust(deploymentEnv)) {
-      console.error("anorvis: local trust keys are in place");
-      trusted = true;
-    }
-    if ((registered && trusted) || Date.now() > deadline) (options.clearInterval ?? globalThis.clearInterval)(timer);
-  }, 2_000);
-  if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
+  };
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => stop(signal));
 
-  return { convex, gateway, stop };
+  return { convex, get gateway() { return gateway; }, stop };
 }
 
 if (import.meta.main) startDevSupervisor();

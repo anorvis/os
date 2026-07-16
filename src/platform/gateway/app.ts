@@ -37,6 +37,8 @@ export type App = {
   stop(): Promise<void>;
 };
 
+type AppLifecycle = "idle" | "starting" | "ready" | "failed" | "stopped";
+
 type AppServiceContext = {
   config: LocalAuthorityConfig;
   now(): Date;
@@ -48,6 +50,10 @@ type AppServiceContext = {
 export function createApp(options: CreateAppOptions = {}): App {
   const config = options.config ?? readLocalAuthorityConfig();
   let serviceIds: string[] = [];
+  let lifecycle: AppLifecycle = "idle";
+  let startupError: unknown;
+  let startPromise: Promise<void> | undefined;
+  let stopPromise: Promise<void> | undefined;
   const context: AppServiceContext = {
     config,
     now: () => new Date(),
@@ -58,10 +64,23 @@ export function createApp(options: CreateAppOptions = {}): App {
   const registry = createServiceRegistry(context, serviceFactories);
   serviceIds = registry.serviceIds;
 
+  const stopRuntime = async (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopPromise = Promise.resolve(options.runtime?.stop());
+    await stopPromise;
+  };
+
   const app = new Hono();
   app.use("*", cors());
   app.onError((error) => json({ error: error instanceof Error ? error.message : String(error) }, 500));
-  app.get("/health", () => json({ ok: true }));
+  app.get("/health", () => {
+    if (lifecycle === "starting") return json({ ok: false, error: "gateway_starting" }, 503);
+    if (lifecycle === "failed") {
+      const error = startupError instanceof Error ? startupError.message : String(startupError);
+      return json({ ok: false, error }, 503);
+    }
+    return json({ ok: true });
+  });
   app.post("/v1/auth/handshake", (c) => authHandshake(c.req.raw));
   app.use("*", async (c, next) => {
     const unauthorized = authorize(c.req.raw, new URL(c.req.url), config);
@@ -71,16 +90,61 @@ export function createApp(options: CreateAppOptions = {}): App {
   for (const register of registry.routes) register(app);
   app.notFound(() => json({ error: "not_found" }, 404));
   const fetch = (request: Request): Promise<Response> => Promise.resolve(app.fetch(request));
+  const start = async (): Promise<void> => {
+    if (lifecycle === "ready") return;
+    if (lifecycle === "starting" && startPromise) return startPromise;
+    if (lifecycle === "failed") throw startupError;
+    if (lifecycle === "stopped") {
+      lifecycle = "idle";
+      startupError = undefined;
+      startPromise = undefined;
+      stopPromise = undefined;
+    }
+    lifecycle = "starting";
+    startPromise = (async () => {
+      try {
+        await options.runtime?.start();
+        lifecycle = "ready";
+      } catch (error) {
+        startupError = error;
+        lifecycle = "failed";
+        try {
+          await stopRuntime();
+        } catch (cleanupError) {
+          console.error(
+            `anorvis: gateway runtime cleanup failed after startup rejection: ${
+              cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }`,
+          );
+        }
+        throw error;
+      }
+    })();
+    return startPromise;
+  };
+  const stop = async (): Promise<void> => {
+    if (lifecycle === "stopped") return;
+    if (lifecycle === "starting" && startPromise) {
+      try {
+        await startPromise;
+      } catch {
+        // Startup performs runtime cleanup before exposing its rejection.
+      }
+    }
+    await stopRuntime();
+    lifecycle = "stopped";
+  };
   return {
     fetch,
     request(input, init) {
       const request = typeof input === "string" ? new Request(`http://127.0.0.1${input}`, init) : input;
       return fetch(request);
     },
-    start: async () => options.runtime?.start(),
-    stop: async () => options.runtime?.stop(),
+    start,
+    stop,
   };
 }
+
 
 export function createServer(options: CreateServerOptions = {}) {
   const config = readLocalAuthorityConfig();
@@ -95,7 +159,15 @@ export function createServer(options: CreateServerOptions = {}) {
     idleTimeout: 120,
     fetch: (request) => app.fetch(request),
   });
-  const ready = options.startRuntime === false ? Promise.resolve() : app.start().catch(() => undefined);
+  const ready = (async () => {
+    if (options.startRuntime === false) return;
+    try {
+      await app.start();
+    } catch (error) {
+      await server.stop();
+      throw error;
+    }
+  })();
   const stop = async () => {
     await app.stop();
     await server.stop();
