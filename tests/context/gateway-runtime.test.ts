@@ -256,4 +256,39 @@ describe("context gateway runtime lifecycle", () => {
       "discord:stop-adapter",
     ]);
   });
+  test("does not restart while a failed teardown still owns resources", async () => {
+    const teardownError = new Error("monitor teardown failed");
+    let starts = 0;
+    let stopAttempts = 0;
+    const runtime = new ContextGatewayRuntime({
+      monitor: {
+        start: () => {
+          starts += 1;
+          return Promise.resolve();
+        },
+        stop: () => {
+          stopAttempts += 1;
+          return Promise.reject(teardownError);
+        },
+      },
+    });
+
+    await runtime.start();
+    let stopError: unknown;
+    try {
+      await runtime.stop();
+    } catch (error) {
+      stopError = error;
+    }
+    let restartError: unknown;
+    try {
+      await runtime.start();
+    } catch (error) {
+      restartError = error;
+    }
+    expect(stopError).toBe(teardownError);
+    expect(restartError).toBe(teardownError);
+    expect(starts).toBe(1);
+    expect(stopAttempts).toBe(2);
+  });
 });

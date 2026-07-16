@@ -48,7 +48,7 @@ export class ContextGatewayRuntime {
     while (this.transition) await this.transition;
     if (this.started) return;
 
-    const transition = this.startInternal();
+    const transition = this.startWithCleanup();
     this.transition = transition;
     try {
       await transition;
@@ -72,6 +72,17 @@ export class ContextGatewayRuntime {
     } finally {
       if (this.transition === transition) this.transition = undefined;
     }
+  }
+
+  private async startWithCleanup(): Promise<void> {
+    if (this.hasResources()) {
+      const cleanupErrors = await this.stopResources();
+      throwErrors(cleanupErrors, "Context gateway restart cleanup failed");
+      if (this.hasResources()) {
+        throw new Error("Context gateway restart cleanup left active resources");
+      }
+    }
+    await this.startInternal();
   }
 
   private async startInternal(): Promise<void> {
