@@ -1061,7 +1061,8 @@ const schema = defineSchema({
       "workspaceId",
       "consumer",
       "status",
-    ]),
+    ])
+    .index("by_workspace_consumer_batch", ["workspaceId", "consumer", "batchId"]),
 
   contextOutboundMessages: defineTable({
     id: v.string(),
@@ -1120,6 +1121,27 @@ const schema = defineSchema({
     .index("by_workspace_effect_key", ["workspaceId", "effectKey"])
     .index("by_workspace_status", ["workspaceId", "status"])
     .index("by_workspace_owner_status", ["workspaceId", "ownerId", "status"]),
+  contextMonitorPlans: defineTable({
+    workspaceId: v.id("workspaces"),
+    ownerId: v.optional(v.id("users")),
+    consumer: v.string(),
+    planKey: v.string(),
+    batchId: v.string(),
+    result: v.object({
+      summaries: v.array(v.object({
+        conversationId: v.string(),
+        visibility: v.union(v.literal("private"), v.literal("shared")),
+        channelId: v.optional(v.string()),
+        summary: v.string(),
+      })),
+      wikiTasks: v.array(v.object({ task: v.string() })),
+      notifications: v.array(v.object({ text: v.string(), reason: v.string() })),
+      notes: v.string(),
+    }),
+    createdAt: v.number(),
+  })
+    .index("by_workspace_consumer_plan", ["workspaceId", "consumer", "planKey"])
+    .index("by_workspace_consumer_batch", ["workspaceId", "consumer", "batchId"]),
 });
 
 export default schema;

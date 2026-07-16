@@ -14,6 +14,8 @@ import type {
   ContextCompleteMonitorWikiEffectRequest,
   ContextCompleteOutboundRequest,
   ContextEventRecord,
+  ContextMonitorPlan,
+  ContextMonitorPlanRequest,
   ContextMonitorWikiJob,
   ContextMonitorEffectRequest,
   ContextMonitorEffectResult,
@@ -46,6 +48,7 @@ export type ContextRuntimeClient = ContextCapabilityClient & {
     leaseUntil: number;
   }>;
   claimMonitorWikiEffects(input: ContextClaimMonitorWikiEffectsRequest): Promise<readonly ContextMonitorWikiJob[]>;
+  getOrCreateMonitorPlan?(input: ContextMonitorPlanRequest): Promise<ContextMonitorPlan>;
   completeMonitorWikiEffect(input: ContextCompleteMonitorWikiEffectRequest): Promise<ContextMonitorEffectResult>;
   commitMonitorEffect(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
 };
@@ -168,12 +171,45 @@ export class ContextMonitorRuntime {
           .filter(Boolean)
           .join("\n")
           .slice(-8_000);
-        const result = await runMonitorAgent(
-          { events, priorNotes, signal: undefined },
-          this.options.monitorAgent
-            ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
-            : { now: this.options.now() },
-        );
+        const planApi = this.options.contextClient.getOrCreateMonitorPlan;
+        let result: MonitorResult;
+        if (typeof planApi === "function" && partition.batchId !== undefined) {
+          const planKey = deterministicId(
+            "monitor-plan",
+            `${this.options.consumer}:${partition.batchId}:${partition.key}`,
+          );
+          const existing = await planApi.call(this.options.contextClient, {
+            ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+            consumer: this.options.consumer,
+            batchId: partition.batchId,
+            planKey,
+          });
+          if (existing.result !== null) {
+            result = existing.result;
+          } else {
+            const generated = await runMonitorAgent(
+              { events, priorNotes, signal: undefined },
+              this.options.monitorAgent
+                ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+                : { now: this.options.now() },
+            );
+            const stored = await planApi.call(this.options.contextClient, {
+              ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+              consumer: this.options.consumer,
+              batchId: partition.batchId,
+              planKey,
+              result: generated,
+            });
+            result = stored.result ?? generated;
+          }
+        } else {
+          result = await runMonitorAgent(
+            { events, priorNotes, signal: undefined },
+            this.options.monitorAgent
+              ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+              : { now: this.options.now() },
+          );
+        }
         if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
         heartbeat.check();
         await this.persistResult(result, partition);

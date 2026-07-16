@@ -6,6 +6,7 @@ import { getHomeDir } from "../../paths";
 import { decodeUnknown } from "../../core/effect/schema";
 import { api } from "../../../convex/_generated/api";
 import { ContextEventAttachmentSchema, type ContextEventInput, type ContextEventKind, type ContextSurface } from "./schema";
+import type { MonitorResult } from "./monitor-agent";
 
 export type ContextScopeRequest = {
   kind: "owner" | "workspace" | "channel";
@@ -141,6 +142,18 @@ export type ContextMonitorEffectResult = {
   effectKey: string;
   status: "pending" | "running" | "completed" | "replayed" | "needs_reconciliation";
 };
+export type ContextMonitorPlanRequest = {
+  workspaceId?: string;
+  consumer: string;
+  batchId: string;
+  planKey: string;
+  result?: MonitorResult;
+};
+export type ContextMonitorPlan = {
+  planKey: string;
+  batchId: string;
+  result: MonitorResult | null;
+};
 export type ContextMonitorWikiJob = {
   effectKey: string;
   wikiTask: string;
@@ -175,6 +188,7 @@ export type ContextCapabilityClient = {
     status: "completed" | "queued" | "failed";
     attempts: number;
   }>;
+  getOrCreateMonitorPlan?(input: ContextMonitorPlanRequest): Promise<ContextMonitorPlan>;
   renewClaim?(input: ContextRenewClaimRequest): Promise<ContextRenewClaimResult>;
   commitMonitorEffect?(input: ContextMonitorEffectRequest): Promise<ContextMonitorEffectResult>;
   claimMonitorWikiEffects?(input: ContextClaimMonitorWikiEffectsRequest): Promise<readonly ContextMonitorWikiJob[]>;
@@ -303,6 +317,22 @@ const renewClaimResultSchema = Schema.Struct({
   claims: Schema.Array(Schema.Struct({ eventId: Schema.String, claimToken: Schema.String })),
   leaseUntil: Schema.Number,
 });
+const monitorPlanResultSchema = Schema.Struct({
+  summaries: Schema.Array(Schema.Struct({
+    conversationId: Schema.String,
+    visibility: Schema.Literal("private", "shared"),
+    channelId: Schema.optional(Schema.String),
+    summary: Schema.String,
+  })),
+  wikiTasks: Schema.Array(Schema.Struct({ task: Schema.String })),
+  notifications: Schema.Array(Schema.Struct({ text: Schema.String, reason: Schema.String })),
+  notes: Schema.String,
+});
+const monitorPlanSchema = Schema.Struct({
+  planKey: Schema.String,
+  batchId: Schema.String,
+  result: Schema.Union(monitorPlanResultSchema, Schema.Null),
+});
 const monitorEffectResultSchema = Schema.Struct({
   effectKey: Schema.String,
   status: Schema.Literal("pending", "running", "completed", "replayed", "needs_reconciliation"),
@@ -412,6 +442,9 @@ export class ConvexContextClient implements ContextCapabilityClient {
   }
   renewClaim(input: ContextRenewClaimRequest) {
     return this.invoke<ContextRenewClaimResult, ContextRenewClaimRequest>("mutation", api.capability.context.renewClaim, input, renewClaimResultSchema);
+  }
+  getOrCreateMonitorPlan(input: ContextMonitorPlanRequest) {
+    return this.invoke<ContextMonitorPlan, ContextMonitorPlanRequest>("mutation", api.capability.context.getOrCreateMonitorPlan, input, monitorPlanSchema);
   }
   commitMonitorEffect(input: ContextMonitorEffectRequest) {
     return this.invoke<ContextMonitorEffectResult, ContextMonitorEffectRequest>("mutation", api.capability.context.commitMonitorEffect, input, monitorEffectResultSchema);

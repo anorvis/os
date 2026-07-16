@@ -558,6 +558,77 @@ describe("shared context capability", () => {
     expect(compiled.events.map((item) => item.id)).not.toContain("private-note");
     expect(compiled.events.map((item) => item.id)).not.toContain("shared-health");
   });
+  it("creates and replays a bounded Monitor plan within workspace scope", async () => {
+    const { t, client, workspaceId } = await owner("monitor-plan@example.test");
+    const result = {
+      summaries: [{ conversationId: "conversation", visibility: "private" as const, summary: "durable note" }],
+      wikiTasks: [{ task: "curate this" }],
+      notifications: [{ text: "owner notice", reason: "timely" }],
+      notes: "compact notes",
+    };
+    const created = await client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "batch-1",
+      planKey: "plan-1",
+      result,
+    });
+    const replayed = await client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "batch-1",
+      planKey: "plan-1",
+      result: {
+        ...result,
+        notes: "different retry output",
+      },
+    });
+    expect(created).toEqual({ planKey: "plan-1", batchId: "batch-1", result });
+    expect(replayed).toEqual(created);
+
+    const otherUser = await t.run((ctx) => ctx.db.insert("users", { email: "monitor-plan-other@example.test" }));
+    const otherClient = t.withIdentity({ subject: otherUser });
+    const otherWorkspaceId = await otherClient.mutation(api.platform.workspace.ensureDefault, {});
+    expect(otherWorkspaceId).not.toBe(workspaceId);
+    await client.mutation(api.capability.context.append, {
+      workspaceId,
+      ...event("monitor-plan-cleanup"),
+    });
+    const cleanupClaim = await client.mutation(api.capability.context.claim, {
+      workspaceId,
+      consumer: "cleanup-monitor",
+      scope: { kind: "owner" },
+      limit: 1,
+    });
+    expect(cleanupClaim).toHaveLength(1);
+    await client.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "cleanup-monitor",
+      batchId: cleanupClaim[0].batchId,
+      planKey: "cleanup-plan",
+      result,
+    });
+    await client.mutation(api.capability.context.ack, {
+      workspaceId,
+      consumer: "cleanup-monitor",
+      eventIds: [cleanupClaim[0].event.id],
+      claimToken: cleanupClaim[0].claimToken,
+    });
+    await expect(t.run((ctx) => ctx.db.query("contextMonitorPlans")
+      .withIndex("by_workspace_consumer_plan", (q) =>
+        q.eq("workspaceId", workspaceId).eq("consumer", "cleanup-monitor").eq("planKey", "cleanup-plan"),
+      )
+      .unique())).resolves.toBeNull();
+
+    await expect(otherClient.mutation(api.capability.context.getOrCreateMonitorPlan, {
+      workspaceId,
+      consumer: "os-monitor",
+      batchId: "batch-2",
+      planKey: "plan-2",
+      result,
+    })).rejects.toThrow("access to this workspace");
+  });
+
   it("claims and completes Monitor Wiki jobs exactly once", async () => {
     const { t, client, workspaceId } = await owner("wiki-monitor@example.test");
     await client.mutation(api.capability.context.append, {
