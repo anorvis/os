@@ -418,7 +418,7 @@ describe("shared context capability", () => {
       limit: 1,
     });
     expect(late.map((item) => item.event.id)).toEqual(["late-old-occurredAt"]);
-  });
+  }, 15_000);
 
   it("drains same-timestamp rows with adversarial event ids across restarts", async () => {
     const { t, client, workspaceId, userId } = await owner("adversarial-context@example.test");

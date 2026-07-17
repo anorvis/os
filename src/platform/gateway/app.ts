@@ -38,6 +38,8 @@ export type CreateAppOptions = {
   runtime?: ContextGatewayRuntime;
   maintenanceRoot?: string;
   maintenanceSessionRoots?: MaintenanceSessionRoots;
+  foregroundStatsPath?: string;
+  maintainerModelPerfPath?: string;
 };
 
 export type App = {
@@ -55,6 +57,8 @@ type AppServiceContext = {
   contextClient?: ContextCapabilityClient;
   maintenanceRoot?: string;
   maintenanceSessionRoots?: MaintenanceSessionRoots;
+  foregroundStatsPath?: string;
+  maintainerModelPerfPath?: string;
   serviceIds?: () => string[];
 };
 
@@ -72,6 +76,8 @@ export function createApp(options: CreateAppOptions = {}): App {
     contextClient: options.contextClient,
     maintenanceRoot: options.maintenanceRoot,
     maintenanceSessionRoots: options.maintenanceSessionRoots,
+    foregroundStatsPath: options.foregroundStatsPath,
+    maintainerModelPerfPath: options.maintainerModelPerfPath,
     serviceIds: () => serviceIds,
   };
   const registry = createServiceRegistry(context, serviceFactories);
