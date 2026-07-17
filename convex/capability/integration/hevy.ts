@@ -5,6 +5,7 @@ import type { Doc, Id } from "../../_generated/dataModel";
 import { internal } from "../../_generated/api";
 import { action, type ActionCtx, internalAction } from "../../_generated/server";
 import { decryptCredentials, encryptCredentials } from "../../platform/auth/credentials";
+import { throwIfRateLimited } from "./rateLimit";
 type HevyConnection = Extract<Doc<"providerConnections">, { provider: "hevy" }>;
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -28,9 +29,16 @@ function number(value: unknown): number | undefined {
 
 async function getJson(url: string, apiKey: string): Promise<Record<string, unknown>> {
   const response = await fetch(url, { headers: { "api-key": apiKey } });
-  const payload = (await response.json().catch(() => ({}))) as unknown;
+  const text = await response.text();
+  throwIfRateLimited(response, "Hevy", text);
+  let payload: unknown = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
   if (!response.ok) {
-    throw new Error(`Hevy request failed (${response.status}): ${JSON.stringify(payload).slice(0, 300)}`);
+    throw new Error(`Hevy request failed (${response.status}): ${text.slice(0, 300)}`);
   }
   return record(payload) ?? {};
 }
@@ -199,7 +207,17 @@ export const syncNow = action({
     if (completed) {
       await ctx.runMutation(
         internal.capability.integration.jobs.publishProviderSyncCompletion,
-        { workspaceId, provider: "hevy", watermark },
+        {
+          workspaceId,
+          provider: "hevy",
+          watermark,
+          changed:
+            workoutsCreated +
+              workoutsUpdated +
+              measurementsCreated +
+              measurementsUpdated >
+            0,
+        },
       );
     }
     return {

@@ -3,8 +3,13 @@ import type { Id } from "../_generated/dataModel";
 import { internalMutation, internalQuery, mutation, query } from "../_generated/server";
 import type { MutationCtx } from "../_generated/server";
 import { requireWorkspace } from "../platform/auth/access";
-import { cancelActiveSyncs, enqueueSync } from "./integration/jobs";
-import { parseDecimal } from "./finance/decimal";
+import {
+  cancelActiveSyncs,
+  enqueueSync,
+  recordProviderSyncFailure,
+  type SyncProvider,
+} from "./integration/jobs";
+import { parseProviderDecimal } from "./finance/decimal";
 
 const provider = v.union(
   v.literal("google"),
@@ -86,10 +91,69 @@ export const list = query({
           sync: {
             sequence: syncState?.sequence ?? 0,
             lastSyncedAt: syncState?.lastSyncedAt ?? null,
+            lastChangedAt: syncState?.lastChangedAt ?? null,
+            lastAttemptAt: syncState?.lastAttemptAt ?? null,
+            lastError: syncState?.lastError ?? null,
+            lastErrorAt: syncState?.lastErrorAt ?? null,
           },
         };
       }),
     );
+  },
+});
+
+const SYNC_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+const SYNC_RETRY_HOLDOFF_MS = 10 * 60 * 1000;
+
+// Catch-up for a backend that is not always running: clients call this once
+// at session start and any provider whose last successful sync is stale gets
+// a scheduled sync, without waiting for the next 6-hour cron tick.
+export const syncStale = mutation({
+  args: { workspaceId: v.optional(v.id("workspaces")) },
+  handler: async (ctx, args) => {
+    const access = await requireWorkspace(ctx, args.workspaceId);
+    const now = Date.now();
+    const connections = await ctx.db
+      .query("providerConnections")
+      .withIndex("by_workspace_provider", (q) =>
+        q.eq("workspaceId", access.workspaceId),
+      )
+      .collect();
+    const enqueued: SyncProvider[] = [];
+    for (const connection of connections) {
+      if (
+        (connection.provider !== "google" &&
+          connection.provider !== "hevy" &&
+          connection.provider !== "snaptrade") ||
+        connection.status !== "connected" ||
+        connection.credentials === undefined
+      ) {
+        continue;
+      }
+      const state = await ctx.db
+        .query("providerSyncStates")
+        .withIndex("by_workspace_provider", (q) =>
+          q
+            .eq("workspaceId", access.workspaceId)
+            .eq("provider", connection.provider),
+        )
+        .unique();
+      const fresh =
+        state?.lastSyncedAt !== undefined &&
+        now - state.lastSyncedAt < SYNC_STALE_AFTER_MS;
+      const recentlyAttempted =
+        state?.lastAttemptAt !== undefined &&
+        now - state.lastAttemptAt < SYNC_RETRY_HOLDOFF_MS;
+      if (fresh || recentlyAttempted) continue;
+      const result = await enqueueSync(
+        ctx,
+        access.workspaceId,
+        connection.provider,
+        "scheduled",
+      );
+      if (result.scheduled) enqueued.push(connection.provider);
+    }
+    return enqueued;
   },
 });
 
@@ -223,6 +287,32 @@ export const resetGoogleConnection = internalMutation({
       "Google was disconnected",
     );
     return connection._id;
+  },
+});
+
+// A revoked/expired Google refresh token cannot recover on its own; flag the
+// connection so the dashboard shows a reconnect prompt and the scheduled
+// cron stops hammering the token endpoint.
+export const markGoogleReauthRequired = internalMutation({
+  args: { workspaceId: v.id("workspaces") },
+  handler: async (ctx, args) => {
+    const connection = await ctx.db
+      .query("providerConnections")
+      .withIndex("by_workspace_provider", (q) =>
+        q.eq("workspaceId", args.workspaceId).eq("provider", "google"),
+      )
+      .unique();
+    if (connection === null || connection.status !== "connected") return;
+    await ctx.db.patch(connection._id, {
+      status: "error",
+      updatedAt: Date.now(),
+    });
+    await recordProviderSyncFailure(
+      ctx,
+      args.workspaceId,
+      "google",
+      "Google access expired or was revoked — reconnect Google Calendar.",
+    );
   },
 });
 
@@ -1095,7 +1185,7 @@ export const upsertSnapTradeAccounts = internalMutation({
         balance:
           input.balance === undefined
             ? undefined
-            : parseDecimal(input.balance, "SnapTrade balance"),
+            : parseProviderDecimal(input.balance, "SnapTrade balance"),
         status: "active" as const,
         observedAt: input.observedAt,
         updatedAt: now,
@@ -1195,11 +1285,11 @@ export const applySnapTradeAccountData = internalMutation({
         cash:
           input.cash === undefined
             ? undefined
-            : parseDecimal(input.cash, "SnapTrade cash balance"),
+            : parseProviderDecimal(input.cash, "SnapTrade cash balance"),
         buyingPower:
           input.buyingPower === undefined
             ? undefined
-            : parseDecimal(input.buyingPower, "SnapTrade buying power"),
+            : parseProviderDecimal(input.buyingPower, "SnapTrade buying power"),
         observedAt: input.observedAt,
         source: "snaptrade" as const,
         updatedAt: now,
@@ -1239,15 +1329,15 @@ export const applySnapTradeAccountData = internalMutation({
         sourceId: input.sourceId,
         symbol: input.symbol,
         name: input.name,
-        quantity: parseDecimal(input.quantity, "SnapTrade position quantity"),
+        quantity: parseProviderDecimal(input.quantity, "SnapTrade position quantity"),
         marketValue:
           input.marketValue === undefined
             ? undefined
-            : parseDecimal(input.marketValue, "SnapTrade market value"),
+            : parseProviderDecimal(input.marketValue, "SnapTrade market value"),
         averageCost:
           input.averageCost === undefined
             ? undefined
-            : parseDecimal(input.averageCost, "SnapTrade average cost"),
+            : parseProviderDecimal(input.averageCost, "SnapTrade average cost"),
         currency: input.currency,
         observedAt: input.observedAt,
         updatedAt: now,
@@ -1274,7 +1364,7 @@ export const applySnapTradeAccountData = internalMutation({
       const amount =
         input.amount === undefined
           ? undefined
-          : parseDecimal(input.amount, "SnapTrade activity amount");
+          : parseProviderDecimal(input.amount, "SnapTrade activity amount");
       const value = {
         accountId: account._id,
         source: "snaptrade" as const,
@@ -1287,11 +1377,11 @@ export const applySnapTradeAccountData = internalMutation({
         quantity:
           input.quantity === undefined
             ? undefined
-            : parseDecimal(input.quantity, "SnapTrade activity quantity"),
+            : parseProviderDecimal(input.quantity, "SnapTrade activity quantity"),
         price:
           input.price === undefined
             ? undefined
-            : parseDecimal(input.price, "SnapTrade activity price"),
+            : parseProviderDecimal(input.price, "SnapTrade activity price"),
         fingerprint: input.fingerprint,
         status: input.status,
         occurredAt: input.occurredAt,
@@ -1343,11 +1433,11 @@ export const applySnapTradeAccountData = internalMutation({
         .unique();
       const value = {
         source: "snaptrade" as const,
-        equity: parseDecimal(input.equity, "SnapTrade equity"),
+        equity: parseProviderDecimal(input.equity, "SnapTrade equity"),
         cash:
           input.cash === undefined
             ? undefined
-            : parseDecimal(input.cash, "SnapTrade history cash"),
+            : parseProviderDecimal(input.cash, "SnapTrade history cash"),
         currency: input.currency,
         observedAt: input.observedAt,
         updatedAt: now,

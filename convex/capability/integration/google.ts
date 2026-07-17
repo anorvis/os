@@ -5,6 +5,7 @@ import { ConvexError, v } from "convex/values";
 import type { Doc, Id } from "../../_generated/dataModel";
 import { internal } from "../../_generated/api";
 import { action, type ActionCtx, internalAction } from "../../_generated/server";
+import { throwIfRateLimited } from "./rateLimit";
 import {
   decryptCredentials,
   encryptCredentials,
@@ -372,14 +373,34 @@ async function googleAccess(
     connection.accessTokenExpiresAt <= Date.now() + 60_000
   ) {
     if (!current.refreshToken) throw new Error("Google refresh token is missing");
-    const payload = await tokenRequest(
-      new URLSearchParams({
-        refresh_token: current.refreshToken,
-        client_id: current.clientId,
-        client_secret: current.clientSecret,
-        grant_type: "refresh_token",
-      }),
-    );
+    let payload: Record<string, unknown>;
+    try {
+      payload = await tokenRequest(
+        new URLSearchParams({
+          refresh_token: current.refreshToken,
+          client_id: current.clientId,
+          client_secret: current.clientSecret,
+          grant_type: "refresh_token",
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A revoked or expired refresh token never recovers by retrying; flag
+      // the connection so the dashboard prompts a reconnect and scheduled
+      // syncs stop failing every six hours.
+      if (/invalid_grant|expired|revoked/i.test(message)) {
+        await ctx.runMutation(
+          internal.capability.integration.markGoogleReauthRequired,
+          { workspaceId },
+        );
+        throw new ConvexError({
+          code: "REAUTH_REQUIRED",
+          message:
+            "Google access expired or was revoked — reconnect Google Calendar from the dashboard.",
+        });
+      }
+      throw error;
+    }
     accessToken = string(payload.access_token);
     if (!accessToken) throw new Error("Google token refresh returned no access token");
     const expiresIn = typeof payload.expires_in === "number" ? payload.expires_in : 3600;
@@ -398,6 +419,17 @@ async function googleAccess(
   return { accessToken };
 }
 
+function parseJson(text: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 // The calendars the user actually displays in Google Calendar; the primary
 // calendar keeps the literal id "primary" so existing rows retain identity.
 async function listSelectedCalendars(accessToken: string): Promise<string[]> {
@@ -405,7 +437,9 @@ async function listSelectedCalendars(accessToken: string): Promise<string[]> {
     "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250",
     { headers: { Authorization: `Bearer ${accessToken}` } },
   );
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  const text = await response.text();
+  throwIfRateLimited(response, "Google Calendar", text);
+  const payload = parseJson(text);
   if (!response.ok) {
     throw new Error(
       string(payload.error) ?? `Google calendar list failed: HTTP ${response.status}`,
@@ -451,7 +485,9 @@ async function syncPage(
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  const text = await response.text();
+  throwIfRateLimited(response, "Google Calendar", text);
+  const payload = parseJson(text);
   if (!response.ok) {
     throw new Error(string(payload.error) ?? "Google Calendar request failed");
   }

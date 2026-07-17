@@ -34,6 +34,23 @@ export function parseDecimal(input: string, label = "Value"): Decimal {
   }
   return { units, scale };
 }
+// Provider feeds (SnapTrade) report values like average cost with more
+// precision than exact int64 storage can hold; rejecting them would fail the
+// whole sync over insignificant digits. Truncate the fraction so the total
+// digit count fits, then parse strictly.
+export function parseProviderDecimal(input: string, label = "Value"): Decimal {
+  const value = input.trim();
+  const match = /^([+-]?)(\d+)\.(\d+)$/.exec(value);
+  if (match === null) return parseDecimal(value, label);
+  const integerDigits = match[2].replace(/^0+(?=\d)/, "");
+  const keep = Math.min(match[3].length, Math.max(0, 18 - integerDigits.length), 12);
+  const fraction = match[3].slice(0, keep).replace(/0+$/, "");
+  return parseDecimal(
+    `${match[1]}${match[2]}${fraction ? `.${fraction}` : ""}`,
+    label,
+  );
+}
+
 
 export function formatDecimal(value: Decimal): string {
   if (!Number.isInteger(value.scale) || value.scale < 0 || value.scale > 18) {
