@@ -1274,6 +1274,32 @@ export const applySnapTradeAccountData = internalMutation({
       throw new ConvexError({ code: "NOT_FOUND", message: "Finance account not found" });
     }
     const now = Date.now();
+    const ensureCategory = async (name: string, group: string) => {
+      const normalizedName = name.toLocaleLowerCase();
+      const existing = await ctx.db
+        .query("financeCategories")
+        .withIndex("by_workspace_name", (q) =>
+          q.eq("workspaceId", access.workspaceId).eq("normalizedName", normalizedName),
+        )
+        .unique();
+      if (existing !== null) {
+        if (existing.group !== group) {
+          await ctx.db.patch(existing._id, { group });
+        }
+        return existing._id;
+      }
+      return ctx.db.insert("financeCategories", {
+        workspaceId: access.workspaceId,
+        name,
+        normalizedName,
+        group,
+        excludeFromSpending: false,
+      });
+    };
+    const [transfersCategoryId, investingCategoryId] = await Promise.all([
+      ensureCategory("Transfers", "transfers"),
+      ensureCategory("Investing", "investing"),
+    ]);
     for (const input of args.balances) {
       const existing = await ctx.db
         .query("financeBalances")
@@ -1398,6 +1424,11 @@ export const applySnapTradeAccountData = internalMutation({
         await ctx.db.patch(existing._id, value);
       }
       if (amount !== undefined) {
+        // Mirrored ledger rows are fully derivable from provider activities:
+        // one canonical row per fingerprint, converged by plain upsert. A
+        // ledger poisoned by older promotion schemes is wiped with
+        // purgeSnapTradeTransactions and rebuilt by the next full sync
+        // instead of being adopted row by row.
         const dedupeKey = `snaptrade:activity:${input.fingerprint}`;
         const transaction = await ctx.db
           .query("financeTransactions")
@@ -1405,6 +1436,29 @@ export const applySnapTradeAccountData = internalMutation({
             q.eq("workspaceId", access.workspaceId).eq("dedupeKey", dedupeKey),
           )
           .unique();
+        const kind = input.type.toLowerCase();
+        // Provider spends arrive with positive magnitudes; the ledger stores
+        // outflows negative (a negative provider spend is a refund).
+        const transactionAmount =
+          kind === "spend" || kind === "fee"
+            ? { ...amount, units: -amount.units }
+            : amount;
+        let categoryId: Id<"financeCategories"> | undefined;
+        switch (kind) {
+          case "contribution":
+          case "deposit":
+          case "withdrawal":
+          case "transfer":
+            categoryId = transfersCategoryId;
+            break;
+          case "buy":
+          case "sell":
+          case "tax":
+          case "crypto_staking_action":
+            categoryId = investingCategoryId;
+            break;
+        }
+        const description = input.description ?? input.type;
         if (transaction === null) {
           await ctx.db.insert("financeTransactions", {
             workspaceId: access.workspaceId,
@@ -1413,12 +1467,22 @@ export const applySnapTradeAccountData = internalMutation({
             sourceId: input.sourceId,
             fingerprint: input.fingerprint,
             dedupeKey,
-            description: input.description ?? input.type,
-            amount,
+            description,
+            amount: transactionAmount,
             currency: input.currency,
             postedAt: input.occurredAt,
+            categoryId,
             status: input.status,
             createdAt: now,
+            updatedAt: now,
+          });
+        } else {
+          await ctx.db.patch(transaction._id, {
+            amount: transactionAmount,
+            categoryId,
+            description,
+            status: input.status,
+            postedAt: input.occurredAt,
             updatedAt: now,
           });
         }
