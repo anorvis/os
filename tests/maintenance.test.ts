@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import {
   parseMaintainerTelemetry,
   recordMaintainerUsage,
   recordMaintenanceReview,
+  scanMaintenanceUsage,
 } from "../src/capability/maintenance";
 import { getMaintenanceOverview } from "../src/capability/maintenance/overview";
 import { maintenanceRoutes } from "../src/capability/maintenance/route";
@@ -95,6 +96,73 @@ test("overview route applies bounded pagination and status filtering", async () 
   };
   expect(body).toMatchObject({ total: 1, usageTotal: 3, tickets: [{ status: "running" }] });
   expect(body.usage.recent).toHaveLength(2);
+});
+
+test("ticket-only overview requests skip the usage scan", async () => {
+  const root = mkdtempSync(join(tmpdir(), "anorvis-maintenance-tickets-only-"));
+  const store = createMaintenanceStore({ root, now: () => new Date("2026-07-14T00:00:00.000Z") });
+  store.createTicket({ task: "Tickets without usage" });
+  const sessions = join(root, "sessions");
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(sessions, "usage.jsonl"), JSON.stringify({
+    type: "session",
+    id: "usage-session",
+    timestamp: "2026-07-14T00:00:00Z",
+    provider: "openai",
+    model: "gpt-test",
+  }));
+  const app = new Hono();
+  maintenanceRoutes({ root, sessionRoots: { pi: sessions } })(app);
+
+  const ticketsOnly = await app.request("/v1/maintainer/overview?status=pending_approval&limit=20&offset=0");
+  expect(ticketsOnly.status).toBe(200);
+  const body = await ticketsOnly.json() as {
+    total: number;
+    tickets: unknown[];
+    usage: { totals: { sessions: number } };
+    performance: { totals: { samples: number } };
+  };
+  expect(body.total).toBe(1);
+  expect(body.tickets).toHaveLength(1);
+  expect(body.usage.totals.sessions).toBe(0);
+  expect(body.performance.totals.samples).toBe(0);
+
+  // A session view on the same route still includes usage.
+  const withUsage = await app.request("/v1/maintainer/overview?sessionLimit=20&sessionOffset=0");
+  const usageBody = await withUsage.json() as { usage: { totals: { sessions: number } } };
+  expect(usageBody.usage.totals.sessions).toBe(1);
+});
+
+test("usage scan cache refreshes on file growth and forgets deleted files", () => {
+  const root = mkdtempSync(join(tmpdir(), "anorvis-maintenance-scan-cache-"));
+  const sessions = join(root, "sessions");
+  mkdirSync(sessions, { recursive: true });
+  const file = join(sessions, "grow.jsonl");
+  const message = (minute: number) => JSON.stringify({
+    type: "message",
+    sessionId: "grow-session",
+    timestamp: `2026-07-14T00:0${minute}:00Z`,
+    provider: "openai",
+    model: "gpt-test",
+    message: { role: "assistant", usage: { input: 5, output: 1, totalTokens: 6 } },
+  });
+  writeFileSync(file, `${message(1)}\n`);
+
+  const first = scanMaintenanceUsage({ root, sessionRoots: { pi: sessions } });
+  expect(first).toHaveLength(1);
+  expect(first[0]).toMatchObject({ messageCount: 1, inputTokens: 5, totalTokens: 6 });
+
+  // Cached second scan returns identical aggregates without reparsing drift.
+  const second = scanMaintenanceUsage({ root, sessionRoots: { pi: sessions } });
+  expect(second[0]).toMatchObject({ messageCount: 1, inputTokens: 5, totalTokens: 6 });
+
+  appendFileSync(file, `${message(2)}\n`);
+  const grown = scanMaintenanceUsage({ root, sessionRoots: { pi: sessions } });
+  expect(grown[0]).toMatchObject({ messageCount: 2, inputTokens: 10, totalTokens: 12 });
+  expect(grown[0]?.lastSeenAt).toBe("2026-07-14T00:02:00.000Z");
+
+  rmSync(file);
+  expect(scanMaintenanceUsage({ root, sessionRoots: { pi: sessions } })).toHaveLength(0);
 });
 
 test("usage aggregation tolerates malformed JSONL and matches hashed reviews", () => {

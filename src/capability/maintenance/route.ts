@@ -28,6 +28,9 @@ export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteR
       const statuses = url.searchParams.get("status")?.split(",").map((status) => status.trim()).filter(Boolean) as
         | MaintenanceTicketStatus[]
         | undefined;
+      // A ticket pagination request without a session view never renders
+      // usage; skip the session-root scan and performance load entirely.
+      const ticketsOnly = hasPagination && !hasSessionPagination;
       return json(getMaintenanceOverview({
         root: options.root,
         sessionRoots: options.sessionRoots,
@@ -35,6 +38,7 @@ export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteR
         foregroundStatsPath: options.foregroundStatsPath,
         sessionScope,
         now: options.now,
+        includeUsage: !ticketsOnly,
         ...(hasPagination ? { limit: parseBoundedNumber(url.searchParams.get("limit"), 20, 100), offset: parseBoundedNumber(url.searchParams.get("offset"), 0, Number.MAX_SAFE_INTEGER) } : {}),
         ...(statuses ? { ticketStatuses: statuses } : {}),
         ...(hasSessionPagination ? {

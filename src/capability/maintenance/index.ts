@@ -211,6 +211,8 @@ export type MaintenanceOptions = {
   ticketStatuses?: readonly MaintenanceTicketStatus[];
   sessionLimit?: number;
   sessionOffset?: number;
+  // Ticket-only callers skip the (expensive) usage scan and performance load.
+  includeUsage?: boolean;
 };
 
 
@@ -361,8 +363,17 @@ export function scanMaintenanceUsage(options: MaintenanceOptions = {}): Maintena
   const reviews = createMaintenanceStore(options).listReviews();
   const reviewed = new Set(reviews.map((review) => review.sessionKey));
   const rows = new Map<string, UsageAccumulator>();
+  const seen = new Set<string>();
   for (const root of roots) {
-    for (const path of jsonlFiles(root.path)) parseSessionFile(path, root.host, rows);
+    for (const path of jsonlFiles(root.path)) {
+      seen.add(path);
+      mergeContribution(rows, cachedContribution(path, root.host));
+    }
+  }
+  // Session files can disappear (cleanup, root changes); drop their cache
+  // entries so the memo never outgrows the live session set.
+  for (const path of sessionFileCache.keys()) {
+    if (!seen.has(path)) sessionFileCache.delete(path);
   }
   return [...rows.values()]
     .map((row) => ({
@@ -764,9 +775,65 @@ function jsonlFiles(root: string): string[] {
   }
   return files;
 }
-function parseSessionFile(path: string, host: string, rows: Map<string, UsageAccumulator>): void {
+type SessionFileContribution = UsageAccumulator;
+
+type SessionFileCacheEntry = {
+  stamp: string;
+  contribution: SessionFileContribution | undefined;
+};
+
+// Session JSONL roots reach hundreds of megabytes; reparsing every file on
+// every overview request is the dominant gateway cost. Files are append-only
+// per session, so (mtime, size) identifies parsed content exactly.
+const sessionFileCache = new Map<string, SessionFileCacheEntry>();
+
+function cachedContribution(
+  path: string,
+  host: string,
+): SessionFileContribution | undefined {
+  let stamp: string;
+  try {
+    const info = statSync(path);
+    stamp = `${host}\u0000${info.mtimeMs}\u0000${info.size}`;
+  } catch {
+    return undefined;
+  }
+  const cached = sessionFileCache.get(path);
+  if (cached && cached.stamp === stamp) return cached.contribution;
+  const contribution = parseSessionFile(path, host);
+  sessionFileCache.set(path, { stamp, contribution });
+  return contribution;
+}
+
+function mergeContribution(
+  rows: Map<string, UsageAccumulator>,
+  contribution: SessionFileContribution | undefined,
+): void {
+  if (!contribution) return;
+  const key = `${contribution.host}\u0000${contribution.sessionKey}`;
+  const current = rows.get(key);
+  if (!current) {
+    rows.set(key, { ...contribution });
+    return;
+  }
+  current.firstSeenAt = !current.firstSeenAt || contribution.firstSeenAt < current.firstSeenAt ? contribution.firstSeenAt : current.firstSeenAt;
+  current.lastSeenAt = contribution.lastSeenAt > current.lastSeenAt ? contribution.lastSeenAt : current.lastSeenAt;
+  current.provider ||= contribution.provider;
+  current.model ||= contribution.model;
+  current.messageCount += contribution.messageCount;
+  current.inputTokens += contribution.inputTokens;
+  current.outputTokens += contribution.outputTokens;
+  current.cacheReadTokens += contribution.cacheReadTokens;
+  current.cacheWriteTokens += contribution.cacheWriteTokens;
+  current.cacheTokens += contribution.cacheTokens;
+  current.totalTokens += contribution.totalTokens;
+  current.usdCost += contribution.usdCost;
+  current.outputLimitWarningCount += contribution.outputLimitWarningCount;
+}
+
+function parseSessionFile(path: string, host: string): SessionFileContribution | undefined {
   let text: string;
-  try { text = readFileSync(path, "utf8"); } catch { return; }
+  try { text = readFileSync(path, "utf8"); } catch { return undefined; }
   const fallbackId = path.split(/[\\/]/).pop()?.replace(/\.jsonl$/, "") || path;
   let sessionId = fallbackId;
   let firstSeenAt = "";
@@ -819,25 +886,7 @@ function parseSessionFile(path: string, host: string, rows: Map<string, UsageAcc
   }
   if (!totalTokens) totalTokens = inputTokens + outputTokens + cacheTokens;
   const sessionKey = hashMaintenanceSessionId(sessionId);
-  const key = `${host}\u0000${sessionKey}`;
-  const current = rows.get(key);
-  if (!current) {
-    rows.set(key, { host, sessionKey, firstSeenAt, lastSeenAt, provider, model, stage: null, outcome: null, messageCount, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cacheTokens, totalTokens, usdCost, outputLimitWarningCount });
-    return;
-  }
-  current.firstSeenAt = !current.firstSeenAt || firstSeenAt < current.firstSeenAt ? firstSeenAt : current.firstSeenAt;
-  current.lastSeenAt = lastSeenAt > current.lastSeenAt ? lastSeenAt : current.lastSeenAt;
-  current.provider ||= provider;
-  current.model ||= model;
-  current.messageCount += messageCount;
-  current.inputTokens += inputTokens;
-  current.outputTokens += outputTokens;
-  current.cacheReadTokens += cacheReadTokens;
-  current.cacheWriteTokens += cacheWriteTokens;
-  current.cacheTokens += cacheTokens;
-  current.totalTokens += totalTokens;
-  current.usdCost += usdCost;
-  current.outputLimitWarningCount += outputLimitWarningCount;
+  return { host, sessionKey, firstSeenAt, lastSeenAt, provider, model, stage: null, outcome: null, messageCount, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cacheTokens, totalTokens, usdCost, outputLimitWarningCount };
 }
 
 function eventTimestamp(event: Record<string, unknown>): string | undefined {
