@@ -19,6 +19,7 @@ import {
   type MaintenanceUsageScope,
   type MaintenanceUsageTotals,
 } from "./index";
+import { readLinearLinks } from "./linear";
 
 export function getMaintenanceOverview(options: MaintenanceOptions = {}): MaintenanceOverview {
   const sessionScope = options.sessionScope ?? "foreground";
@@ -90,7 +91,11 @@ export function getMaintenanceOverview(options: MaintenanceOptions = {}): Mainte
     aggregate.outputLimitWarningCount += row.outputLimitWarningCount;
     byModel.set(key, aggregate);
   }
-  const allTickets = listMaintenanceTickets(options);
+  const linearLinks = readLinearLinks({ root: options.root });
+  const allTickets = listMaintenanceTickets(options).map((ticket) => {
+    const link = linearLinks[ticket.id];
+    return link ? { ...ticket, linear: { identifier: link.identifier, url: link.url } } : ticket;
+  });
   const filteredTickets = options.ticketStatuses?.length
     ? allTickets.filter((ticket) => options.ticketStatuses!.includes(ticket.status))
     : allTickets;

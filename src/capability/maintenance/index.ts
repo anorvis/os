@@ -104,6 +104,14 @@ export type MaintenanceTicket = {
   verification: string[];
   warnings: string[];
 };
+export type MaintenanceTicketLinearLink = {
+  identifier: string;
+  url: string;
+};
+
+export type MaintenanceOverviewTicket = MaintenanceTicket & {
+  linear?: MaintenanceTicketLinearLink;
+};
 
 export type CreateMaintenanceTicketInput = {
   task: string;
@@ -184,7 +192,7 @@ export type MaintenanceOverview = {
     byModel: MaintenanceModelUsage[];
   };
   performance: MaintenancePerformance;
-  tickets: MaintenanceTicket[];
+  tickets: MaintenanceOverviewTicket[];
   total?: number;
   usageTotal?: number;
 };
