@@ -7,12 +7,12 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import {
   createMaintenanceStore,
-  getMaintenanceOverview,
   hashMaintenanceSessionId,
   parseMaintainerTelemetry,
   recordMaintainerUsage,
   recordMaintenanceReview,
 } from "../src/capability/maintenance";
+import { getMaintenanceOverview } from "../src/capability/maintenance/overview";
 import { maintenanceRoutes } from "../src/capability/maintenance/route";
 import { createApp } from "../src/platform/gateway/app";
 
