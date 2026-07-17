@@ -22,8 +22,10 @@ import {
 
 export function getMaintenanceOverview(options: MaintenanceOptions = {}): MaintenanceOverview {
   const sessionScope = options.sessionScope ?? "foreground";
-  const recordedUsage =
-    sessionScope === "maintainer"
+  const includeUsage = options.includeUsage ?? true;
+  const recordedUsage = !includeUsage
+    ? []
+    : sessionScope === "maintainer"
       ? scanMaintainerUsage(options)
       : scanMaintenanceUsage(options);
   const clock =
@@ -109,7 +111,9 @@ export function getMaintenanceOverview(options: MaintenanceOptions = {}): Mainte
       recent,
       byModel: [...byModel.values()].sort((a, b) => `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`)),
     },
-    performance: loadModelPerformance(options.maintainerModelPerfPath, sessionScope, options.foregroundStatsPath, options.sessionRoots),
+    performance: includeUsage
+      ? loadModelPerformance(options.maintainerModelPerfPath, sessionScope, options.foregroundStatsPath, options.sessionRoots)
+      : emptyPerformance(),
     tickets,
     ...(paginated ? { total: filteredTickets.length } : {}),
     ...(sessionPaginated ? { usageTotal: usage.length } : {}),
