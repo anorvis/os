@@ -4,16 +4,25 @@ import {
   getMaintenanceOverview,
   type MaintenanceOptions,
   type MaintenanceTicketStatus,
+  type MaintenanceUsageScope,
 } from ".";
 
-export type MaintenanceRouteOptions = Pick<MaintenanceOptions, "root" | "sessionRoots"> & {
+export type MaintenanceRouteOptions = Pick<
+  MaintenanceOptions,
+  "root" | "sessionRoots" | "maintainerModelPerfPath" | "foregroundStatsPath"
+> & {
   now?: () => Date;
 };
 
 export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteRegistrar {
   return (app) => {
-    app.get("/v1/maintenance/overview", (context) => {
+    app.get("/v1/maintainer/overview", (context) => {
       const url = new URL(context.req.url);
+      const requestedScope = url.searchParams.get("sessionScope");
+      if (requestedScope !== null && requestedScope !== "foreground" && requestedScope !== "maintainer") {
+        return json({ error: "sessionScope must be foreground or maintainer" }, 400);
+      }
+      const sessionScope: MaintenanceUsageScope = requestedScope === "maintainer" ? "maintainer" : "foreground";
       const hasPagination = url.searchParams.has("limit") || url.searchParams.has("offset") || url.searchParams.has("status");
       const hasSessionPagination = url.searchParams.has("sessionLimit") || url.searchParams.has("sessionOffset");
       const statuses = url.searchParams.get("status")?.split(",").map((status) => status.trim()).filter(Boolean) as
@@ -22,6 +31,9 @@ export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteR
       return json(getMaintenanceOverview({
         root: options.root,
         sessionRoots: options.sessionRoots,
+        maintainerModelPerfPath: options.maintainerModelPerfPath,
+        foregroundStatsPath: options.foregroundStatsPath,
+        sessionScope,
         now: options.now,
         ...(hasPagination ? { limit: parseBoundedNumber(url.searchParams.get("limit"), 20, 100), offset: parseBoundedNumber(url.searchParams.get("offset"), 0, Number.MAX_SAFE_INTEGER) } : {}),
         ...(statuses ? { ticketStatuses: statuses } : {}),
