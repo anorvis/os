@@ -37,6 +37,7 @@ export async function recordProviderSyncCompletion(
   workspaceId: Id<"workspaces">,
   provider: SyncProvider,
   watermark?: string,
+  changed = true,
 ): Promise<void> {
   const now = Date.now();
   const existing = await ctx.db
@@ -51,6 +52,8 @@ export async function recordProviderSyncCompletion(
       provider,
       sequence: 1,
       lastSyncedAt: now,
+      lastChangedAt: now,
+      lastAttemptAt: now,
       ...(watermark ? { watermark } : {}),
       createdAt: now,
       updatedAt: now,
@@ -59,13 +62,53 @@ export async function recordProviderSyncCompletion(
   }
   const nextWatermark = newerWatermark(existing.watermark, watermark);
   await ctx.db.patch(existing._id, {
-    sequence: existing.sequence + 1,
+    // The sequence is the publication revision consumers watch; bump it only
+    // when synced data actually changed so no-op polls do not fan out
+    // invalidations every 30 seconds.
+    ...(changed ? { sequence: existing.sequence + 1, lastChangedAt: now } : {}),
     lastSyncedAt: now,
+    lastAttemptAt: now,
+    lastError: undefined,
+    lastErrorAt: undefined,
     ...(nextWatermark !== existing.watermark
       ? { watermark: nextWatermark }
       : {}),
     updatedAt: now,
   });
+}
+
+// Terminal sync failures land on the provider state so the dashboard can
+// show what broke and when, instead of the job table swallowing the error.
+export async function recordProviderSyncFailure(
+  ctx: { db: MutationCtx["db"] },
+  workspaceId: Id<"workspaces">,
+  provider: SyncProvider,
+  error: string,
+): Promise<void> {
+  const now = Date.now();
+  const existing = await ctx.db
+    .query("providerSyncStates")
+    .withIndex("by_workspace_provider", (q) =>
+      q.eq("workspaceId", workspaceId).eq("provider", provider),
+    )
+    .unique();
+  const failure = {
+    lastAttemptAt: now,
+    lastError: error.slice(0, 500),
+    lastErrorAt: now,
+    updatedAt: now,
+  };
+  if (existing === null) {
+    await ctx.db.insert("providerSyncStates", {
+      workspaceId,
+      provider,
+      sequence: 0,
+      ...failure,
+      createdAt: now,
+    });
+    return;
+  }
+  await ctx.db.patch(existing._id, failure);
 }
 
 // Single enqueue path for scheduled, manual, post-OAuth, and live syncs. A
@@ -202,6 +245,7 @@ export const publishProviderSyncCompletion = internalMutation({
       v.literal("snaptrade"),
     ),
     watermark: v.optional(v.string()),
+    changed: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     await recordProviderSyncCompletion(
@@ -209,6 +253,7 @@ export const publishProviderSyncCompletion = internalMutation({
       args.workspaceId,
       args.provider,
       args.watermark,
+      args.changed ?? true,
     );
   },
 });
@@ -364,6 +409,7 @@ export const advanceProviderSync = internalMutation({
         job.workspaceId,
         job.provider,
         args.watermark,
+        job.appliedCount + args.applied > 0,
       );
     }
     if (!args.done) {
@@ -380,6 +426,8 @@ export const failProviderSync = internalMutation({
     jobId: v.id("syncJobs"),
     lease: v.number(),
     error: v.string(),
+    retryAfterMs: v.optional(v.number()),
+    permanent: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     const job = await ctx.db.get(args.jobId);
@@ -392,7 +440,12 @@ export const failProviderSync = internalMutation({
     }
     const now = Date.now();
     const attempt = job.attempt + 1;
-    const retry = attempt < 4;
+    // Rate-limited jobs get a longer budget: the provider told us when to
+    // come back, so honoring that hint usually succeeds. Permanent errors
+    // (revoked auth, invalid data) never retry — the stored message is the
+    // actionable one and retrying would bury it.
+    const rateLimited = args.retryAfterMs !== undefined;
+    const retry = !args.permanent && attempt < (rateLimited ? 8 : 4);
     await ctx.db.patch(job._id, {
       status: retry ? "pending" : "failed",
       attempt,
@@ -401,10 +454,26 @@ export const failProviderSync = internalMutation({
       updatedAt: now,
     });
     if (retry) {
+      const backoff = Math.min(60_000, 1_000 * 2 ** (attempt - 1));
+      // Never wait less than the provider's requested window (bounded so a
+      // nonsense hint cannot park the job for hours).
       await ctx.scheduler.runAfter(
-        Math.min(60_000, 1_000 * 2 ** (attempt - 1)),
+        Math.min(900_000, Math.max(backoff, args.retryAfterMs ?? 0)),
         internal.capability.integration.runner.run,
         { jobId: args.jobId },
+      );
+      return;
+    }
+    if (
+      job.provider === "google" ||
+      job.provider === "hevy" ||
+      job.provider === "snaptrade"
+    ) {
+      await recordProviderSyncFailure(
+        ctx,
+        job.workspaceId,
+        job.provider,
+        args.error,
       );
     }
   },

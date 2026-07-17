@@ -24,6 +24,7 @@ import type * as capability_integration_google from "../capability/integration/g
 import type * as capability_integration_hevy from "../capability/integration/hevy.js";
 import type * as capability_integration_jobs from "../capability/integration/jobs.js";
 import type * as capability_integration_pinterest from "../capability/integration/pinterest.js";
+import type * as capability_integration_rateLimit from "../capability/integration/rateLimit.js";
 import type * as capability_integration_recipeImport from "../capability/integration/recipeImport.js";
 import type * as capability_integration_runner from "../capability/integration/runner.js";
 import type * as capability_life from "../capability/life.js";
@@ -62,6 +63,7 @@ declare const fullApi: ApiFromModules<{
   "capability/integration/hevy": typeof capability_integration_hevy;
   "capability/integration/jobs": typeof capability_integration_jobs;
   "capability/integration/pinterest": typeof capability_integration_pinterest;
+  "capability/integration/rateLimit": typeof capability_integration_rateLimit;
   "capability/integration/recipeImport": typeof capability_integration_recipeImport;
   "capability/integration/runner": typeof capability_integration_runner;
   "capability/life": typeof capability_life;

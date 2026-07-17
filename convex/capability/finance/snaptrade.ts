@@ -6,6 +6,7 @@ import type { Doc, Id } from "../../_generated/dataModel";
 import { internal } from "../../_generated/api";
 import { action, type ActionCtx, internalAction } from "../../_generated/server";
 import { decryptCredentials, encryptCredentials } from "../../platform/auth/credentials";
+import { throwIfRateLimited } from "../integration/rateLimit";
 type SnapTradeConnection = Extract<
   Doc<"providerConnections">,
   { provider: "snaptrade" }
@@ -95,6 +96,7 @@ async function request(
   const response = await fetch(`${baseUrl}${fullPath}?${query}`, init);
   const responseText = await response.text();
   const payload = responseText ? (JSON.parse(responseText) as unknown) : null;
+  throwIfRateLimited(response, "SnapTrade", responseText);
   if (!response.ok) {
     throw new Error(`SnapTrade request failed (${response.status}): ${responseText.slice(0, 300)}`);
   }
@@ -699,7 +701,18 @@ export const syncNow = action({
     if (!completed) throw new Error("SnapTrade sync exceeded its page limit");
     await ctx.runMutation(
       internal.capability.integration.jobs.publishProviderSyncCompletion,
-      { workspaceId, provider: "snaptrade" },
+      {
+        workspaceId,
+        provider: "snaptrade",
+        changed:
+          totals.accounts +
+            totals.balances +
+            totals.positions +
+            totals.activities +
+            totals.history +
+            totals.returnRates >
+          0,
+      },
     );
     return {
       ok: true as const,
