@@ -1425,10 +1425,7 @@ export const applySnapTradeAccountData = internalMutation({
       }
       if (amount !== undefined) {
         // Mirrored ledger rows are fully derivable from provider activities:
-        // one canonical row per fingerprint, converged by plain upsert. A
-        // ledger poisoned by older promotion schemes is wiped with
-        // purgeSnapTradeTransactions and rebuilt by the next full sync
-        // instead of being adopted row by row.
+        // one canonical row per fingerprint, converged by upsert.
         const dedupeKey = `snaptrade:activity:${input.fingerprint}`;
         const transaction = await ctx.db
           .query("financeTransactions")
