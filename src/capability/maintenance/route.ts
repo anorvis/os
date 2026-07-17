@@ -1,11 +1,11 @@
 import { json } from "../../core/http/http";
 import type { RouteRegistrar } from "../../core/service/service";
 import {
-  getMaintenanceOverview,
   type MaintenanceOptions,
   type MaintenanceTicketStatus,
   type MaintenanceUsageScope,
 } from ".";
+import { getMaintenanceOverview } from "./overview";
 
 export type MaintenanceRouteOptions = Pick<
   MaintenanceOptions,
