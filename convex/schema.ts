@@ -534,7 +534,6 @@ const schema = defineSchema({
     .index("by_workspace_posted", ["workspaceId", "postedAt"])
     .index("by_account_posted", ["accountId", "postedAt"])
     .index("by_workspace_source_id", ["workspaceId", "source", "sourceId"])
-    .index("by_workspace_source_fingerprint", ["workspaceId", "source", "fingerprint"])
     .index("by_workspace_dedupe", ["workspaceId", "dedupeKey"]),
 
   financePositions: defineTable({
