@@ -35,10 +35,14 @@ export function maintenanceRoutes(options: MaintenanceRouteOptions = {}): RouteR
     app.get("/v1/maintainer/overview", (context) => {
       const url = new URL(context.req.url);
       const requestedScope = url.searchParams.get("sessionScope");
-      if (requestedScope !== null && requestedScope !== "foreground" && requestedScope !== "maintainer") {
-        return json({ error: "sessionScope must be foreground or maintainer" }, 400);
+      if (requestedScope !== null && requestedScope !== "foreground" && requestedScope !== "monitor" && requestedScope !== "maintainer") {
+        return json({ error: "sessionScope must be foreground, monitor, or maintainer" }, 400);
       }
-      const sessionScope: MaintenanceUsageScope = requestedScope === "maintainer" ? "maintainer" : "foreground";
+      const sessionScope: MaintenanceUsageScope = requestedScope === "maintainer"
+        ? "maintainer"
+        : requestedScope === "monitor"
+          ? "monitor"
+          : "foreground";
       const hasPagination = url.searchParams.has("limit") || url.searchParams.has("offset") || url.searchParams.has("status");
       const hasSessionPagination = url.searchParams.has("sessionLimit") || url.searchParams.has("sessionOffset");
       const statuses = url.searchParams.get("status")?.split(",").map((status) => status.trim()).filter(Boolean) as

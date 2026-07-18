@@ -9,6 +9,7 @@ import {
   listMaintenanceTickets,
   resolveSessionRoots,
   scanMaintainerUsage,
+  scanMonitorUsage,
   scanMaintenanceUsage,
   type MaintenanceModelPerformance,
   type MaintenanceModelUsage,
@@ -20,7 +21,6 @@ import {
   type MaintenanceUsageTotals,
 } from "./index";
 import { readLinearLinks } from "./linear";
-
 export function getMaintenanceOverview(options: MaintenanceOptions = {}): MaintenanceOverview {
   const sessionScope = options.sessionScope ?? "foreground";
   const includeUsage = options.includeUsage ?? true;
@@ -28,12 +28,14 @@ export function getMaintenanceOverview(options: MaintenanceOptions = {}): Mainte
     ? []
     : sessionScope === "maintainer"
       ? scanMaintainerUsage(options)
-      : scanMaintenanceUsage(options);
+      : sessionScope === "monitor"
+        ? scanMonitorUsage(options)
+        : scanMaintenanceUsage(options);
   const clock =
     (typeof options.now === "function" ? options.now() : options.now) ??
     new Date();
   const usageSince =
-    sessionScope === "maintainer"
+    sessionScope === "maintainer" || sessionScope === "monitor"
       ? new Date(
           Date.UTC(clock.getUTCFullYear(), clock.getUTCMonth(), 1),
         ).toISOString()
@@ -109,7 +111,7 @@ export function getMaintenanceOverview(options: MaintenanceOptions = {}): Mainte
   const recent = sessionLimit === undefined ? usage.slice(0, 25) : usage.slice(sessionOffset, sessionOffset + sessionLimit);
   return {
     scope: sessionScope,
-    usagePeriod: sessionScope === "maintainer" ? "current_month" : "all",
+    usagePeriod: sessionScope === "maintainer" || sessionScope === "monitor" ? "current_month" : "all",
     usageSince,
     usage: {
       totals,
@@ -167,6 +169,7 @@ function loadModelPerformance(
   if (sessionScope === "foreground") {
     return loadForegroundStatsPerformance(foregroundStatsPath, sessionRoots);
   }
+  if (sessionScope === "monitor") return emptyPerformance();
   const path = maintainerModelPerfPath?.trim()
     || process.env.ANORVIS_MAINTAINER_AGENT_DB?.trim()
     || join(getHomeDir(), ".anorvis", "sandbox", "agent", "agent.db");
