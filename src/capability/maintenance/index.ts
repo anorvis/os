@@ -28,10 +28,12 @@ export type MaintenanceTicketStatus =
   | "running"
   | "rejected"
   | (typeof MAINTENANCE_FINAL_STATUSES)[number];
-export type MaintenanceUsageScope = "foreground" | "maintainer";
+export type MaintenanceUsageScope = "foreground" | "monitor" | "maintainer";
 export type MaintenanceUsagePeriod = "all" | "current_month";
 
-export type MaintainerTelemetryStage = "generalizer" | "worker";
+export type MaintenanceTelemetryStage = "generalizer" | "worker" | "monitor";
+
+export type MaintainerTelemetryStage = Exclude<MaintenanceTelemetryStage, "monitor">;
 
 export type MaintainerTelemetryOutcome =
   | MaintenanceTicketStatus
@@ -41,15 +43,15 @@ export type MaintainerTelemetryOutcome =
   | "cancelled"
   | "output_limited";
 
-export type MaintainerTelemetryRecord = {
-  scope: "maintainer";
-  host: "maintainer";
+export type MaintenanceTelemetryRecord = {
+  scope: "monitor" | "maintainer";
+  host: "monitor" | "maintainer";
   sessionKey: string;
   firstSeenAt: string;
   lastSeenAt: string;
   provider: string;
   model: string;
-  stage: MaintainerTelemetryStage;
+  stage: MaintenanceTelemetryStage;
   outcome: MaintainerTelemetryOutcome;
   messageCount: number;
   inputTokens: number;
@@ -60,10 +62,17 @@ export type MaintainerTelemetryRecord = {
   totalTokens: number;
   usdCost: number;
 };
-export type MaintainerTelemetryMetrics = {
+
+export type MaintainerTelemetryRecord = Omit<MaintenanceTelemetryRecord, "scope" | "host" | "stage"> & {
+  scope: "maintainer";
+  host: "maintainer";
+  stage: MaintainerTelemetryStage;
+};
+
+export type MaintenanceTelemetryMetrics = {
   provider?: string;
   model?: string;
-  stage: MaintainerTelemetryStage;
+  stage: MaintenanceTelemetryStage;
   outcome: MaintainerTelemetryOutcome;
   startedAt?: string | Date;
   completedAt?: string | Date;
@@ -76,13 +85,25 @@ export type MaintainerTelemetryMetrics = {
   usdCost: number;
 };
 
+export type MaintainerTelemetryMetrics = Omit<MaintenanceTelemetryMetrics, "stage"> & {
+  stage: MaintainerTelemetryStage;
+};
+
+export type MaintenanceTelemetryInput = MaintenanceTelemetryMetrics & {
+  scope: "monitor" | "maintainer";
+};
+
 export type MaintainerTelemetryInput = MaintainerTelemetryMetrics;
 
-export type MaintainerTelemetryParseOptions = {
-  stage: MaintainerTelemetryStage;
+export type MaintenanceTelemetryParseOptions = {
+  stage: MaintenanceTelemetryStage;
   outcome: MaintainerTelemetryOutcome;
   startedAt?: string | Date;
   completedAt?: string | Date;
+};
+
+export type MaintainerTelemetryParseOptions = Omit<MaintenanceTelemetryParseOptions, "stage"> & {
+  stage: MaintainerTelemetryStage;
 };
 
 export type MaintainerTelemetryOptions = {
@@ -140,7 +161,7 @@ export type MaintenanceUsage = {
   lastSeenAt: string;
   provider: string;
   model: string;
-  stage: MaintainerTelemetryStage | null;
+  stage: MaintenanceTelemetryStage | null;
   outcome: MaintainerTelemetryOutcome | null;
   messageCount: number;
   inputTokens: number;
@@ -406,12 +427,12 @@ export function getMaintainerTelemetryPath(root?: string): string {
 
 export const maintainerTelemetryPath = getMaintainerTelemetryPath;
 
-export function parseMaintainerTelemetry(
+export function parseMaintenanceTelemetry(
   stdout: string,
-  options: MaintainerTelemetryParseOptions,
-): MaintainerTelemetryMetrics | undefined {
+  options: MaintenanceTelemetryParseOptions,
+): MaintenanceTelemetryMetrics | undefined {
   if (typeof stdout !== "string" || !options || !isMaintainerTelemetryOutcome(options.outcome)) return undefined;
-  if (options.stage !== "generalizer" && options.stage !== "worker") return undefined;
+  if (!isMaintenanceTelemetryStage(options.stage)) return undefined;
   const parsed = parseMaintainerOutputUsage(stdout);
   return {
     provider: parsed.provider || "unknown",
@@ -430,22 +451,32 @@ export function parseMaintainerTelemetry(
   };
 }
 
+export function parseMaintainerTelemetry(
+  stdout: string,
+  options: MaintainerTelemetryParseOptions,
+): MaintainerTelemetryMetrics | undefined {
+  const parsed = parseMaintenanceTelemetry(stdout, options);
+  return parsed ? { ...parsed, stage: options.stage } : undefined;
+}
+
 export const parseMaintainerUsage = parseMaintainerTelemetry;
 
-export function recordMaintainerTelemetry(
-  input: MaintainerTelemetryInput,
+export function recordMaintenanceTelemetry(
+  input: MaintenanceTelemetryInput,
   options: MaintainerTelemetryOptions = {},
-): MaintainerTelemetryRecord | undefined {
+): MaintenanceTelemetryRecord | undefined {
   if (!input || !isMaintainerTelemetryOutcome(input.outcome)) return undefined;
-  if (input.stage !== "generalizer" && input.stage !== "worker") return undefined;
+  if (!isMaintenanceTelemetryStage(input.stage)) return undefined;
+  if (input.scope !== "monitor" && input.scope !== "maintainer") return undefined;
+  if (input.scope === "monitor" ? input.stage !== "monitor" : input.stage === "monitor") return undefined;
   const nowValue = options.now;
   const now = typeof nowValue === "function" ? nowValue() : nowValue;
   const firstSeenAt = normalizeTelemetryTimestamp(input.startedAt) || (now ?? new Date()).toISOString();
   const lastSeenAt = normalizeTelemetryTimestamp(input.completedAt) || firstSeenAt;
   const path = getMaintainerTelemetryPath(options.root);
-  const record: MaintainerTelemetryRecord = {
-    scope: "maintainer",
-    host: "maintainer",
+  const record: MaintenanceTelemetryRecord = {
+    scope: input.scope,
+    host: input.scope,
     sessionKey: hashMaintenanceSessionId(randomUUID()),
     firstSeenAt,
     lastSeenAt,
@@ -475,7 +506,16 @@ export function recordMaintainerTelemetry(
   return record;
 }
 
+export function recordMaintainerTelemetry(
+  input: MaintainerTelemetryInput,
+  options: MaintainerTelemetryOptions = {},
+): MaintainerTelemetryRecord | undefined {
+  const record = recordMaintenanceTelemetry({ ...input, scope: "maintainer" }, options);
+  return record as MaintainerTelemetryRecord | undefined;
+}
+
 export const recordMaintainerUsage = recordMaintainerTelemetry;
+export const recordMaintenanceUsage = recordMaintenanceTelemetry;
 
 type ParsedMaintainerUsage = {
   provider: string;
@@ -539,6 +579,18 @@ function normalizeTelemetryTimestamp(value: unknown): string | undefined {
   return text && !Number.isNaN(new Date(text).getTime()) ? new Date(text).toISOString() : undefined;
 }
 
+function isMaintenanceTelemetryStage(value: unknown): value is MaintenanceTelemetryStage {
+  return value === "generalizer" || value === "worker" || value === "monitor";
+}
+
+function isMaintainerTelemetryStage(value: unknown): value is MaintainerTelemetryStage {
+  return value === "generalizer" || value === "worker";
+}
+
+function isMaintenanceTelemetryScope(value: unknown): value is "monitor" | "maintainer" {
+  return value === "monitor" || value === "maintainer";
+}
+
 function isMaintainerTelemetryOutcome(value: unknown): value is MaintainerTelemetryOutcome {
   return value === "pending_approval"
     || value === "approved"
@@ -557,17 +609,21 @@ function isMaintainerTelemetryOutcome(value: unknown): value is MaintainerTeleme
     || value === "output_limited";
 }
 
-function parsePersistedTelemetry(value: unknown): MaintainerTelemetryRecord | undefined {
-  if (!isRecord(value) || value.scope !== "maintainer" || value.host !== "maintainer") return undefined;
+function parsePersistedTelemetry(value: unknown): MaintenanceTelemetryRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  const scope = value.scope;
+  if (!isMaintenanceTelemetryScope(scope) || value.host !== scope) return undefined;
+  const host = scope;
   if (typeof value.sessionKey !== "string" || !/^[0-9a-f]{64}$/.test(value.sessionKey)) return undefined;
-  if (value.stage !== "generalizer" && value.stage !== "worker") return undefined;
+  if (!isMaintenanceTelemetryStage(value.stage)) return undefined;
+  if (scope === "monitor" ? value.stage !== "monitor" : !isMaintainerTelemetryStage(value.stage)) return undefined;
   if (!isMaintainerTelemetryOutcome(value.outcome)) return undefined;
   const firstSeenAt = normalizeTelemetryTimestamp(value.firstSeenAt);
   const lastSeenAt = normalizeTelemetryTimestamp(value.lastSeenAt);
   if (!firstSeenAt || !lastSeenAt) return undefined;
   return {
-    scope: "maintainer",
-    host: "maintainer",
+    scope,
+    host,
     sessionKey: value.sessionKey,
     firstSeenAt,
     lastSeenAt,
@@ -586,7 +642,10 @@ function parsePersistedTelemetry(value: unknown): MaintainerTelemetryRecord | un
   };
 }
 
-export function scanMaintainerUsage(options: MaintainerTelemetryOptions = {}): MaintenanceUsage[] {
+function scanTelemetryUsage(
+  options: MaintainerTelemetryOptions,
+  scope: "monitor" | "maintainer",
+): MaintenanceUsage[] {
   const path = getMaintainerTelemetryPath(options.root);
   let text = "";
   try { text = readFileSync(path, "utf8"); } catch { return []; }
@@ -596,13 +655,21 @@ export function scanMaintainerUsage(options: MaintainerTelemetryOptions = {}): M
     let value: unknown;
     try { value = JSON.parse(line); } catch { continue; }
     const record = parsePersistedTelemetry(value);
-    if (record) rows.set(record.sessionKey, {
+    if (record?.scope === scope) rows.set(record.sessionKey, {
       ...record,
       outputLimitWarningCount: 0,
       reviewed: false,
     });
   }
   return [...rows.values()].sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
+}
+
+export function scanMaintainerUsage(options: MaintainerTelemetryOptions = {}): MaintenanceUsage[] {
+  return scanTelemetryUsage(options, "maintainer");
+}
+
+export function scanMonitorUsage(options: MaintainerTelemetryOptions = {}): MaintenanceUsage[] {
+  return scanTelemetryUsage(options, "monitor");
 }
 
 
