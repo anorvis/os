@@ -92,6 +92,8 @@ export class ContextMonitorRuntime {
   private draining = false;
   private started = false;
   private stopped = false;
+  private redrainRequested = false;
+  private retryDelayMs: number;
   private active: Promise<void> | undefined;
 
   constructor(options: ContextMonitorRuntimeOptions) {
@@ -104,19 +106,23 @@ export class ContextMonitorRuntime {
       ownerDestinations: options.ownerDestinations ?? [],
       now: options.now ?? (() => new Date()),
     };
+    this.retryDelayMs = this.options.intervalMs;
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     this.stopped = false;
     this.started = true;
+    this.redrainRequested = false;
+    this.retryDelayMs = this.options.intervalMs;
     try {
       await this.drainWikiEffects();
       await this.drain();
-      this.armTimer();
     } catch (error) {
       this.started = false;
       this.stopped = true;
+      clearTimeout(this.timer);
+      this.timer = undefined;
       throw error;
     }
   }
@@ -124,114 +130,138 @@ export class ContextMonitorRuntime {
   async stop(): Promise<void> {
     this.stopped = true;
     this.started = false;
-    if (this.timer) clearTimeout(this.timer);
+    this.redrainRequested = false;
+    clearTimeout(this.timer);
     this.timer = undefined;
     await this.active;
   }
 
+  /** Wake the monitor after a new event or another externally visible change. */
   schedule(): void {
     if (!this.started || this.stopped) return;
-    if (this.timer) clearTimeout(this.timer);
-    this.armTimer(0);
+    this.resetRetry();
+    if (this.draining) {
+      this.redrainRequested = true;
+      return;
+    }
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.drain();
+    }, 0);
   }
 
   async drain(): Promise<void> {
-    if (this.draining || this.stopped) return;
-    this.draining = true;
-    const run = this.drainBatch().catch(() => {
-      // A failed fenced effect leaves every claim retryable.
-    });
-    this.active = run;
-    try {
-      await run;
-    } finally {
-      this.active = undefined;
-      this.draining = false;
+    if (this.stopped) return;
+    if (this.draining) {
+      this.redrainRequested = true;
+      return;
     }
+    this.draining = true;
+    const run = (async () => {
+      try {
+        await this.drainBatch();
+        this.resetRetry();
+      } catch {
+        // Claims remain leased and retryable; wake-driven retries avoid idle polling.
+        this.armRetry();
+      } finally {
+        this.active = undefined;
+        this.draining = false;
+        if (this.redrainRequested && !this.stopped) {
+          this.redrainRequested = false;
+          this.schedule();
+        }
+      }
+    })();
+    this.active = run;
+    await run;
   }
 
   private async drainBatch(): Promise<void> {
-    const claimed = await this.options.contextClient.claim({
-      ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-      scope: { kind: "owner" },
-      consumer: this.options.consumer,
-      limit: this.options.batchSize,
-      leaseMs: this.options.leaseMs,
-    });
-    if (!claimed.length) return;
-    const heartbeat = this.startHeartbeat(claimed);
-    try {
-      const partitions = this.partitionClaims(claimed);
-      for (const partition of partitions) {
-        heartbeat.check();
-        partition.priorSummaries = await this.loadPriorSummaries(partition);
-        const events = partition.claimed.map((entry) => entry.event);
-        const priorNotes = partition.priorSummaries
-          .map((summary) => summary.summary.trim())
-          .filter(Boolean)
-          .join("\n")
-          .slice(-8_000);
-        const planApi = this.options.contextClient.getOrCreateMonitorPlan;
-        let result: MonitorResult;
-        if (typeof planApi === "function" && partition.batchId !== undefined) {
-          const planKey = deterministicId(
-            "monitor-plan",
-            `${this.options.consumer}:${partition.batchId}:${partition.key}`,
-          );
-          const existing = await planApi.call(this.options.contextClient, {
-            ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
-            consumer: this.options.consumer,
-            batchId: partition.batchId,
-            planKey,
-          });
-          if (existing.result !== null) {
-            result = existing.result;
+    while (true) {
+      const claimed = await this.options.contextClient.claim({
+        ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+        scope: { kind: "owner" },
+        consumer: this.options.consumer,
+        limit: this.options.batchSize,
+        leaseMs: this.options.leaseMs,
+      });
+      if (!claimed.length) return;
+      const heartbeat = this.startHeartbeat(claimed);
+      try {
+        const partitions = this.partitionClaims(claimed);
+        for (const partition of partitions) {
+          heartbeat.check();
+          partition.priorSummaries = await this.loadPriorSummaries(partition);
+          const events = partition.claimed.map((entry) => entry.event);
+          const priorNotes = partition.priorSummaries
+            .map((summary) => summary.summary.trim())
+            .filter(Boolean)
+            .join("\n")
+            .slice(-8_000);
+          const planApi = this.options.contextClient.getOrCreateMonitorPlan;
+          let result: MonitorResult;
+          if (typeof planApi === "function" && partition.batchId !== undefined) {
+            const planKey = deterministicId(
+              "monitor-plan",
+              `${this.options.consumer}:${partition.batchId}:${partition.key}`,
+            );
+            const existing = await planApi.call(this.options.contextClient, {
+              ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+              consumer: this.options.consumer,
+              batchId: partition.batchId,
+              planKey,
+            });
+            if (existing.result !== null) {
+              result = existing.result;
+            } else {
+              const generated = await runMonitorAgent(
+                { events, priorNotes, signal: undefined },
+                this.options.monitorAgent
+                  ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
+                  : { now: this.options.now() },
+              );
+              const stored = await planApi.call(this.options.contextClient, {
+                ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
+                consumer: this.options.consumer,
+                batchId: partition.batchId,
+                planKey,
+                result: generated,
+              });
+              result = stored.result ?? generated;
+            }
           } else {
-            const generated = await runMonitorAgent(
+            result = await runMonitorAgent(
               { events, priorNotes, signal: undefined },
               this.options.monitorAgent
                 ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
                 : { now: this.options.now() },
             );
-            const stored = await planApi.call(this.options.contextClient, {
-              ...(partition.workspaceId ? { workspaceId: partition.workspaceId } : {}),
-              consumer: this.options.consumer,
-              batchId: partition.batchId,
-              planKey,
-              result: generated,
-            });
-            result = stored.result ?? generated;
           }
-        } else {
-          result = await runMonitorAgent(
-            { events, priorNotes, signal: undefined },
-            this.options.monitorAgent
-              ? { monitorAgent: this.options.monitorAgent, now: this.options.now() }
-              : { now: this.options.now() },
-          );
+          if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
+          heartbeat.check();
+          await this.persistResult(result, partition);
+          heartbeat.check();
         }
-        if (result.notes.startsWith("Monitor unavailable:")) throw new Error(result.notes);
+        await this.drainWikiEffects();
         heartbeat.check();
-        await this.persistResult(result, partition);
-        heartbeat.check();
-      }
-      await this.drainWikiEffects();
-      heartbeat.check();
-      for (const partition of partitions) {
-        heartbeat.check();
-        const claims = await this.renew(partition);
-        for (const entry of partition.claimed) {
-          const claim = claims.find((item) => item.eventId === entry.event.id);
-          await this.options.contextClient.ack({
-            ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
-            consumer: this.options.consumer,
-            eventIds: [entry.event.id],
-            claimToken: claim?.claimToken ?? entry.claimToken,
-          });
+        for (const partition of partitions) {
+          heartbeat.check();
+          const claims = await this.renew(partition);
+          for (const entry of partition.claimed) {
+            const claim = claims.find((item) => item.eventId === entry.event.id);
+            await this.options.contextClient.ack({
+              ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
+              consumer: this.options.consumer,
+              eventIds: [entry.event.id],
+              claimToken: claim?.claimToken ?? entry.claimToken,
+            });
+          }
         }
+      } finally {
+        await heartbeat.stop();
       }
-    } finally {
-      await heartbeat.stop();
     }
   }
 
@@ -367,7 +397,7 @@ export class ContextMonitorRuntime {
     if (typeof claimJobs !== "function" || typeof completeJob !== "function") return;
     // Claim one job per iteration so an agent failure never strands other
     // already-claimed jobs as running; only ledger mutations may throw.
-    for (let index = 0; index < this.options.batchSize; index += 1) {
+    while (true) {
       const jobs = await claimJobs.call(this.options.contextClient, {
         ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
         consumer: `${this.options.consumer}:wiki`,
@@ -493,12 +523,20 @@ export class ContextMonitorRuntime {
     }
   }
 
-  private armTimer(delay = this.options.intervalMs): void {
-    if (!this.started || this.stopped) return;
+  private resetRetry(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.retryDelayMs = this.options.intervalMs;
+  }
+
+  private armRetry(): void {
+    if (!this.started || this.stopped || this.timer) return;
+    const delay = this.retryDelayMs;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.drain().finally(() => this.armTimer());
+      void this.drain();
     }, delay);
+    this.retryDelayMs = Math.min(delay * 2, 300_000);
   }
 }
 
@@ -522,6 +560,8 @@ export class ContextOutboundRuntime {
   private started = false;
   private stopped = false;
   private active: Promise<void> | undefined;
+  private redrainRequested = false;
+  private retryDelayMs: number;
   constructor(options: OutboundRuntimeOptions) {
     this.options = {
       ...options,
@@ -530,6 +570,7 @@ export class ContextOutboundRuntime {
       batchSize: Math.min(100, Math.max(1, options.batchSize ?? 20)),
       leaseMs: Math.min(86_400_000, Math.max(1_000, options.leaseMs ?? DEFAULT_LEASE_MS)),
     };
+    this.retryDelayMs = this.options.intervalMs;
     this.adapters = options.adapters instanceof Map
       ? options.adapters
       : new Map((options.adapters as readonly ChannelAdapter[]).map((adapter: ChannelAdapter) => [adapter.id, adapter] as const));
@@ -538,31 +579,63 @@ export class ContextOutboundRuntime {
     if (this.started) return;
     this.stopped = false;
     this.started = true;
-    this.armTimer();
+    this.redrainRequested = false;
+    this.retryDelayMs = this.options.intervalMs;
     await this.drain();
   }
+
   async stop(): Promise<void> {
     this.stopped = true;
     this.started = false;
-    if (this.timer) clearTimeout(this.timer);
+    this.redrainRequested = false;
+    clearTimeout(this.timer);
     this.timer = undefined;
     await this.active;
   }
-  async drain(): Promise<void> {
-    if (this.draining || this.stopped) return;
-    this.draining = true;
-    const run = this.drainBatch().catch(() => {
-      // Keep a failed lease retryable.
-    });
-    this.active = run;
-    try {
-      await run;
-    } finally {
-      this.active = undefined;
-      this.draining = false;
+
+  /** Wake outbound delivery after a new queue row is committed. */
+  schedule(): void {
+    if (!this.started || this.stopped) return;
+    this.resetRetry();
+    if (this.draining) {
+      this.redrainRequested = true;
+      return;
     }
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.drain();
+    }, 0);
   }
-  private async drainBatch(): Promise<void> {
+
+  async drain(): Promise<void> {
+    if (this.stopped) return;
+    if (this.draining) {
+      this.redrainRequested = true;
+      return;
+    }
+    this.draining = true;
+    const run = (async () => {
+      try {
+        const delivered = await this.drainBatch();
+        if (delivered) this.armRetry();
+        else this.resetRetry();
+      } catch {
+        // Keep a failed lease retryable with bounded backoff.
+        this.armRetry();
+      } finally {
+        this.active = undefined;
+        this.draining = false;
+        if (this.redrainRequested && !this.stopped) {
+          this.redrainRequested = false;
+          this.schedule();
+        }
+      }
+    })();
+    this.active = run;
+    await run;
+  }
+  private async drainBatch(): Promise<boolean> {
     const rows = await this.options.contextClient.claimOutbound({
       ...(this.options.workspaceId ? { workspaceId: this.options.workspaceId } : {}),
       consumer: this.options.consumer,
@@ -609,6 +682,7 @@ export class ContextOutboundRuntime {
         await this.complete(row, false, result.retryable, result.error);
       }
     }
+    return rows.length > 0;
   }
   private async complete(row: ContextOutboundRecord, success: boolean, retryable: boolean, error?: string): Promise<void> {
     await this.options.contextClient.completeOutbound({
@@ -621,12 +695,20 @@ export class ContextOutboundRuntime {
       ...(error ? { error } : {}),
     });
   }
-  private armTimer(): void {
-    if (!this.started || this.stopped) return;
+  private resetRetry(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.retryDelayMs = this.options.intervalMs;
+  }
+
+  private armRetry(): void {
+    if (!this.started || this.stopped || this.timer) return;
+    const delay = this.retryDelayMs;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.drain().finally(() => this.armTimer());
-    }, this.options.intervalMs);
+      void this.drain();
+    }, delay);
+    this.retryDelayMs = Math.min(delay * 2, 300_000);
   }
 }
 
@@ -666,6 +748,9 @@ export class DiscordContextRuntime {
       leaseMs: Math.min(86_400_000, Math.max(1_000, options.leaseMs ?? DEFAULT_LEASE_MS)),
       now: options.now ?? (() => new Date()),
     };
+  }
+  setContextClient(contextClient: DiscordReplayClient): void {
+    this.options.contextClient = contextClient;
   }
   async start(): Promise<void> {
     if (this.started) return;

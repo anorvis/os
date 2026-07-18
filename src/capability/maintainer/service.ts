@@ -26,6 +26,8 @@ export function createMaintainerService(context: ServiceContext): ServiceDefinit
         sessionRoots: options.maintenanceSessionRoots ?? options.sessionRoots,
         maintainerModelPerfPath: options.maintainerModelPerfPath,
         foregroundStatsPath: options.foregroundStatsPath,
+        config: context.config,
+        fetch: options.fetch,
         now: () => context.now(),
       }),
     ],
